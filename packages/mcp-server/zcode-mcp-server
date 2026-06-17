@@ -22,10 +22,13 @@ import sys
 from pathlib import Path
 
 # zcode-agent-help 的路径 (能力发现的数据源)
-AGENT_HELP_BIN = os.environ.get(
-    "ZCODE_AGENT_HELP_BIN",
-    str(Path.home() / ".local" / "bin" / "zcode-agent-help"),
+# 优先解析仓库相邻路径 (../agent-help/zcode-agent-help), 让"从仓库直接运行"读到同版本;
+# 不存在则 fallback 到安装态 ~/.local/bin (修复 P2: 原默认指向安装态, 仓库运行读到旧版)
+_REPO_AGENT_HELP = Path(__file__).resolve().parent.parent / "agent-help" / "zcode-agent-help"
+_DEFAULT_AGENT_HELP = str(_REPO_AGENT_HELP) if _REPO_AGENT_HELP.exists() else str(
+    Path.home() / ".local" / "bin" / "zcode-agent-help"
 )
+AGENT_HELP_BIN = os.environ.get("ZCODE_AGENT_HELP_BIN", _DEFAULT_AGENT_HELP)
 ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 
 # MCP 协议版本
@@ -83,9 +86,8 @@ TOOLS = [
                 "section": {
                     "type": "string",
                     "description": (
-                        "可选,只返回某一节: "
-                        "how_to_invoke | headless_modes | capabilities | "
-                        "known_limitations | environment"
+                        "可选,只返回某一节 (与 agent-help 的 SECTIONS 一致): "
+                        "overview | native_cli | app_server | ecosystem"
                     ),
                 }
             },

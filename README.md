@@ -137,6 +137,7 @@ zcode --prompt "继续" --resume sess_xxxx
 4. **diff 无内容**：ZCode 协议层不暴露 oldText/newText，只能列文件名。
 5. **GLM-5.2 无推理输出**：思考过程（agent_thought_chunk）在 GLM-5.2 下不触发，需 GLM-5-Turbo。
 6. **TUI 不可用**：`zcode` 无参数直接运行（TUI 模式）在独立终端报错（缺 `@zcode/tui` 模块），仅 headless 模式可用。
+7. **⚠️ ACP bridge 默认 `mode=yolo`（权限风险）**：为避免工具调用 turn 卡在权限确认，ACP bridge 的 `session/new` 强制以 `mode=yolo` 创建会话（见 `zcode-acp-bridge` 的 `_on_session_new`）。这意味着任意 prompt 都可能触发**无确认的文件修改和命令执行**。作为编辑器集成时请知悉此风险；如需更安全的 `build` 模式（带权限确认），需自行修改并实现 ACP↔ZCode 的 permission 转发（本项目 P4b 未实现）。
 
 ## 项目结构
 

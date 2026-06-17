@@ -693,9 +693,10 @@ class ACPBridge:
                     "result": {"stopReason": "max_turn_requests"}}
 
         # turn 正常完成。differ 已发本轮新增 text; 若本轮无新增 text, 兜底发最后一条 assistant 回复
+        # 修复 P1: 兜底要排除 differ 已见的消息, 避免把上一轮旧回复发出
         if not differ.emitted_text_this_turn:
             differ.emitted_text_this_turn = False  # reset
-            reply_text = self._fetch_last_reply(zcode_sid)
+            reply_text = self._fetch_last_reply(zcode_sid, differ)
             if reply_text:
                 self._send_acp_notification("session/update", {
                     "sessionId": acp_sid,
@@ -760,11 +761,14 @@ class ACPBridge:
                 break
         return None  # notification, 无响应
 
-    def _fetch_last_reply(self, zcode_sid):
+    def _fetch_last_reply(self, zcode_sid, differ=None):
         """turn 完成后, 读 session/messages 拿最后一条 assistant 回复的文本。
 
-        zcode 在 status=idle 后, messages 可能有数据一致性延迟 (idle 了但消息还没刷新),
-        故用短 retry 直到拿到非空 assistant 文本。
+        修复 P1: 传入 differ, 只返回 differ 尚未见过的 assistant 文本,
+        避免把上一轮旧回复当兜底发出。若所有 assistant 消息都已见过, 返回 ""
+        (本轮可能是 tool-only/patch-only, 不应强发旧文本)。
+
+        zcode 在 status=idle 后, messages 可能有数据一致性延迟, 故用短 retry。
         """
         for attempt in range(4):  # 最多重试 4 次
             zc_id = self._next_id()
@@ -774,16 +778,22 @@ class ACPBridge:
                 time.sleep(0.4)
                 continue
             messages = resp["result"].get("messages", [])
-            # 找最后一条 assistant 消息
+            # 找最后一条 differ 未见的 assistant 消息
             for m in reversed(messages):
                 info = m.get("info", {})
-                if info.get("role") == "assistant":
-                    parts = m.get("parts", [])
-                    texts = [p.get("text", "") for p in parts
-                             if isinstance(p, dict) and p.get("type") == "text"]
-                    text = "\n".join(texts)
-                    if text.strip():  # 拿到非空文本才返回
-                        return text
+                if info.get("role") != "assistant":
+                    continue
+                # 若传了 differ, 跳过已见消息 (避免兜底旧回复)
+                if differ is not None:
+                    key = differ._message_dedup_key(m)
+                    if key and key in differ._seen_message_ids:
+                        continue
+                parts = m.get("parts", [])
+                texts = [p.get("text", "") for p in parts
+                         if isinstance(p, dict) and p.get("type") == "text"]
+                text = "\n".join(texts)
+                if text.strip():  # 拿到非空且未见的文本才返回
+                    return text
             time.sleep(0.4)  # 还没数据, 等一会再试
         return ""
 

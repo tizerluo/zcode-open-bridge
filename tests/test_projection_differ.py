@@ -190,6 +190,48 @@ class TestProjectionDiffer(unittest.TestCase):
         deltas2 = [e for e in events2 if e["kind"] == "TextDelta"]
         self.assertEqual(len(deltas2), 0)  # 修复后: fallback 去重生效
 
+    def test_p1_fetch_last_reply_skips_seen(self):
+        """P1: 兜底回复跳过 differ 已见的消息 (避免把旧回复当兜底发)"""
+        differ = self._new_differ()
+        # 两条 assistant 消息: 旧的(a1) 和 新的(a2)
+        msgs = [
+            {"info": {"role": "assistant", "id": "a1"},
+             "parts": [{"type": "text", "text": "旧回复"}]},
+            {"info": {"role": "assistant", "id": "a2"},
+             "parts": [{"type": "text", "text": "新回复"}]},
+        ]
+        # 把 a1 (旧) 标记为已见 (模拟上一轮已发)
+        differ.mark_seen([msgs[0]])
+        # 模拟 _fetch_last_reply 的过滤逻辑: reversed 找第一条未见的 assistant
+        found = None
+        for m in reversed(msgs):
+            if m["info"]["role"] != "assistant":
+                continue
+            key = differ._message_dedup_key(m)
+            if key and key in differ._seen_message_ids:
+                continue  # 已见, 跳过
+            texts = [p["text"] for p in m["parts"] if p.get("type") == "text"]
+            found = "\n".join(texts)
+            break
+        self.assertEqual(found, "新回复")  # 只返回未见的, 不返回旧的
+
+    def test_p1_fetch_last_reply_all_seen_returns_none(self):
+        """P1: 所有 assistant 都已见过时不兜底发旧内容 (tool-only turn)"""
+        differ = self._new_differ()
+        msgs = [{"info": {"role": "assistant", "id": "a1"},
+                 "parts": [{"type": "text", "text": "旧回复"}]}]
+        differ.mark_seen(msgs)  # 全部已见
+        found = None
+        for m in reversed(msgs):
+            if m["info"]["role"] != "assistant":
+                continue
+            key = differ._message_dedup_key(m)
+            if key and key in differ._seen_message_ids:
+                continue
+            found = m["parts"][0]["text"]
+            break
+        self.assertIsNone(found)  # 无未见文本, 不兜底
+
     def test_p3a_reasoning_delta(self):
         """P3a: reasoning part 增量 → ReasoningDelta"""
         differ = self._new_differ()
