@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+zcode-mcp-server — 把 headless ZCode 能力暴露为标准 MCP server
+
+通过 stdio 实现 Model Context Protocol, 让任何 MCP client (zcode 自身、
+Claude Code、Cursor 等) 能标准化地发现并调用 headless zcode。
+
+暴露的 tools:
+  1. get_zcode_capabilities — 返回 headless zcode 完整能力清单 (JSON)
+  2. zcode_review           — 直接调 zcode 审查代码 (封装 --prompt + --attach + --mode plan)
+
+协议: MCP over stdio (JSON-RPC 2.0, 每行一条消息)
+日志: 全部走 stderr (绝不污染 stdout 协议流)
+
+依赖: 仅 Python3 标准库 (零第三方依赖)
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# zcode-agent-help 的路径 (能力发现的数据源)
+AGENT_HELP_BIN = os.environ.get(
+    "ZCODE_AGENT_HELP_BIN",
+    str(Path.home() / ".local" / "bin" / "zcode-agent-help"),
+)
+ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
+
+# MCP 协议版本
+PROTOCOL_VERSION = "2024-11-05"
+SERVER_INFO = {"name": "zcode-mcp-server", "version": "1.0.0"}
+
+
+def log(msg):
+    """日志走 stderr, 不污染 stdout 协议流"""
+    print(f"[zcode-mcp] {msg}", file=sys.stderr, flush=True)
+
+
+def load_zcode_credentials():
+    """从 ~/.zcode/v2/config.json 动态读取凭证 (不明文存储)。
+
+    MCP server 被 zcode 以子进程方式 spawn, 不会继承 shell 的环境变量,
+    所以必须自己从配置文件读取 model/baseURL/apiKey 注入给 zcode 子进程。
+
+    NOTE: 本函数源自 shared/credentials.py (权威实现), 修改时请同步。
+    """
+    cfg_path = Path.home() / ".zcode" / "v2" / "config.json"
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        for _pid, p in cfg.get("provider", {}).items():
+            if p.get("enabled"):
+                opts = p.get("options", {})
+                models = p.get("models", {})
+                model_id = next(iter(models)) if models else "GLM-5.2"
+                return {
+                    "ZCODE_MODEL": model_id,
+                    "ZCODE_BASE_URL": opts.get("baseURL", ""),
+                    "ANTHROPIC_API_KEY": opts.get("apiKey", ""),
+                }
+    except Exception as e:
+        log(f"读取凭证失败: {e}")
+    return {}
+
+
+# ============================================================
+# Tool 定义
+# ============================================================
+TOOLS = [
+    {
+        "name": "get_zcode_capabilities",
+        "description": (
+            "返回 headless 模式 ZCode (智谱 GLM 驱动的 coding agent CLI) 的完整能力清单。"
+            "包含: 如何调用 (命令+环境变量)、两种 headless 模式 (prompt/target)、"
+            "14 项能力 (输入/输出/权限/会话/自主性)、已知限制、以及当前环境实际安装的 skills。"
+            "用途: 当你需要了解能否/如何调用 zcode 完成任务时,先调用此 tool。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "description": (
+                        "可选,只返回某一节: "
+                        "how_to_invoke | headless_modes | capabilities | "
+                        "known_limitations | environment"
+                    ),
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "zcode_review",
+        "description": (
+            "调用 headless ZCode (GLM-5.2) 审查代码,返回审查结论。"
+            "内部以只读模式 (--mode plan) 运行,不会修改任何文件,安全。"
+            "适用于: 安全审查、代码质量评审、找 bug、最佳实践建议。"
+            "可审查单个文件、多个文件,或直接传入代码文本。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "要审查的文件路径列表 (绝对或相对路径)",
+                },
+                "code": {
+                    "type": "string",
+                    "description": "直接传入代码文本 (与 files 二选一,或组合使用)",
+                },
+                "focus": {
+                    "type": "string",
+                    "description": "审查重点,如 '安全性'、'性能'、'可读性'、'找 bug'。默认全面审查",
+                    "default": "全面审查: 安全、正确性、可维护性",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "工作目录 (影响 zcode 的项目上下文),默认当前目录",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+# ============================================================
+# Tool 实现
+# ============================================================
+def tool_get_zcode_capabilities(args):
+    section = args.get("section")
+    cmd = [AGENT_HELP_BIN]
+    if section:
+        cmd += ["--section", section]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        return {"content": [{"type": "text", "text": f"错误: {result.stderr}"}],
+                "isError": True}
+    return {"content": [{"type": "text", "text": result.stdout}]}
+
+
+def tool_zcode_review(args):
+    files = args.get("files", [])
+    code = args.get("code")
+    focus = args.get("focus", "全面审查: 安全、正确性、可维护性")
+    cwd = args.get("cwd")
+
+    # 构造 prompt
+    prompt = (
+        f"你是资深代码审查专家。请审查以下代码,重点: {focus}。\n"
+        f"输出格式: 按严重程度 (严重/警告/建议) 分级,每个问题含文件位置和修复建议。用中文。"
+    )
+
+    # 构造 zcode 命令
+    cmd = [ZCODE_BIN, "--prompt", prompt, "--mode", "plan", "--no-color"]
+    if cwd:
+        cmd += ["--cwd", cwd]
+
+    # 处理文件附件 + 内联代码
+    attach_files = list(files)
+    if code:
+        # 内联代码写入临时文件
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="zcode-review-"
+        )
+        tmp.write(code)
+        tmp.close()
+        attach_files.append(tmp.name)
+
+    for f in attach_files:
+        cmd += ["--attach", f]
+
+    log(f"调用 zcode review: {len(attach_files)} 个输入")
+
+    # 注入凭证: MCP server 子进程不继承 shell 环境变量, 需自行读取
+    env = {**os.environ, **load_zcode_credentials()}
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120, env=env
+        )
+        output = result.stdout
+        if result.returncode != 0 and not output:
+            return {"content": [{"type": "text", "text": f"zcode 调用失败: {result.stderr}"}],
+                    "isError": True}
+        return {"content": [{"type": "text", "text": output}]}
+    except subprocess.TimeoutExpired:
+        return {"content": [{"type": "text", "text": "zcode review 超时 (120s)"}],
+                "isError": True}
+    finally:
+        # 清理临时文件
+        if code:
+            import tempfile, glob
+            for tf in glob.glob("/tmp/zcode-review-*.txt"):
+                try:
+                    os.unlink(tf)
+                except OSError:
+                    pass
+
+
+TOOL_HANDLERS = {
+    "get_zcode_capabilities": tool_get_zcode_capabilities,
+    "zcode_review": tool_zcode_review,
+}
+
+
+# ============================================================
+# MCP 协议处理 (JSON-RPC 2.0 over stdio)
+# ============================================================
+def send_message(msg):
+    """输出一条 JSON-RPC 消息 (单行 JSON 到 stdout)"""
+    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def make_response(msg_id, result):
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def make_error(msg_id, code, message, data=None):
+    err = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": msg_id, "error": err}
+
+
+def handle_request(req):
+    """处理一条 JSON-RPC 请求,返回响应 dict (或 None 表示无需响应)"""
+    msg_id = req.get("id")
+    method = req.get("method")
+
+    # --- 协议握手 ---
+    if method == "initialize":
+        return make_response(msg_id, {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": SERVER_INFO,
+        })
+
+    # initialized 是 notification (无 id), 无需响应
+    if method == "notifications/initialized":
+        return None
+
+    # --- 工具发现 ---
+    if method == "tools/list":
+        return make_response(msg_id, {"tools": TOOLS})
+
+    # --- 工具调用 ---
+    if method == "tools/call":
+        params = req.get("params", {})
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+
+        if tool_name not in TOOL_HANDLERS:
+            return make_error(msg_id, -32601, f"未知 tool: {tool_name}")
+
+        try:
+            result = TOOL_HANDLERS[tool_name](arguments)
+            return make_response(msg_id, result)
+        except Exception as e:
+            log(f"tool {tool_name} 异常: {e}")
+            return make_error(msg_id, -32603, f"tool 执行异常: {e}")
+
+    # 未知方法
+    if method is not None:
+        return make_error(msg_id, -32601, f"未知 method: {method}")
+    return None
+
+
+def main():
+    log(f"启动 zcode-mcp-server (stdio), protocol {PROTOCOL_VERSION}")
+    log(f"暴露 tools: {[t['name'] for t in TOOLS]}")
+
+    # 按行读取 stdin
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as e:
+            log(f"JSON 解析失败: {e}")
+            send_message(make_error(None, -32700, "Parse error"))
+            continue
+
+        try:
+            resp = handle_request(req)
+            if resp is not None:
+                send_message(resp)
+        except Exception as e:
+            log(f"处理请求异常: {e}")
+            send_message(make_error(req.get("id"), -32603, str(e)))
+
+    log("stdin 关闭, 退出")
+
+
+if __name__ == "__main__":
+    main()

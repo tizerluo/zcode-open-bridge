@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""
+zcode-agent-help — ZCode 开放生态能力说明书
+
+通过一次调用, 以标准 JSON 了解 ZCode (智谱 Z.AI 的 Agentic Coding CLI)
+的全部能力, 包括:
+  1. 原生 headless CLI (--prompt / --target)
+  2. app-server 协议 (session/create 等私有 JSON-RPC)
+  3. 开放生态接入 (zcode-mcp-server / zcode-acp-bridge)
+
+让其他 Agent / 编辑器 / 脚本据此学会如何调用 zcode。
+
+用法:
+  zcode-agent-help              # 完整能力清单 (JSON)
+  zcode-agent-help --pretty     # 人类可读的格式化输出
+  zcode-agent-help --section <name>   # 只看某一节
+  zcode-agent-help --help       # 本帮助
+
+可用 section:
+  overview, native_cli, app_server, ecosystem, environment
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
+
+
+# ============================================================
+# 静态能力描述 (基于实测)
+# ============================================================
+OVERVIEW = {
+    "tool": "zcode",
+    "version_described": "0.14.5",
+    "what_it_is": (
+        "ZCode 是智谱(Z.AI)的 Agentic Coding CLI, 由 GLM 系列模型驱动。"
+        "它能自主完成代码编写/审查/调试/分析等任务, 可调用工具(读写文件、"
+        "执行 Bash、Grep、Web 搜索等)。"
+    ),
+    "three_layers": [
+        {
+            "layer": "native_cli",
+            "name": "原生 Headless CLI",
+            "summary": "zcode --prompt / --target, 单次或长程任务, 适合脚本/CI",
+            "entry": "zcode --prompt \"<text>\"",
+        },
+        {
+            "layer": "app_server",
+            "name": "App Server 协议",
+            "summary": "zcode app-server --stdio, 私有 JSON-RPC, 长连接多会话",
+            "entry": "zcode app-server --stdio",
+        },
+        {
+            "layer": "ecosystem",
+            "name": "开放生态接入",
+            "summary": "通过桥接器接入 MCP (工具调用) 和 ACP (编辑器集成)",
+            "entry": "zcode-mcp-server / zcode-acp-bridge",
+        },
+    ],
+}
+
+# ---------- 第一层: 原生 Headless CLI ----------
+NATIVE_CLI = {
+    "layer": "native_cli",
+    "name": "原生 Headless CLI",
+    "binary": "zcode",
+    "env_required": {
+        "ZCODE_MODEL": {"description": "模型 ID, 如 GLM-5.2", "example": "GLM-5.2"},
+        "ZCODE_BASE_URL": {"description": "API 端点", "example": "https://api.z.ai/api/anthropic"},
+        "ANTHROPIC_API_KEY": {"description": "API 密钥 (provider kind 为 anthropic)", "example": "<your-key>"},
+    },
+    "config_note": (
+        "~/.zcode/cli/config.json 的 model 字段在 --prompt 模式下不被读取, "
+        "必须用上述环境变量配置。凭证可从 ~/.zcode/v2/config.json 动态读取注入。"
+    ),
+    "headless_modes": [
+        {
+            "name": "prompt",
+            "description": "单次提问模式: 一次性问答, 跑完即退 (类似 claude -p)",
+            "usage": "zcode --prompt \"<text>\" [options]",
+            "best_for": "单轮任务: 审查代码、解释报错、生成实现",
+            "mutually_exclusive_with": ["target"],
+        },
+        {
+            "name": "target",
+            "description": "目标驱动模式: 设定长期目标, 可跨多轮推进 (长程任务)",
+            "usage": "zcode --target \"<objective>\" [options]",
+            "best_for": "需要多步骤、多工具调用的复杂任务",
+            "mutually_exclusive_with": ["prompt"],
+        },
+    ],
+    "capabilities": [
+        # 输入
+        {"category": "input", "name": "text-prompt", "supported": True,
+         "description": "直接传入文本指令或问题", "arg": "--prompt <text>",
+         "example": "zcode --prompt \"审查这段代码的安全性\""},
+        {"category": "input", "name": "file-attach", "supported": True,
+         "description": "附带本地文件 (可重复 --attach 传多个文件)", "arg": "--attach <path>",
+         "example": "zcode --prompt \"review\" --attach app.py --attach tests.py"},
+        {"category": "input", "name": "working-directory", "supported": True,
+         "description": "指定工作目录 (影响项目上下文)", "arg": "--cwd <path>",
+         "example": "zcode --prompt \"分析项目\" --cwd /path/to/project"},
+        {"category": "input", "name": "skill-loading", "supported": True,
+         "description": "强制加载某个 skill 执行专业流程", "arg": "prompt 中用 /skill <name> <task>",
+         "example": "zcode --prompt \"/skill gitnexus-pr-review 审查改动\"",
+         "see_also": "zcode skills list --json"},
+        {"category": "input", "name": "stdin-pipe", "supported": False,
+         "description": "管道输入 — 不支持",
+         "workaround": "用 --attach 传文件"},
+        # 输出
+        {"category": "output", "name": "text", "supported": True, "description": "默认纯文本输出"},
+        {"category": "output", "name": "json", "supported": True,
+         "description": "机器可读 JSON", "arg": "--json",
+         "output_schema": {
+             "sessionId": "string — 会话 ID (sess_...), 可用于续接",
+             "response": "string — 回答内容",
+             "usage": {"inputTokens": "number", "outputTokens": "number"},
+             "traceId": "string", "eventCount": "number",
+         },
+         "example": "zcode --prompt \"hi\" --json"},
+        {"category": "output", "name": "no-color", "supported": True,
+         "description": "去除 ANSI 颜色码", "arg": "--no-color"},
+        {"category": "output", "name": "verbose", "supported": True,
+         "description": "额外调试信息", "arg": "--verbose"},
+        {"category": "output", "name": "stream-json", "supported": False,
+         "description": "流式 JSON — 不支持"},
+        # 权限
+        {"category": "permission", "name": "mode", "supported": True,
+         "description": "权限模式: 控制 zcode 自主权", "arg": "--mode <mode>",
+         "values": {
+             "plan": "只读规划, 不改文件 (最安全, 适合 review)",
+             "build": "可读可写, 关键操作确认",
+             "edit": "可编辑文件",
+             "yolo": "全自动, 跳过确认 (--prompt 默认)",
+         },
+         "example": "zcode --prompt \"review\" --mode plan"},
+        # 会话
+        {"category": "session", "name": "resume", "supported": True,
+         "description": "续接指定会话", "arg": "--resume <sessionId>",
+         "example": "zcode --prompt \"继续\" --resume sess_xxxx"},
+        {"category": "session", "name": "continue", "supported": True,
+         "description": "续接当前目录最近会话", "arg": "-c / --continue"},
+        # 自主性
+        {"category": "agency", "name": "autonomous-tools", "supported": True,
+         "description": "自主调用工具: 读写文件、Bash、Grep、Web 搜索等",
+         "limitations": {"tool_whitelist": "不支持", "max_turns": "不支持", "max_budget": "不支持"}},
+    ],
+    "known_limitations": [
+        "不支持 stdin 管道输入",
+        "不支持流式输出 (stream-json)",
+        "不支持结构化输出 (--json-schema)",
+        "不支持工具白/黑名单、轮次上限、预算控制",
+        "TUI 模式 (无参数直接运行) 在独立终端不可用 (缺 @zcode/tui 模块)",
+        "工具调用 turn 时长不稳定 (38s~100s+ 波动)",
+    ],
+}
+
+# ---------- 第二层: App Server 协议 ----------
+APP_SERVER = {
+    "layer": "app_server",
+    "name": "App Server 协议 (ZCode Protocol)",
+    "binary": "zcode",
+    "entry": "zcode app-server --stdio",
+    "transport": "JSON-RPC-like over stdio (注意: 消息不带 jsonrpc 字段, 是私有协议)",
+    "description": (
+        "长驻 stdio 服务, 支持多会话/多轮。ZCode 桌面 App 和 ACP 桥接器都用它。"
+        "协议私有, 无公开文档, 字段名靠逆向 zcode.cjs 源码确认。"
+    ),
+    "key_methods": [
+        {"method": "session/create", "params": "workspace:{workspacePath,workspaceKey}, mode?",
+         "result": "session:{sessionId}, projection, messages", "note": "mode 参数实测不生效, 返回 build"},
+        {"method": "session/send", "params": "sessionId, content",
+         "result": "{accepted, sessionId, stateRevision}", "note": "立即返回, 不阻塞; turn 完成需轮询"},
+        {"method": "session/read", "params": "sessionId",
+         "result": "projection:{status, totalTokenCount, activeToolCalls, pendingPermissions...}, todos, messages",
+         "note": "查状态用; status: idle/running"},
+        {"method": "session/messages", "params": "sessionId",
+         "result": "{messages:[{info, parts}]}", "note": "parts 类型: text/tool/reasoning/patch/step-start 等"},
+        {"method": "session/list", "params": "workspace?, includeArchived?, limit?",
+         "result": "{sessions:[{sessionId, workspace, title, status...}]}"},
+        {"method": "session/resume", "params": "sessionId, workspace?",
+         "result": "完整快照 Om", "note": "不回放历史"},
+        {"method": "session/setMode", "params": "sessionId, mode", "result": "ok"},
+        {"method": "interaction/requestPermission", "params": "requestId, toolCallId, decision",
+         "note": "应答权限; decision: allow/deny/escalate/modify"},
+    ],
+    "turn_model": {
+        "description": "异步模型: send 立即返回, turn 完成需轮询 session/read",
+        "completion_detection": "projection.status 从 running 变回 idle 表示 turn 完成",
+        "caveat": "工具调用 turn 不主动推送完成事件, 且时长不稳定",
+    },
+    "part_types": {
+        "text": "Agent 文本回复",
+        "tool": "工具调用 (含 callID/tool/state.{status,input,output})",
+        "reasoning": "推理过程 (仅 GLM-5-Turbo 产出, GLM-5.2 无)",
+        "patch": "文件变更清单 (含 hash + files[], 但无 diff 内容)",
+        "step-start": "步骤开始标记",
+        "step-finish": "步骤结束 (含 cost/tokens)",
+    },
+    "data_source_for_acp": {
+        "tool_call": "messages 的 type:tool part",
+        "usage_update": "projection.totalTokenCount + contextWindow",
+        "agent_message_chunk": "messages 的 type:text part",
+        "agent_thought_chunk": "messages 的 type:reasoning part",
+        "plan": "session/read 顶层的 todos[] (不在 messages 响应里)",
+    },
+}
+
+# ---------- 第三层: 开放生态接入 ----------
+ECOSYSTEM = {
+    "layer": "ecosystem",
+    "name": "开放生态接入 (桥接器)",
+    "description": "zcode 原生不支持 MCP-server/ACP, 通过两个桥接器接入开放生态",
+    "components": [
+        {
+            "name": "zcode-mcp-server",
+            "role": "把 zcode 能力暴露为标准 MCP server",
+            "maturity": "stable",
+            "transport": "MCP over stdio (JSON-RPC 2.0)",
+            "tools_exposed": [
+                {"name": "get_zcode_capabilities", "description": "返回 zcode 能力清单 (调 agent-help)"},
+                {"name": "zcode_review", "description": "调 zcode 审查代码 (--mode plan 只读)"},
+            ],
+            "config": "~/.zcode/cli/config.json 的 mcp.servers.zcode-mcp",
+            "use_case": "让 MCP client (zcode 自身/Claude Code/Cursor) 标准化调用 zcode",
+        },
+        {
+            "name": "zcode-acp-bridge",
+            "role": "把 zcode 桥接为 ACP (Agent Client Protocol) Agent",
+            "maturity": "experimental",
+            "transport": "ACP over stdio (JSON-RPC 2.0) 对外; ZCode Protocol 对内",
+            "acp_methods_implemented": [
+                "initialize", "session/new", "session/prompt", "session/cancel",
+                "session/list", "session/resume",
+            ],
+            "acp_events_emitted": [
+                {"event": "tool_call/tool_call_update", "status": "已验证"},
+                {"event": "usage_update", "status": "已验证"},
+                {"event": "agent_message_chunk", "status": "已验证"},
+                {"event": "agent_thought_chunk", "status": "代码就位, GLM-5.2 无数据"},
+                {"event": "plan", "status": "代码就位, 数据驱动"},
+                {"event": "diff (文件列表)", "status": "代码就位, 仅文件名无内容"},
+            ],
+            "use_case": "让 Zed/JetBrains 等 ACP 兼容编辑器调用 zcode",
+            "limitations": [
+                "工具调用 turn 不稳定时 turn 完成检测受影响",
+                "流式文本是伪流式 (zcode 快照式架构)",
+                "diff 无内容 (zcode 协议层不暴露 oldText/newText)",
+                "P4b 权限请求未实现 (yolo 模式不触发)",
+            ],
+        },
+        {
+            "name": "zcode-agent-help",
+            "role": "能力发现包装器 (本工具)",
+            "maturity": "stable",
+            "use_case": "让其他 Agent/程序通过一次调用了解 zcode 全部能力",
+        },
+    ],
+    "session_storage": {
+        "shared": True,
+        "location": "~/.zcode/cli/db/db.sqlite (主库, --prompt 和 ACP 共用)",
+        "rollout": "~/.zcode/cli/rollout/model-io-<sid>.jsonl",
+        "artifacts": "~/.zcode/cli/artifacts/<sid>/",
+        "memories": "~/.zcode/cli/memories/projects/<workspace>/",
+        "note": "v2/sessions/*.json 是桌面 App 旧数据 (claude-import), CLI/ACP 不用",
+        "cross_compatible": "--prompt 创建的会话可被 session/list 看到、被 --resume 或 ACP resume 恢复",
+    },
+}
+
+
+# ============================================================
+# 动态探测: 实时调用 zcode 获取当前环境信息
+# ============================================================
+def _run_zcode_json(args):
+    try:
+        result = subprocess.run(
+            [ZCODE_BIN] + args + ["--json"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        return None
+
+
+def _get_version():
+    try:
+        result = subprocess.run(
+            [ZCODE_BIN, "version"], capture_output=True, text=True, timeout=10
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def discover_environment():
+    env = {"zcode_version": _get_version()}
+
+    skills_data = _run_zcode_json(["skills", "list"])
+    if skills_data and "skills" in skills_data:
+        env["installed_skills"] = [
+            {"name": s.get("name"),
+             "description": (s.get("description") or "").strip() or "(无描述)",
+             "scope": s.get("scope"), "source": s.get("source")}
+            for s in skills_data["skills"]
+        ]
+        env["skills_count"] = len(skills_data["skills"])
+    else:
+        env["installed_skills"] = []
+        env["skills_count"] = 0
+
+    cmds_data = _run_zcode_json(["commands", "list"])
+    if cmds_data and isinstance(cmds_data, dict):
+        cmds = cmds_data.get("commands") or cmds_data.get("data") or []
+        env["custom_commands"] = [c.get("name", str(c)) if isinstance(c, dict) else str(c) for c in cmds]
+    else:
+        env["custom_commands"] = []
+
+    # 探测桥接器是否已安装
+    bin_dir = Path.home() / ".local" / "bin"
+    env["installed_components"] = {}
+    for comp in ("zcode-agent-help", "zcode-mcp-server", "zcode-acp-bridge"):
+        env["installed_components"][comp] = (bin_dir / comp).exists()
+
+    return env
+
+
+# ============================================================
+# 组装 + 输出
+# ============================================================
+SECTIONS = {
+    "overview": OVERVIEW,
+    "native_cli": NATIVE_CLI,
+    "app_server": APP_SERVER,
+    "ecosystem": ECOSYSTEM,
+}
+
+
+def build_full():
+    return {
+        **OVERVIEW,
+        "native_cli": NATIVE_CLI,
+        "app_server": APP_SERVER,
+        "ecosystem": ECOSYSTEM,
+        "environment": discover_environment(),
+    }
+
+
+def print_pretty(cap):
+    v = cap["environment"]["zcode_version"]
+    print(f"╔══ ZCode v{v} — 开放生态能力说明书 ══╗\n")
+    print(cap["what_it_is"], "\n")
+
+    print("▼ 三层架构")
+    for layer in cap["three_layers"]:
+        print(f"  [{layer['layer']}] {layer['name']}")
+        print(f"    {layer['summary']}")
+        print(f"    入口: {layer['entry']}\n")
+
+    # native_cli
+    nc = cap["native_cli"]
+    print("▼ 第一层: 原生 Headless CLI")
+    print(f"  必需环境变量: ZCODE_MODEL / ZCODE_BASE_URL / ANTHROPIC_API_KEY")
+    print(f"  ⚠ {nc['config_note'][:60]}...\n")
+    for m in nc["headless_modes"]:
+        print(f"  [{m['name']}] {m['description']}")
+        print(f"    用法: {m['usage']}\n")
+    by_cat = {}
+    for c in nc["capabilities"]:
+        by_cat.setdefault(c["category"], []).append(c)
+    for cat, items in by_cat.items():
+        print(f"  · {cat}能力")
+        for c in items:
+            st = "✅" if c.get("supported", True) else "❌"
+            print(f"    {st} {c['name']}: {c['description']}")
+    print(f"\n  限制: {len(nc['known_limitations'])} 项\n")
+
+    # app_server
+    aps = cap["app_server"]
+    print("▼ 第二层: App Server 协议")
+    print(f"  {aps['description'][:70]}...")
+    print(f"  关键 method: {', '.join(m['method'] for m in aps['key_methods'][:5])}...")
+    print(f"  part 类型: {', '.join(aps['part_types'].keys())}\n")
+
+    # ecosystem
+    eco = cap["ecosystem"]
+    print("▼ 第三层: 开放生态接入")
+    for comp in eco["components"]:
+        print(f"  [{comp['maturity']}] {comp['name']}: {comp['role']}")
+    print(f"  会话存储: {'共享' if eco['session_storage']['shared'] else '独立'} "
+          f"({eco['session_storage']['location'][:40]}...)\n")
+
+    # environment
+    env = cap["environment"]
+    print("▼ 当前环境 (动态探测)")
+    print(f"  zcode 版本: {env['zcode_version']}")
+    print(f"  已装 skill: {env['skills_count']} 个")
+    print(f"  已装组件: {[k for k,v in env['installed_components'].items() if v] or '无'}")
+
+
+def main():
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+
+    if "--section" in args:
+        idx = args.index("--section")
+        if idx + 1 < len(args):
+            section = args[idx + 1]
+            data = SECTIONS.get(section)
+            if data:
+                print(json.dumps(data, indent=2, ensure_ascii=False))
+                return 0
+            print(f"未知 section: {section}\n可用: {', '.join(SECTIONS.keys())}", file=sys.stderr)
+            return 1
+
+    cap = build_full()
+    if "--pretty" in args:
+        print_pretty(cap)
+        return 0
+
+    print(json.dumps(cap, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
