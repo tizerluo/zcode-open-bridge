@@ -233,11 +233,31 @@ class ProjectionDiffer:
         self.emitted_text_this_turn = False  # 本轮是否已发过 TextDelta (兜底判断用)
 
     def mark_seen(self, messages):
-        """把给定 messages 的 id 全部标记为已见 (建立 baseline, 避免误发历史)。"""
+        """把给定 messages 全部标记为已见 (建立 baseline, 避免误发历史)。"""
         for m in messages:
-            msg_id = m.get("info", {}).get("id") or m.get("id")
-            if msg_id:
-                self._seen_message_ids.add(msg_id)
+            key = self._message_dedup_key(m)
+            if key:
+                self._seen_message_ids.add(key)
+
+    @staticmethod
+    def _message_dedup_key(m):
+        """生成消息去重键。优先 info.id; 无 id 时用 (role, parts 内容签名) 做 fallback。
+
+        修复 P3: 原代码无 id 消息每次 diff 都重发。zcode 协议保证 info.id 存在
+        (实测验证), 但 fallback 让代码对边界情况也安全, 且注释与行为一致。
+        """
+        info = m.get("info", {}) if isinstance(m.get("info"), dict) else {}
+        msg_id = info.get("id") or m.get("id")
+        if msg_id:
+            return msg_id
+        # fallback: role + parts 内容签名 (无 id 时用, 避免重复)
+        role = info.get("role", "?")
+        parts = m.get("parts", [])
+        try:
+            parts_sig = json.dumps(parts, ensure_ascii=False, sort_keys=True)[:200]
+        except (TypeError, ValueError):
+            parts_sig = str(parts)[:200]
+        return f"__fallback::{role}::{parts_sig}"
 
     def reset_turn(self):
         """每个 turn 开始时重置"本轮"标记 (不重置 _seen_message_ids)。"""
@@ -264,14 +284,14 @@ class ProjectionDiffer:
                 events.append({"kind": "UsageDelta", "used": used, "size": size})
             self._last_usage = used
 
-        # 2. 只遍历"本轮新增"的 messages (按 id 去重, 修复 P1.1 误发历史)
+        # 2. 只遍历"本轮新增"的 messages (去重, 修复 P1.1 误发历史 + P3 无 id 重复)
         for m in cur_msgs:
-            msg_id = m.get("info", {}).get("id") or m.get("id")
-            # 无 id 的消息无法去重, 跳过避免重复 (zcode messages 都有 info.id)
-            if msg_id and msg_id in self._seen_message_ids:
+            dedup_key = self._message_dedup_key(m)
+            # 按 dedup_key 去重: 优先 info.id; 无 id 时用 (role, parts 内容) 做 fallback
+            if dedup_key and dedup_key in self._seen_message_ids:
                 continue
-            if msg_id:
-                self._seen_message_ids.add(msg_id)
+            if dedup_key:
+                self._seen_message_ids.add(dedup_key)
             role = m.get("info", {}).get("role")
             for p in m.get("parts", []):
                 if not isinstance(p, dict):

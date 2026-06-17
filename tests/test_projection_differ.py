@@ -174,6 +174,22 @@ class TestProjectionDiffer(unittest.TestCase):
         self.assertEqual(len(plans), 1)
         self.assertEqual(plans[0]["entries"], [])  # 空列表也要发
 
+    def test_p3_no_id_message_not_repeated(self):
+        """P3: 无 info.id 的消息连续 diff 不重复发 (用 parts hash fallback 去重)"""
+        differ = self._new_differ()
+        # 模拟无 id 的 assistant message (边界情况, zcode 实测都有 id, 但防御性)
+        snap = {"projection": {},
+                "messages": [{"info": {"role": "assistant"},  # 注意: 无 id
+                              "parts": [{"type": "text", "text": "回复"}]}],
+                "todos": []}
+        events1 = differ.diff(None, snap)
+        deltas1 = [e for e in events1 if e["kind"] == "TextDelta"]
+        self.assertEqual(len(deltas1), 1)  # 首次发
+        # 同一无 id 消息再 diff: 不应重发
+        events2 = differ.diff(snap, snap)
+        deltas2 = [e for e in events2 if e["kind"] == "TextDelta"]
+        self.assertEqual(len(deltas2), 0)  # 修复后: fallback 去重生效
+
     def test_p3a_reasoning_delta(self):
         """P3a: reasoning part 增量 → ReasoningDelta"""
         differ = self._new_differ()
