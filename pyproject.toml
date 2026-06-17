@@ -1,0 +1,23 @@
+# =============================================================================
+# pyproject.toml — zcode-open-bridge
+#
+# 本仓库的三个组件是「无后缀单文件 Python 脚本」(zcode-acp-bridge /
+# zcode-agent-help / zcode-mcp-server), 不是标准 .py 模块。ruff 默认只
+# 扫描 .py 文件, 因此 CI 里会把无后缀组件显式传给 ruff (见
+# .github/workflows/ci.yml)。本文件只管规则选择。
+# =============================================================================
+
+[tool.ruff.lint]
+# 选择规则: 默认 E/F/W 超集 + 几组高价值检查。不追求 PEP 8 完美,
+# 目标是挡住真正的 bug 与明显坏味道 (未用变量/import、不可达代码、
+# 重复定义、过时写法、常见陷阱), 避免给单作者开源项目增加负担。
+#   E  pycodestyle errors
+#   W  pycodestyle warnings
+#   F  pyflakes (未用变量/import、重复定义等 — 最有价值的 bug 类规则)
+#   I  isort (import 排序)
+#   UP pyupgrade (推到更现代的写法)
+#   B  flake8-bugbear (常见 bug 陷阱)
+select = ["E", "F", "W", "I", "UP", "B"]
+# E501 (行长 > 88): 三个组件大量带中文注释的行天然偏长, 单作者项目里
+# 强制折行只会牺牲可读性, 故全局放宽。其余规则保留以挡住真实问题。
+ignore = ["E501"]

@@ -364,7 +364,7 @@ def print_pretty(cap):
     # native_cli
     nc = cap["native_cli"]
     print("▼ 第一层: 原生 Headless CLI")
-    print(f"  必需环境变量: ZCODE_MODEL / ZCODE_BASE_URL / ANTHROPIC_API_KEY")
+    print("  必需环境变量: ZCODE_MODEL / ZCODE_BASE_URL / ANTHROPIC_API_KEY")
     print(f"  ⚠ {nc['config_note'][:60]}...\n")
     for m in nc["headless_modes"]:
         print(f"  [{m['name']}] {m['description']}")

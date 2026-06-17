@@ -3,6 +3,7 @@
 > 非官方社区项目，将 [ZCode](https://zcode.z.ai)（智谱 Z.AI 的 Agentic Coding CLI）接入开放 Agent 生态（MCP / ACP）。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/tizerluo/zcode-open-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/tizerluo/zcode-open-bridge/actions/workflows/ci.yml)
 
 ## 这是什么
 
@@ -159,10 +160,30 @@ zcode-open-bridge/
 
 ## 开发
 
+提交前建议在本地跑一遍与 CI 等价的检查（lint + 测试 + 可执行位校验）：
+
 ```bash
-# 运行测试
+# 1. lint (需安装: pip install ruff==0.15.17)
+ruff check \
+  packages/acp-bridge/zcode-acp-bridge \
+  packages/agent-help/zcode-agent-help \
+  packages/mcp-server/zcode-mcp-server \
+  shared/ \
+  tests/
+
+# 2. 测试 (纯标准库 unittest, 无需安装依赖)
 python3 tests/test_projection_differ.py
 
+# 3. 确认三个组件保持可执行位 (100755)
+git ls-files --stage packages/*/zcode-*
+```
+
+> ⚠️ 一些编辑器/Edit 类工具会把组件的 `100755` 改回 `100644`。若发现权限丢失，用
+> `git update-index --chmod=+x -- <文件>` 修复——CI 的 `Executable bit check` job 也会拦截这个问题。
+
+日常开发自测：
+
+```bash
 # 自测凭证读取
 python3 shared/credentials.py
 ```

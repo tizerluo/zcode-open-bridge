@@ -55,7 +55,7 @@ def load_zcode_credentials(config_path=None):
                     "ZCODE_BASE_URL": opts.get("baseURL", ""),
                     "ANTHROPIC_API_KEY": opts.get("apiKey", ""),
                 }
-    except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
         # 生产环境: 调用方负责日志; 这里静默返回 {} 由上层兜底
         return {}
     except Exception:

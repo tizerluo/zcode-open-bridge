@@ -15,7 +15,6 @@ messages/projection/todos 数据转换成 ACP 事件:
 """
 
 import os
-import sys
 import types
 import unittest
 

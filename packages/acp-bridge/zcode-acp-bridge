@@ -670,7 +670,7 @@ class ACPBridge:
             if status == "running":
                 turn_started = True
             elif status == "idle" and turn_started:
-                log(f"  ✓ turn 完成 (status=idle)")
+                log("  ✓ turn 完成 (status=idle)")
                 # turn 完成: 取一次完整 snapshot, 发本轮新增的 tool/text/reasoning/plan 事件
                 # differ 已标记历史消息为已见, 只会产出本轮新增 (P1.1)
                 cur_snapshot = self._build_snapshot(zcode_sid, projection)
@@ -686,9 +686,9 @@ class ACPBridge:
         del self.pending_turns[msg_id]
         if not turn_completed:
             if not turn_started:
-                log(f"session/prompt 失败: turn 从未启动 (status 未变 running)")
+                log("session/prompt 失败: turn 从未启动 (status 未变 running)")
                 return self._error(msg_id, -32603, "zcode turn 未启动 (可能后端繁忙或拒绝)")
-            log(f"session/prompt 超时: turn 启动但 120s 未完成")
+            log("session/prompt 超时: turn 启动但 120s 未完成")
             return {"jsonrpc": "2.0", "id": msg_id,
                     "result": {"stopReason": "max_turn_requests"}}
 
@@ -709,7 +709,7 @@ class ACPBridge:
             log(f"session/prompt 完成: stopReason=end_turn, 回复 {len(reply_text)} 字 (兜底)")
         else:
             differ.emitted_text_this_turn = False  # reset for next turn
-            log(f"session/prompt 完成: stopReason=end_turn, text 已随事件发送")
+            log("session/prompt 完成: stopReason=end_turn, text 已随事件发送")
 
         return {"jsonrpc": "2.0", "id": msg_id,
                 "result": {"stopReason": "end_turn"}}
@@ -770,7 +770,7 @@ class ACPBridge:
 
         zcode 在 status=idle 后, messages 可能有数据一致性延迟, 故用短 retry。
         """
-        for attempt in range(4):  # 最多重试 4 次
+        for _attempt in range(4):  # 最多重试 4 次
             zc_id = self._next_id()
             resp, _ = self.backend.request(zc_id, "session/messages",
                                            {"sessionId": zcode_sid}, timeout=10)
