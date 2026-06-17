@@ -412,11 +412,16 @@ def main():
         idx = args.index("--section")
         if idx + 1 < len(args):
             section = args[idx + 1]
-            data = SECTIONS.get(section)
-            if data:
+            # 静态 section 直接查 SECTIONS; environment 是动态探测的, 单独处理
+            if section == "environment":
+                data = discover_environment()
+            else:
+                data = SECTIONS.get(section)
+            if data is not None:
                 print(json.dumps(data, indent=2, ensure_ascii=False))
                 return 0
-            print(f"未知 section: {section}\n可用: {', '.join(SECTIONS.keys())}", file=sys.stderr)
+            print(f"未知 section: {section}\n可用: {', '.join(list(SECTIONS.keys()) + ['environment'])}",
+                  file=sys.stderr)
             return 1
 
     cap = build_full()
