@@ -44,7 +44,7 @@ OVERVIEW = {
         {
             "layer": "native_cli",
             "name": "原生 Headless CLI",
-            "summary": "zcode --prompt / --target, 单次或长程任务, 适合脚本/CI",
+            "summary": "zcode --prompt 单次/长程任务; --target 或 prompt 内 /goal 设定 session 目标, 适合脚本/CI",
             "entry": "zcode --prompt \"<text>\"",
         },
         {
@@ -86,10 +86,13 @@ NATIVE_CLI = {
         },
         {
             "name": "target",
-            "description": "目标驱动模式: 设定长期目标, 可跨多轮推进 (长程任务)",
-            "usage": "zcode --target \"<objective>\" [options]",
+            "description": "目标驱动模式: 为 session 设定长期目标, 可跨多轮推进 (长程任务)。"
+                           "注意 --target 与 --prompt 互斥, 且与 prompt 内的 /goal 斜杠命令等价: "
+                           "`--target \"<obj>\"` 等同于 `--prompt \"/goal <obj>\"`。",
+            "usage": "zcode --target \"<objective>\" [options]   或   zcode --prompt \"/goal <objective>\"",
             "best_for": "需要多步骤、多工具调用的复杂任务",
             "mutually_exclusive_with": ["prompt"],
+            "equivalent_to": "--prompt \"/goal <objective>\"",
         },
     ],
     "capabilities": [
@@ -107,6 +110,11 @@ NATIVE_CLI = {
          "description": "强制加载某个 skill 执行专业流程", "arg": "prompt 中用 /skill <name> <task>",
          "example": "zcode --prompt \"/skill gitnexus-pr-review 审查改动\"",
          "see_also": "zcode skills list --json"},
+        {"category": "input", "name": "goal-setting", "supported": True,
+         "description": "为 session 设定长期目标, 触发跨多轮的长程任务。两种等价写法: "
+                        "`--target <objective>` (与 --prompt 互斥) 或在 prompt 开头用 `/goal <objective>`。",
+         "example": "zcode --target \"重构认证模块\"   或   zcode --prompt \"/goal 重构认证模块\"",
+         "equivalent": "--target \"<obj>\"  ==  --prompt \"/goal <obj>\""},
         {"category": "input", "name": "stdin-pipe", "supported": False,
          "description": "管道输入 — 不支持",
          "workaround": "用 --attach 传文件"},

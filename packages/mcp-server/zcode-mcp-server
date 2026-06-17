@@ -76,7 +76,7 @@ TOOLS = [
         "name": "get_zcode_capabilities",
         "description": (
             "返回 headless 模式 ZCode (智谱 GLM 驱动的 coding agent CLI) 的完整能力清单。"
-            "包含: 如何调用 (命令+环境变量)、两种 headless 模式 (prompt/target)、"
+            "包含: 如何调用 (命令+环境变量)、headless 模式 (--prompt 单次; --target 或 prompt 内 /goal 设定长程目标)、"
             "14 项能力 (输入/输出/权限/会话/自主性)、已知限制、以及当前环境实际安装的 skills。"
             "用途: 当你需要了解能否/如何调用 zcode 完成任务时,先调用此 tool。"
         ),

@@ -94,7 +94,8 @@ zcode --prompt "审查这段代码" --attach app.py --mode plan --json
 zcode --prompt "继续" --resume sess_xxxx
 ```
 
-- 两种模式：`--prompt`（单次）/ `--target`（长程，与 prompt 互斥）
+- 单次问答：`--prompt "<text>"`
+- 长程任务（设定 session 目标）：`--target "<objective>"`，或等价地在 prompt 开头用 `/goal`：`--prompt "/goal <objective>"`（两者互斥）
 - 权限：`--mode plan`（只读）/ `build` / `edit` / `yolo`（全自动）
 - 输出：纯文本 或 `--json`（含 sessionId/response/usage）
 
