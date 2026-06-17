@@ -164,15 +164,16 @@ def tool_zcode_review(args):
 
     # 处理文件附件 + 内联代码
     attach_files = list(files)
+    tmp_path = None  # 记录本次创建的临时文件 (修复 P2.5: 不用 glob 误删并发请求的文件)
     if code:
-        # 内联代码写入临时文件
         import tempfile
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False, prefix="zcode-review-"
         )
         tmp.write(code)
         tmp.close()
-        attach_files.append(tmp.name)
+        tmp_path = tmp.name
+        attach_files.append(tmp_path)
 
     for f in attach_files:
         cmd += ["--attach", f]
@@ -195,14 +196,12 @@ def tool_zcode_review(args):
         return {"content": [{"type": "text", "text": "zcode review 超时 (120s)"}],
                 "isError": True}
     finally:
-        # 清理临时文件
-        if code:
-            import tempfile, glob
-            for tf in glob.glob("/tmp/zcode-review-*.txt"):
-                try:
-                    os.unlink(tf)
-                except OSError:
-                    pass
+        # 只清理本次创建的临时文件 (不用 glob, 避免误删并发请求的文件)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 TOOL_HANDLERS = {

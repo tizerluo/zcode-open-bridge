@@ -227,15 +227,30 @@ class ProjectionDiffer:
         self._seen_tool_ids = set()      # 已通知过的 toolCallId
         self._last_tool_status = {}      # call_id → 上次 status
         self._last_usage = None          # 上次 totalTokenCount
-        self._last_text_len = 0          # 已发送的 text 前缀长度
-        self._last_reasoning_len = 0
-        self._last_plan_sig = None       # 上次 plan 签名 (json)
+        self._seen_message_ids = set()   # 已处理过的 message id (避免多轮/resume 误发历史)
+        self._last_plan_sig = "__none__" # 上次 plan 签名 (初始 "__none__" 让首次空 todos 也能发出清空事件)
         self._seen_patch_hashes = set()  # 已通知过的 patch hash
+        self.emitted_text_this_turn = False  # 本轮是否已发过 TextDelta (兜底判断用)
+
+    def mark_seen(self, messages):
+        """把给定 messages 的 id 全部标记为已见 (建立 baseline, 避免误发历史)。"""
+        for m in messages:
+            msg_id = m.get("info", {}).get("id") or m.get("id")
+            if msg_id:
+                self._seen_message_ids.add(msg_id)
+
+    def reset_turn(self):
+        """每个 turn 开始时重置"本轮"标记 (不重置 _seen_message_ids)。"""
+        self.emitted_text_this_turn = False
 
     def diff(self, prev_snapshot, cur_snapshot):
         """对比两次快照。snapshot = {projection, messages, todos}。
 
         返回事件列表 (可能为空)。
+
+        关键: 只处理"本轮新增"的消息 (按 message id 去重), 避免多轮/resume 时
+        把历史 assistant 回复当新增重发。text/reasoning 按整条消息发 (zcode 快照式,
+        每条 assistant 消息是完整的, 不存在跨 snapshot 增量)。
         """
         events = []
         cur_proj = cur_snapshot.get("projection", {}) if cur_snapshot else {}
@@ -249,45 +264,47 @@ class ProjectionDiffer:
                 events.append({"kind": "UsageDelta", "used": used, "size": size})
             self._last_usage = used
 
-        # 2. 遍历 messages parts 找 tool/text/reasoning/patch
+        # 2. 只遍历"本轮新增"的 messages (按 id 去重, 修复 P1.1 误发历史)
         for m in cur_msgs:
+            msg_id = m.get("info", {}).get("id") or m.get("id")
+            # 无 id 的消息无法去重, 跳过避免重复 (zcode messages 都有 info.id)
+            if msg_id and msg_id in self._seen_message_ids:
+                continue
+            if msg_id:
+                self._seen_message_ids.add(msg_id)
+            role = m.get("info", {}).get("role")
             for p in m.get("parts", []):
                 if not isinstance(p, dict):
                     continue
                 ptype = p.get("type")
                 if ptype == "tool":
                     events.extend(self._diff_tool_part(p))
-                elif ptype == "text" and m.get("info", {}).get("role") == "assistant":
-                    full_text = p.get("text", "")
-                    if len(full_text) > self._last_text_len:
-                        delta = full_text[self._last_text_len:]
-                        self._last_text_len = len(full_text)
-                        if delta.strip():
-                            events.append({"kind": "TextDelta", "text": delta})
+                elif ptype == "text" and role == "assistant":
+                    # 整条 text 发送 (新消息才到这里, 已按 id 去重)
+                    text = p.get("text", "")
+                    if text.strip():
+                        events.append({"kind": "TextDelta", "text": text})
+                        self.emitted_text_this_turn = True
                 elif ptype == "reasoning":
-                    full_text = p.get("text", "")
-                    if len(full_text) > self._last_reasoning_len:
-                        delta = full_text[self._last_reasoning_len:]
-                        self._last_reasoning_len = len(full_text)
-                        if delta.strip():
-                            events.append({"kind": "ReasoningDelta", "text": delta})
+                    text = p.get("text", "")
+                    if text.strip():
+                        events.append({"kind": "ReasoningDelta", "text": text})
                 elif ptype == "patch":
                     ph = p.get("hash")
                     if ph and ph not in self._seen_patch_hashes:
                         self._seen_patch_hashes.add(ph)
                         events.append({"kind": "FilesChanged", "files": p.get("files", [])})
 
-        # 3. plan (todos)
-        todos = cur_snapshot.get("todos", [])
-        if todos:
-            sig = json.dumps(todos, ensure_ascii=False, sort_keys=True)
-            if sig != self._last_plan_sig:
-                self._last_plan_sig = sig
-                entries = [{"content": t.get("content", ""),
-                            "status": t.get("status", "pending"),
-                            "priority": t.get("priority", "medium")}
-                           for t in todos]
-                events.append({"kind": "PlanUpdate", "entries": entries})
+        # 3. plan (todos) — 含清空: todos 变空也要发空列表 (修复 P2.3)
+        todos = cur_snapshot.get("todos", []) or []
+        sig = json.dumps(todos, ensure_ascii=False, sort_keys=True)
+        if sig != self._last_plan_sig:
+            self._last_plan_sig = sig
+            entries = [{"content": t.get("content", ""),
+                        "status": t.get("status", "pending"),
+                        "priority": t.get("priority", "medium")}
+                       for t in todos]
+            events.append({"kind": "PlanUpdate", "entries": entries})
 
         return events
 
@@ -520,16 +537,26 @@ class ACPBridge:
         if not zcode_sid:
             return self._error(msg_id, -32603, f"unknown session: {acp_sid}")
 
-        # 从 ACP prompt (ContentBlock[]) 提取文本
+        # 从 ACP prompt (ContentBlock[]) 提取文本 + resource_link (修复 P2.2)
+        # ACP baseline 要求支持 text 和 resource_link 两种
         prompt_blocks = params.get("prompt", [])
         text_parts = []
         for block in prompt_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
                 text_parts.append(block.get("text", ""))
+            elif btype == "resource_link":
+                # resource_link 含 uri/title; 转成路径提示让 zcode 知道有相关资源
+                uri = block.get("uri", "")
+                title = block.get("title", "")
+                if uri:
+                    text_parts.append(f"[相关资源: {title}]({uri})" if title else f"[相关资源] {uri}")
         prompt_text = "\n".join(text_parts)
 
         if not prompt_text.strip():
-            return self._error(msg_id, -32602, "empty prompt")
+            return self._error(msg_id, -32602, "empty prompt (需 text 或 resource_link)")
 
         log(f"session/prompt: sid={acp_sid[:20]}..., text={prompt_text[:40]!r}")
 
@@ -537,11 +564,21 @@ class ACPBridge:
         turn = {"zcode_sid": zcode_sid, "cancelled": False}
         self.pending_turns[msg_id] = turn
 
+        # 建立 baseline: send 前先记录已有消息 id, 让 differ 只产出本轮新增 (修复 P1.1)
+        # differ 跨 turn 持久化 (按 session 存), 避免多轮/resume 误发历史
+        differ = self._get_or_create_differ(zcode_sid)
+        # 先喂一次当前 messages, 让 _seen_message_ids 标记所有历史消息为"已见"
+        baseline_msgs = self._fetch_messages(zcode_sid)
+        if baseline_msgs:
+            differ.mark_seen(baseline_msgs)
+        chunk_msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+
         # 发送给 zcode (立即返回 accepted, 不等)
         zc_id = self._next_id()
         self.backend.send({"id": zc_id, "method": "session/send",
                            "params": {"sessionId": zcode_sid, "content": prompt_text}})
-        # 消费 send 的即时响应: 按 id 匹配到 accepted 响应为止 (不再硬编码读 5 行)
+        # 消费 send 响应并校验 (修复 P1.2: 失败要返回错误, 不能默默继续)
+        send_accepted = False
         send_t0 = time.time()
         while time.time() - send_t0 < 5:
             line = self.backend.readline(1.0)
@@ -549,33 +586,51 @@ class ACPBridge:
                 try:
                     d = json.loads(line)
                     if d.get("id") == zc_id:
+                        if "error" in d:
+                            del self.pending_turns[msg_id]
+                            return self._error(msg_id, -32603,
+                                               f"zcode send failed: {d['error'].get('message','')}")
+                        if d.get("result", {}).get("accepted"):
+                            send_accepted = True
                         break
                 except json.JSONDecodeError:
                     pass
+        if not send_accepted:
+            del self.pending_turns[msg_id]
+            return self._error(msg_id, -32603, "zcode send 未被接受 (无 accepted 响应)")
 
         # zcode 不主动推送 turn 完成事件, 改用轮询 session/read 查 status
         # 注意: 必须先观察到 status=running 才算 turn 真正启动, 否则会误判上一个 idle 为完成
         # 阶段1: 轮询保持轻量 (只读 projection 发 usage_update);
         #        turn 完成(idle)后才取一次完整 snapshot 发 tool/text/reasoning/plan 事件。
-        #        原因: _build_snapshot 要额外调 session/messages, 放进轮询循环会拖慢/卡住状态检测。
         monitor = TurnMonitor(self.backend, zcode_sid, self)
-        differ = ProjectionDiffer()
-        chunk_msg_id = f"msg_{uuid.uuid4().hex[:12]}"
-        prev_snapshot = None
         last_usage = None
         t0 = time.time()
         last_status = None
         turn_started = False
+        consecutive_none = 0   # 连续 poll 失败计数 (P1.3)
+        turn_completed = False
         while time.time() - t0 < 120:
             # 每轮先处理 inbox: 让 session/cancel 真正生效
             self._drain_inbox()
             if turn["cancelled"]:
+                # 修复 P2.1: 向后端转发取消, 而非仅本地标记
+                self._cancel_backend_turn(zcode_sid)
                 del self.pending_turns[msg_id]
                 return {"jsonrpc": "2.0", "id": msg_id,
                         "result": {"stopReason": "cancelled"}}
 
             projection = monitor.poll_once()
             status = projection.get("status") if projection else None
+
+            # 修复 P1.3: poll 返回 None 的处理
+            if projection is None:
+                consecutive_none += 1
+                if consecutive_none >= 10:  # 连续 ~5s 无响应
+                    log(f"  ⚠ 连续 {consecutive_none} 次 poll 失败")
+                time.sleep(0.5)
+                continue
+            consecutive_none = 0
 
             # 轻量 usage_update (只读 projection, 不调 messages)
             if turn_started:
@@ -596,20 +651,30 @@ class ACPBridge:
                 turn_started = True
             elif status == "idle" and turn_started:
                 log(f"  ✓ turn 完成 (status=idle)")
-                # turn 完成: 取一次完整 snapshot, 发所有 tool/text/reasoning/plan 事件
+                # turn 完成: 取一次完整 snapshot, 发本轮新增的 tool/text/reasoning/plan 事件
+                # differ 已标记历史消息为已见, 只会产出本轮新增 (P1.1)
                 cur_snapshot = self._build_snapshot(zcode_sid, projection)
-                events = differ.diff(prev_snapshot, cur_snapshot)
+                events = differ.diff(None, cur_snapshot)
                 for ev in events:
                     self._dispatch_event(ev, acp_sid, chunk_msg_id)
+                turn_completed = True
                 break
 
             time.sleep(0.5)  # 轮询间隔
 
-        # turn 完成。流式期间若已发过 text delta (P2), 不再重发; 否则用 _fetch_last_reply 兜底
+        # 修复 P1.2: turn 未完成 (超时或从未 running) 时返回明确错误, 不假装 end_turn
         del self.pending_turns[msg_id]
-        sent_text_len = differ._last_text_len
-        if sent_text_len == 0:
-            # 流式期间未捕获到 text (zcode 可能 turn 结束才一次性产出), 兜底发完整回复
+        if not turn_completed:
+            if not turn_started:
+                log(f"session/prompt 失败: turn 从未启动 (status 未变 running)")
+                return self._error(msg_id, -32603, "zcode turn 未启动 (可能后端繁忙或拒绝)")
+            log(f"session/prompt 超时: turn 启动但 120s 未完成")
+            return {"jsonrpc": "2.0", "id": msg_id,
+                    "result": {"stopReason": "max_turn_requests"}}
+
+        # turn 正常完成。differ 已发本轮新增 text; 若本轮无新增 text, 兜底发最后一条 assistant 回复
+        if not differ.emitted_text_this_turn:
+            differ.emitted_text_this_turn = False  # reset
             reply_text = self._fetch_last_reply(zcode_sid)
             if reply_text:
                 self._send_acp_notification("session/update", {
@@ -622,13 +687,51 @@ class ACPBridge:
                 })
             log(f"session/prompt 完成: stopReason=end_turn, 回复 {len(reply_text)} 字 (兜底)")
         else:
-            log(f"session/prompt 完成: stopReason=end_turn, 流式已发 {sent_text_len} 字")
+            differ.emitted_text_this_turn = False  # reset for next turn
+            log(f"session/prompt 完成: stopReason=end_turn, text 已随事件发送")
 
         return {"jsonrpc": "2.0", "id": msg_id,
                 "result": {"stopReason": "end_turn"}}
 
+    # ---------- differ 管理 + 后端交互辅助 ----------
+
+    def _get_or_create_differ(self, zcode_sid):
+        """获取或创建 session 级别的 ProjectionDiffer (跨 turn 持久化)。
+
+        修复 P1.1: differ 按 session 存, 不每 turn 新建, 避免多轮/resume 误发历史。
+        """
+        if not hasattr(self, "_differs"):
+            self._differs = {}
+        if zcode_sid not in self._differs:
+            self._differs[zcode_sid] = ProjectionDiffer()
+        d = self._differs[zcode_sid]
+        d.reset_turn()  # 重置"本轮"标记
+        return d
+
+    def _fetch_messages(self, zcode_sid):
+        """取 session/messages 的消息列表 (建 baseline / 兜底用)。"""
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "session/messages",
+                                       {"sessionId": zcode_sid}, timeout=8)
+        if "result" in resp:
+            return resp["result"].get("messages", [])
+        return []
+
+    def _cancel_backend_turn(self, zcode_sid):
+        """向 zcode 后端转发取消 (修复 P2.1: 不能只本地标记)。
+
+        zcode 的取消 method 是 session/stop。即使失败也不阻塞 (本地标记已生效)。
+        """
+        try:
+            zc_id = self._next_id()
+            self.backend.send({"id": zc_id, "method": "session/stop",
+                               "params": {"sessionId": zcode_sid}})
+            log(f"  → 已向后端发 session/stop (sid={zcode_sid[:16]}...)")
+        except Exception as e:
+            log(f"  → session/stop 发送失败 (忽略): {e}")
+
     def _on_session_cancel(self, params):
-        """ACP session/cancel: 标记当前 turn 取消"""
+        """ACP session/cancel: 标记当前 turn 取消 (本地), 后端取消由轮询循环检测到标记后转发"""
         acp_sid = params.get("sessionId")
         for tid, turn in self.pending_turns.items():
             if turn["zcode_sid"] == self.session_map.get(acp_sid):

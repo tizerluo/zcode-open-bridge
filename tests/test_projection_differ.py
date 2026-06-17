@@ -118,21 +118,61 @@ class TestProjectionDiffer(unittest.TestCase):
         self.assertEqual(usage[0]["size"], 1000000)
 
     def test_p2_text_delta(self):
-        """P2: assistant text 增量 → TextDelta (只发新增部分)"""
+        """P2: 新增 assistant text → 整条 TextDelta (按 message id 去重)"""
         differ = self._new_differ()
+        # 第一条 assistant 消息
         snap1 = {"projection": {},
-                 "messages": [{"info": {"role": "assistant"},
+                 "messages": [{"info": {"role": "assistant", "id": "m1"},
                                "parts": [{"type": "text", "text": "你好"}]}],
                  "todos": []}
-        differ.diff(None, snap1)  # 发 "你好"
-        snap2 = {"projection": {},
-                 "messages": [{"info": {"role": "assistant"},
-                               "parts": [{"type": "text", "text": "你好世界"}]}],
+        events1 = differ.diff(None, snap1)
+        deltas1 = [e for e in events1 if e["kind"] == "TextDelta"]
+        self.assertEqual(len(deltas1), 1)
+        self.assertEqual(deltas1[0]["text"], "你好")
+        # 同一条消息再 diff 不应重发 (id 去重)
+        events2 = differ.diff(snap1, snap1)
+        deltas2 = [e for e in events2 if e["kind"] == "TextDelta"]
+        self.assertEqual(len(deltas2), 0)
+
+    def test_p1_1_no_history_replay(self):
+        """P1.1: 多轮/resume 时历史 assistant 消息不重发"""
+        differ = self._new_differ()
+        # 第一轮: 两条历史消息 (user + assistant)
+        snap_baseline = {"projection": {},
+                 "messages": [
+                     {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "问题"}]},
+                     {"info": {"role": "assistant", "id": "a1"}, "parts": [{"type": "text", "text": "旧回复"}]},
+                 ],
                  "todos": []}
-        events = differ.diff(snap1, snap2)
+        differ.mark_seen(snap_baseline["messages"])  # 建 baseline
+        # 第二轮: 历史仍在 + 新增一条 assistant
+        snap_turn2 = {"projection": {},
+                 "messages": [
+                     {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "问题"}]},
+                     {"info": {"role": "assistant", "id": "a1"}, "parts": [{"type": "text", "text": "旧回复"}]},
+                     {"info": {"role": "user", "id": "u2"}, "parts": [{"type": "text", "text": "追问"}]},
+                     {"info": {"role": "assistant", "id": "a2"}, "parts": [{"type": "text", "text": "新回复"}]},
+                 ],
+                 "todos": []}
+        events = differ.diff(None, snap_turn2)
         deltas = [e for e in events if e["kind"] == "TextDelta"]
+        # 只应发"新回复", 不重发"旧回复"
         self.assertEqual(len(deltas), 1)
-        self.assertEqual(deltas[0]["text"], "世界")  # 只发增量
+        self.assertEqual(deltas[0]["text"], "新回复")
+
+    def test_p2_3_plan_clear_emits_empty(self):
+        """P2.3: todos 从有内容变空, 应发空 plan (不残留旧 plan)"""
+        differ = self._new_differ()
+        # 先有 plan
+        snap1 = {"projection": {}, "messages": [],
+                 "todos": [{"content": "任务1", "status": "in_progress", "priority": "high"}]}
+        differ.diff(None, snap1)
+        # plan 清空
+        snap2 = {"projection": {}, "messages": [], "todos": []}
+        events = differ.diff(snap1, snap2)
+        plans = [e for e in events if e["kind"] == "PlanUpdate"]
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["entries"], [])  # 空列表也要发
 
     def test_p3a_reasoning_delta(self):
         """P3a: reasoning part 增量 → ReasoningDelta"""
