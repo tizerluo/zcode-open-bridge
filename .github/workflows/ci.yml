@@ -65,11 +65,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # 测试用 stdlib unittest, 无需安装任何依赖
-      - name: Run tests (projection differ)
-        run: python3 tests/test_projection_differ.py -v
-
-      - name: Run tests (event translator)
-        run: python3 tests/test_event_translator.py -v
+      # unittest discover 自动发现 tests/ 下所有 test_*.py
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
   perms:
     name: Executable bit check

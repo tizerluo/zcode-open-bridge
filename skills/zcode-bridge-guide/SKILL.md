@@ -207,10 +207,11 @@ while True:
         break
     elif msg.get("method") == "session/update":
         update = msg["params"]["update"]
-        if update.get("sessionUpdate") == "agent_message_chunk":
+        su = update.get("sessionUpdate", "")
+        if su == "agent_message_chunk":
             chunks.append(update["content"]["text"])
-        elif update.get("sessionUpdate") == "tool_call":
-            print("工具调用:", update["toolCall"])
+        elif su in ("tool_call", "tool_call_update"):
+            print("工具调用:", update.get("toolCallId"), update.get("status"))
 
 print("回复:", "".join(chunks))
 proc.terminate()
@@ -339,7 +340,7 @@ npm test     # 全量，看实际数字
 
 **降级行为**：
 - ACP bridge 检测到 `session/subscribe` 不可用时，自动切换到轮询 `session/read`（伪流式）
-- 扩展方法（fork/rewind/goal/compact/steer）在旧版上报 `Method not supported` 错误（-32601），不影响标准 ACP 方法
+- 扩展方法（fork/rewind/goal/compact/steer）在旧版 ZCode 上会透传后端错误（`-32603 zcode <method> failed: ...`），不影响标准 ACP 方法
 
 ---
 

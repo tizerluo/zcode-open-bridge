@@ -920,8 +920,11 @@ class ACPBridge:
         # 实测 goal set 的内部 AI turn 耗时 10-45s+ 不等, 必须等锁释放
         # 否则后续 show/compact 会报 "prompt is running"
         if action in ("set", "replace"):
-            self._wait_for_turn_idle(zcode_sid, timeout=60, probe_method="session/goal")
-            log(f"session/goal action={action} → ok (内部 turn lock 已释放)")
+            released = self._wait_for_turn_idle(zcode_sid, timeout=60, probe_method="session/goal")
+            if released:
+                log(f"session/goal action={action} → ok (内部 turn lock 已释放)")
+            else:
+                log(f"session/goal action={action} → ok (⚠ lock 等待超时, 后续 show/compact 可能暂不可用)")
         else:
             log(f"session/goal action={action} → ok")
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
@@ -1071,42 +1074,54 @@ class ACPBridge:
             differ.mark_seen(baseline_msgs)
         chunk_msg_id = f"msg_{uuid.uuid4().hex[:12]}"
 
-        # 发送给 zcode 并等待 accepted 响应 (reader 线程模式下用 request)
-        zc_id = self._next_id()
-        resp, _ = self.backend.request(zc_id, "session/send",
-                                       {"sessionId": zcode_sid, "content": prompt_text},
-                                       timeout=10)
-        if "error" in resp:
-            del self.pending_turns[msg_id]
-            return self._error(msg_id, -32603,
-                               f"zcode send failed: {resp['error'].get('message', '')}")
-        send_accepted = resp.get("result", {}).get("accepted", False)
-        if not send_accepted:
-            del self.pending_turns[msg_id]
-            return self._error(msg_id, -32603, "zcode send 未被接受 (无 accepted 响应)")
-
         # ===== 双模式: 优先事件驱动, 失败降级轮询 =====
         # 新版 ZCode (0.14.8+) 支持 session/subscribe 推送流式事件 (model.streaming)。
         # 事件驱动模式下: model.streaming → 逐段 TextDelta (真流式);
         #                tool.updated → 实时工具调用状态。
         # 降级模式 (旧版 CLI / subscribe 失败): 轮询 session/read, turn 结束整段发 (伪流式)。
 
-        # 先尝试订阅事件流
+        # ⚠️ 时序关键: 必须先 subscribe + register listener, 再 session/send。
+        # 否则 send 和 register 之间的 session/event 会被 reader 线程丢弃,
+        # 短 turn 的 turn.completed 可能丢失导致 120s 超时。
         listener = EventStreamListener(self.backend, zcode_sid)
         sub_id = self._next_id()
         snapshot = listener.subscribe(sub_id)
 
         if snapshot is not None:
-            # 事件驱动模式
+            # 事件驱动模式: 先注册 listener (确保不丢事件), 再 send
             self.backend.register_event_listener(zcode_sid, listener)
             try:
+                # 现在 send prompt (listener 已注册, 不会丢事件)
+                zc_id = self._next_id()
+                resp, _ = self.backend.request(zc_id, "session/send",
+                                               {"sessionId": zcode_sid, "content": prompt_text},
+                                               timeout=10)
+                if "error" in resp:
+                    del self.pending_turns[msg_id]
+                    return self._error(msg_id, -32603,
+                                       f"zcode send failed: {resp['error'].get('message', '')}")
+                if not resp.get("result", {}).get("accepted", False):
+                    del self.pending_turns[msg_id]
+                    return self._error(msg_id, -32603, "zcode send 未被接受 (无 accepted 响应)")
+
                 result = self._run_event_turn(
                     listener, acp_sid, zcode_sid, msg_id, turn, chunk_msg_id, differ)
             finally:
                 self.backend.unregister_event_listener(zcode_sid)
             return result
         else:
-            # 降级: 轮询模式 (原逻辑)
+            # 降级: 轮询模式 — send 在轮询循环前发
+            zc_id = self._next_id()
+            resp, _ = self.backend.request(zc_id, "session/send",
+                                           {"sessionId": zcode_sid, "content": prompt_text},
+                                           timeout=10)
+            if "error" in resp:
+                del self.pending_turns[msg_id]
+                return self._error(msg_id, -32603,
+                                   f"zcode send failed: {resp['error'].get('message', '')}")
+            if not resp.get("result", {}).get("accepted", False):
+                del self.pending_turns[msg_id]
+                return self._error(msg_id, -32603, "zcode send 未被接受 (无 accepted 响应)")
             log("  ⟳ 降级轮询模式 (事件流不可用)")
             return self._run_polling_turn(
                 acp_sid, zcode_sid, msg_id, turn, chunk_msg_id, differ)
@@ -1119,6 +1134,8 @@ class ACPBridge:
         translator = EventTranslator()
         t0 = time.time()
         emitted_text = False   # 本轮是否已通过事件发过文本 (用于决定兜底)
+        last_event_time = time.time()
+        stall_checked = False  # 是否已做过停滞收尾检查
 
         while time.time() - t0 < 120:
             # 每轮先处理 inbox: 让 session/cancel 真正生效
@@ -1132,11 +1149,37 @@ class ACPBridge:
             # 从事件队列取一条 (超时 0.5s)
             event = listener.poll_event(timeout=0.5)
             if event is None:
-                # 无事件, 继续循环 (cancel 检查)
-                # 超时保护: 如果 turn 已启动但 10s 无事件, 降级为错误
-                if translator.turn_started and time.time() - t0 > 30:
-                    log("  ⚠ 事件流停滞, 检查是否降级")
+                # 无事件。如果 turn 已启动且超过 15s 无事件,
+                # 可能 turn.completed 事件丢失 → 用 session/read 确认并轮询收尾
+                if translator.turn_started and not stall_checked \
+                        and time.time() - last_event_time > 15:
+                    stall_checked = True
+                    log("  ⚠ 事件流停滞 15s, 用 session/read 确认 turn 状态")
+                    monitor = TurnMonitor(self.backend, zcode_sid, self)
+                    proj = monitor.poll_once()
+                    if proj and proj.get("status") == "idle":
+                        log("  ✓ 确认 turn 已完成 (事件丢失), 轮询收尾")
+                        # 复用轮询模式的收尾: 取 snapshot 发差异事件 + 兜底
+                        cur_snapshot = self._build_snapshot(zcode_sid, proj)
+                        for ev in differ.diff(None, cur_snapshot):
+                            self._dispatch_event(ev, acp_sid, chunk_msg_id)
+                            if ev.get("kind") == "TextDelta":
+                                emitted_text = True
+                        del self.pending_turns[msg_id]
+                        if not emitted_text:
+                            reply_text = self._fetch_last_reply(zcode_sid, differ)
+                            if reply_text:
+                                self._send_acp_notification("session/update", {
+                                    "sessionId": acp_sid,
+                                    "update": {"sessionUpdate": "agent_message_chunk",
+                                               "content": {"type": "text", "text": reply_text},
+                                               "messageId": chunk_msg_id},
+                                })
+                        return {"jsonrpc": "2.0", "id": msg_id,
+                                "result": {"stopReason": "end_turn"}}
                 continue
+
+            last_event_time = time.time()
 
             # 翻译事件 → ACP 事件 dict 列表
             acp_events = translator.translate(event)
