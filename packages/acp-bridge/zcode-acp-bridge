@@ -4,7 +4,7 @@ zcode-acp-bridge — 把 headless ZCode 桥接为 ACP (Agent Client Protocol) Ag
 
 让 Zed / JetBrains 等 ACP 兼容编辑器能通过标准 ACP 协议调用 zcode (GLM-5.2)。
 
-工作原理:
+工作原理 (双模式自动选择):
   ACP Client (编辑器)            zcode-acp-bridge              zcode app-server
        │                              │                              │
        │  ACP initialize              │                              │
@@ -15,35 +15,37 @@ zcode-acp-bridge — 把 headless ZCode 桥接为 ACP (Agent Client Protocol) Ag
        │  {sessionId}                 │◀─────────────────────────────│
        │◀─────────────────────────────│                              │
        │                              │                              │
-       │  ACP session/prompt          │  zcode session/send (不等)    │
+       │  ACP session/prompt          │  zcode session/subscribe     │
        │─────────────────────────────▶│─────────────────────────────▶│
-       │                              │  {accepted}                  │
-       │                              │◀─────────────────────────────│
-       │                              │                              │
-       │                              │  监听 state.updated           │
-       │                              │◀─────────────────────────────│
-       │                              │  直到 status:idle            │
-       │                              │                              │
-       │                              │  zcode session/messages      │
+       │                              │  register listener            │
+       │                              │  zcode session/send           │
        │                              │─────────────────────────────▶│
-       │                              │  (拿完整回复文本)             │
+       │                              │                              │
+       │                              │  session/event 推送:          │
+       │                              │  model.streaming → 流式文本   │
+       │                              │  tool.updated → 工具状态      │
+       │                              │  turn.completed → 收尾        │
        │                              │◀─────────────────────────────│
        │                              │                              │
-       │  session/update notification │                              │
-       │  (agent_message_chunk)       │                              │
+       │  session/update (流式)       │                              │
+       │  agent_message_chunk (逐段)  │                              │
+       │  tool_call / tool_call_update│                              │
        │◀─────────────────────────────│                              │
        │  session/prompt result       │                              │
        │  {stopReason: end_turn}      │                              │
        │◀─────────────────────────────│                              │
 
-MVP 范围 (阶段1):
+  若 session/subscribe 不可用 (旧版 CLI <0.14.8): 自动降级为轮询 session/read,
+  turn 完成后整段发文本 (伪流式)。
+
+能力范围:
   ✅ initialize 握手
   ✅ session/new → session/create
-  ✅ session/prompt → session/send + 监听 + 返回
-  ✅ 文本输出 (非流式, turn 结束一次性发)
-  ✅ session/cancel 处理
-  ❌ 流式文本 (阶段2)
-  ❌ 工具调用展示 (阶段2)
+  ✅ session/prompt → 事件驱动真流式 (0.14.8+) / 轮询伪流式 (旧版降级)
+  ✅ 流式文本 (model.streaming → agent_message_chunk 逐段)
+  ✅ 工具调用展示 (tool.updated → tool_call/tool_call_update 实时)
+  ✅ session/cancel → session/stop
+  ✅ 扩展方法: fork/rewind/goal/compact/steer (0.14.8+)
 
 协议: ACP (JSON-RPC 2.0 over stdio) 对外; ZCode Protocol (无 jsonrpc 字段) 对内
 依赖: 仅 Python3 标准库
@@ -124,7 +126,8 @@ class ZCodeBackend:
         # 当前事件监听器: {zcode_sid: EventStreamListener}
         self._event_listeners = {}
         self._listeners_lock = threading.Lock()
-        # 启动后台 reader 线程
+        # reader 线程健康标志: 退出后设 True, request() 快速失败而非慢速假死
+        self._reader_dead = False
         self._reader_stop = False
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
@@ -178,7 +181,14 @@ class ZCodeBackend:
             except Exception as e:
                 log(f"reader 线程异常: {e}")
                 break
-        log("reader 线程退出")
+        # reader 退出: 设标志, 后续 request() 快速失败而非慢速假死
+        self._reader_dead = True
+        # 清理所有等待中的响应队列, 让它们立即得到错误
+        with self._resp_lock:
+            for q in self._response_queues.values():
+                q.put({"error": {"message": "zcode backend reader exited"}})
+            self._response_queues.clear()
+        log("reader 线程退出 (backend 已标记为 dead)")
 
     def register_event_listener(self, zcode_sid, listener):
         """注册事件监听器, 之后该 sid 的 session/event 会路由到它。"""
@@ -215,11 +225,20 @@ class ZCodeBackend:
         """
         if params is None:
             params = {}
+        # reader 已死: 快速失败, 不让调用方卡满 timeout
+        if self._reader_dead:
+            return {"error": {"message": "zcode backend reader exited (backend dead)"}}, []
         # 注册响应队列
         resp_q = queue.Queue()
         with self._resp_lock:
             self._response_queues[msg_id] = resp_q
-        self.send({"id": msg_id, "method": method, "params": params})
+        try:
+            self.send({"id": msg_id, "method": method, "params": params})
+        except (BrokenPipeError, OSError) as e:
+            with self._resp_lock:
+                self._response_queues.pop(msg_id, None)
+            self._reader_dead = True
+            return {"error": {"message": f"zcode backend pipe broken: {e}"}}, []
         try:
             resp = resp_q.get(timeout=timeout)
             return resp, []  # notifications 已由 reader 分发, 不再在这里收集
@@ -462,7 +481,21 @@ class EventTranslator:
                     "status": "failed",
                     "output": payload.get("error", ""),
                 })
-        # batch 事件 (多个工具一起完成) 不单独翻译, 各工具的 result 事件已覆盖
+
+        elif tkind == "batch":
+            # batch: 多个工具一起完成。payload 含 toolCallIds[] + successCount/errorCount。
+            # 实测 zcode 通常也会逐个发 result, 但作为兜底: 若 batch 里有未完成的 call_id,
+            # 补发 completed, 防止工具在编辑器里永远卡在 in_progress。
+            batch_ids = payload.get("toolCallIds", [])
+            error_count = payload.get("errorCount", 0)
+            for bid in batch_ids:
+                # 只补发 scheduled 过的 (避免给未知 id 发幽灵事件)
+                if bid in self._seen_tool_ids:
+                    results.append({
+                        "kind": "ToolCallUpdate",
+                        "call_id": bid,
+                        "status": "failed" if error_count > 0 else "completed",
+                    })
         return results
 
     def _translate_turn_done(self, payload):
@@ -933,6 +966,9 @@ class ACPBridge:
         """扩展 session/compact → zcode session/compact: 压缩对话上下文。
 
         params: {sessionId}
+        注: compact 本身是同步的 (返回 snapshot), 不启动内部 turn。
+        但若前一个 goal set 的内部 turn 仍在跑, compact 会报 "prompt is running"。
+        goal set handler 已等待 lock 释放, 所以正常流程不会撞此问题。
         """
         self.ensure_backend()
         acp_sid = params.get("sessionId")

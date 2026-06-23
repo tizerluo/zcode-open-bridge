@@ -255,6 +255,52 @@ class TestEventTranslator(unittest.TestCase):
         self.assertEqual(events[0]["status"], "failed")
         self.assertEqual(events[0]["output"], "命令失败")
 
+    # ---------- E13: batch tool completion ----------
+    def test_e13_tool_batch(self):
+        """E13: tool.updated batch → 为 scheduled 过的 call_id 补发 completed"""
+        t = self._new_translator()
+        # 两个工具 scheduled
+        t.translate(_event("tool.updated", {"kind": "scheduled", "toolCallId": "b1", "toolName": "Read"}))
+        t.translate(_event("tool.updated", {"kind": "scheduled", "toolCallId": "b2", "toolName": "Bash"}))
+        # batch 事件 (含 toolCallIds)
+        events = t.translate(_event("tool.updated", {
+            "kind": "batch", "toolCallIds": ["b1", "b2"], "successCount": 2, "errorCount": 0}))
+        # 应为两个 scheduled 过的 id 各补发 completed
+        self.assertEqual(len(events), 2)
+        statuses = {e["call_id"]: e["status"] for e in events}
+        self.assertEqual(statuses["b1"], "completed")
+        self.assertEqual(statuses["b2"], "completed")
+
+    def test_e13b_batch_with_errors(self):
+        """E13b: batch 有 error → 对应 call_id 标记 failed"""
+        t = self._new_translator()
+        t.translate(_event("tool.updated", {"kind": "scheduled", "toolCallId": "be1", "toolName": "Bash"}))
+        events = t.translate(_event("tool.updated", {
+            "kind": "batch", "toolCallIds": ["be1"], "successCount": 0, "errorCount": 1}))
+        self.assertEqual(events[0]["status"], "failed")
+
+    def test_e13c_batch_ignores_unknown_ids(self):
+        """E13c: batch 里的未知 toolCallId (未 scheduled) 不补发"""
+        t = self._new_translator()
+        t.translate(_event("tool.updated", {"kind": "scheduled", "toolCallId": "known", "toolName": "Read"}))
+        events = t.translate(_event("tool.updated", {
+            "kind": "batch", "toolCallIds": ["known", "unknown"], "successCount": 2, "errorCount": 0}))
+        # 只有 "known" 补发, "unknown" 忽略
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["call_id"], "known")
+
+    # ---------- E14: reader dead fail-fast ----------
+    def test_e14_turn_usage_total_tokens(self):
+        """E14: turn.completed 的 usage.totalTokens 优先于 tokenCount"""
+        t = self._new_translator()
+        events = t.translate(_event("turn.completed", {
+            "resultType": "success",
+            "tokenCount": 50,
+            "usage": {"totalTokens": 200, "contextWindow": 100000},
+        }))
+        usage_events = [e for e in events if e["kind"] == "UsageDelta"]
+        self.assertEqual(usage_events[0]["used"], 200)  # totalTokens 优先
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
