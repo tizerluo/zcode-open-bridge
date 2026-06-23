@@ -116,12 +116,31 @@ zcode --prompt "继续" --resume sess_xxxx
 |----------|:----:|
 | initialize / session/new / session/prompt / session/cancel | ✅ |
 | session/list / session/resume | ✅ |
-| tool_call / tool_call_update（工具调用展示）| ✅ |
+| tool_call / tool_call_update（工具调用展示）| ✅ 实时 |
 | usage_update（token 用量）| ✅ |
-| agent_message_chunk（文本输出）| ✅ |
-| agent_thought_chunk（思考过程）| ⚠️ 代码就位，GLM-5.2 不产数据 |
+| agent_message_chunk（文本输出）| ✅ **真流式**（0.14.8+）|
+| agent_thought_chunk（思考过程）| ✅ 流式（GLM-5-Turbo）|
 | plan（任务清单）| ⚠️ 代码就位，数据驱动 |
 | diff（文件变更）| ⚠️ 仅文件名，无 diff 内容 |
+
+#### 双模式自动降级
+
+ACP bridge 支持**事件驱动**（真流式）和**轮询**（伪流式）两种模式，自动选择：
+
+- **事件驱动模式**（ZCode CLI ≥ 0.14.8）：通过 `session/subscribe` 订阅事件流，`model.streaming` 事件携带 `text_delta` 逐段推送，实现**真正的流式文本输出**。工具调用状态也实时推送（scheduled → started → progress → result）。
+- **轮询模式**（旧版 CLI 或订阅失败）：自动降级为轮询 `session/read`，turn 完成后整段发文本（伪流式）。
+
+#### 扩展方法（非标准 ACP）
+
+ACP bridge 额外暴露了 ZCode 新版（0.14.8+）的协议方法，供编辑器/脚本调用：
+
+| 扩展方法 | 作用 | params |
+|----------|------|--------|
+| `session/fork` | 从 checkpoint 分叉新会话 | `{sessionId, target?}` |
+| `session/rewind` | 回退工作区文件到 checkpoint | `{sessionId, target?, expectedRevision?}` |
+| `session/goal` | 读取/设置 session 目标 | `{sessionId, action: show\|set\|replace\|clear, objective?}` |
+| `session/compact` | 压缩对话上下文 | `{sessionId}` |
+| `session/steer` | turn 进行中追加指令 | `{sessionId, content}` |
 
 ## 会话存储
 
@@ -129,13 +148,41 @@ zcode --prompt "继续" --resume sess_xxxx
 - `--prompt` 创建的会话可被 `session/list` 看到、被 `--resume` 或 ACP resume 恢复
 - 反之亦然
 
+## 版本兼容性
+
+本项目兼容以下 ZCode 版本，**对旧版完全向后兼容**：
+
+| ZCode CLI 版本 | 支持情况 | ACP bridge 流式 | 扩展方法 |
+|:--------------:|:--------:|:---------------:|:--------:|
+| **0.14.8+**（App 3.1.4） | ✅ 完整 | **真流式**（事件驱动） | ✅ fork/rewind/goal/compact/steer |
+| **0.14.5 ~ 0.14.7** | ✅ 兼容 | 伪流式（自动降级轮询） | ❌（旧版协议未实现） |
+| **< 0.14.5** | ⚠️ 未测 | — | — |
+
+**降级行为**（自动，无需手动配置）：
+- ACP bridge 检测到 `session/subscribe` 不可用时，自动切换到轮询 `session/read`（伪流式）
+- 扩展方法（fork/rewind/goal/compact/steer）在旧版 ZCode 上会透传后端错误（`-32603 zcode <method> failed: ...`），不影响标准 ACP 方法（new/prompt/cancel/list/resume）
+
+## Skill（驱动说明书）
+
+项目附带一个通用 skill [zcode-bridge-guide](skills/zcode-bridge-guide/SKILL.md)，覆盖：
+- 三种接入模式（CLI / ACP / MCP）的完整使用方法
+- 凭证配置、非交互 shell 坑
+- 真流式 vs 伪流式双模式说明
+- 扩展协议方法（fork/rewind/goal/compact/steer）
+- 任务书模板、独立复核、版本兼容性
+
+复制到 ZCode 的 skill 目录即可使用：
+```bash
+cp -r skills/zcode-bridge-guide ~/.zcode/skills/
+```
+
 ## ⚠️ 重要限制（请务必阅读）
 
 本项目是建立在**闭源 ZCode** 之上的非官方桥接器，存在以下固有限制：
 
 1. **依赖闭源软件**：必须先安装 ZCode。ZCode 升级可能随时破坏本项目（协议字段靠逆向确认，无官方保证）。
 2. **工具调用 turn 不稳定**：ZCode app-server 的工具调用 turn 时长在 38s～100s+ 波动，有时不完成。
-3. **流式是伪流式**：ZCode 是快照式架构（turn 期间不推送中间事件），ACP bridge 的流式文本是 turn 完成后整段发。
+3. **流式输出**：ZCode CLI ≥ 0.14.8 支持事件推送（`session/subscribe`），ACP bridge 在此版本下实现**真流式**（逐段推送）；旧版自动降级为伪流式（turn 完成后整段发）。
 4. **diff 无内容**：ZCode 协议层不暴露 oldText/newText，只能列文件名。
 5. **GLM-5.2 无推理输出**：思考过程（agent_thought_chunk）在 GLM-5.2 下不触发，需 GLM-5-Turbo。
 6. **TUI 不可用**：`zcode` 无参数直接运行（TUI 模式）在独立终端报错（缺 `@zcode/tui` 模块），仅 headless 模式可用。
@@ -151,8 +198,11 @@ zcode-open-bridge/
 │   └── acp-bridge/      # ACP 桥接 (experimental)
 ├── shared/
 │   └── credentials.py   # 凭证读取 (单一真相源)
+├── skills/
+│   └── zcode-bridge-guide/  # 驱动 ZCode 的通用 skill (说明书)
 ├── tests/
-│   └── test_projection_differ.py
+│   ├── test_projection_differ.py
+│   └── test_event_translator.py
 ├── LICENSE              # MIT
 └── README.md
 ```
