@@ -34,7 +34,7 @@ ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 # ============================================================
 OVERVIEW = {
     "tool": "zcode",
-    "version_described": "0.14.5",
+    "version_described": "0.14.8 (App 3.1.4)",
     "what_it_is": (
         "ZCode 是智谱(Z.AI)的 Agentic Coding CLI, 由 GLM 系列模型驱动。"
         "它能自主完成代码编写/审查/调试/分析等任务, 可调用工具(读写文件、"
@@ -114,7 +114,17 @@ NATIVE_CLI = {
          "description": "为 session 设定长期目标, 触发跨多轮的长程任务。两种等价写法: "
                         "`--target <objective>` (与 --prompt 互斥) 或在 prompt 开头用 `/goal <objective>`。",
          "example": "zcode --target \"重构认证模块\"   或   zcode --prompt \"/goal 重构认证模块\"",
-         "equivalent": "--target \"<obj>\"  ==  --prompt \"/goal <obj>\""},
+         "equivalent": "--target \"<obj>\"  ==  --prompt \"/goal <obj>\"",
+         "since": "0.14.x"},
+        {"category": "input", "name": "target-replace", "supported": True,
+         "description": "与 --target 配合: 替换已存在的 session 目标 (不追加)",
+         "arg": "--target-replace",
+         "example": "zcode --target \"新目标\" --target-replace",
+         "since": "0.14.8"},
+        {"category": "input", "name": "locale", "supported": True,
+         "description": "UI 语言: en-US / zh-CN / auto",
+         "arg": "--locale <locale>",
+         "since": "0.14.8"},
         {"category": "input", "name": "stdin-pipe", "supported": False,
          "description": "管道输入 — 不支持",
          "workaround": "用 --attach 传文件"},
@@ -151,6 +161,17 @@ NATIVE_CLI = {
          "example": "zcode --prompt \"继续\" --resume sess_xxxx"},
         {"category": "session", "name": "continue", "supported": True,
          "description": "续接当前目录最近会话", "arg": "-c / --continue"},
+        {"category": "session", "name": "fork", "supported": True,
+         "description": "从 checkpoint 分叉新会话 (不破坏原会话)", "arg": "TUI 内 /fork [latest|checkpointId]",
+         "since": "0.14.8"},
+        {"category": "session", "name": "rewind", "supported": True,
+         "description": "回退工作区文件到某个 checkpoint", "arg": "TUI 内 /rewind [latest|checkpointId]",
+         "since": "0.14.8"},
+        # 诊断
+        {"category": "diagnostic", "name": "doctor", "supported": True,
+         "description": "检查运行时与打包环境 (版本/node/平台/SEA)",
+         "arg": "zcode doctor",
+         "since": "0.14.8"},
         # 自主性
         {"category": "agency", "name": "autonomous-tools", "supported": True,
          "description": "自主调用工具: 读写文件、Bash、Grep、Web 搜索等",
@@ -194,6 +215,16 @@ APP_SERVER = {
         {"method": "session/setMode", "params": "sessionId, mode", "result": "ok"},
         {"method": "interaction/requestPermission", "params": "requestId, toolCallId, decision",
          "note": "应答权限; decision: allow/deny/escalate/modify"},
+        {"method": "session/events", "params": "sessionId?", "note": "0.14.8+: 拉取增量事件 (新)"},
+        {"method": "session/subscribe", "params": "sessionId", "note": "0.14.8+: 订阅事件推送 (新)"},
+        {"method": "session/steer", "params": "sessionId, content", "note": "0.14.8+: 在 turn 进行中追加/改向指令 (新)"},
+        {"method": "session/stop", "params": "sessionId", "note": "0.14.8+: 停止当前 turn (新)"},
+        {"method": "session/fork", "params": "sessionId, checkpointId?", "note": "0.14.8+: 从 checkpoint 分叉 (新)"},
+        {"method": "session/rewind", "params": "sessionId, checkpointId?", "note": "0.14.8+: 回退工作区文件 (新)"},
+        {"method": "session/goal", "params": "sessionId, goal?", "note": "0.14.8+: 读/设 session 目标 (新)"},
+        {"method": "session/compact", "params": "sessionId", "note": "0.14.8+: 压缩对话上下文 (新)"},
+        {"method": "session/setModel", "params": "sessionId, modelId", "note": "0.14.8+: 切换模型 (新)"},
+        {"method": "session/cancelBackgroundTask", "params": "sessionId", "note": "0.14.8+: 取消后台任务 (新)"},
     ],
     "turn_model": {
         "description": "异步模型: send 立即返回, turn 完成需轮询 session/read",
