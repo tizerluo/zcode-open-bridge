@@ -899,6 +899,9 @@ class ACPBridge:
         params: {sessionId, action?, objective?}
           - action 默认 "show" (读取); "set" 设置; "replace" 替换; "clear" 清除; "pause"/"resume" 暂停/恢复
           - objective: 目标文本 (action=set/replace 时必填)
+
+        注意: action=set/replace 会启动内部 AI turn (异步), 必须等待其完成
+        否则后续调用会报 "Cannot manage goals while a prompt is running"。
         """
         self.ensure_backend()
         acp_sid = params.get("sessionId")
@@ -913,7 +916,14 @@ class ACPBridge:
             return self._error(msg_id, -32603,
                                f"zcode goal failed: {resp['error'].get('message', '')}")
         result = resp.get("result", {})
-        log(f"session/goal action={action} → ok")
+        # set/replace 启动内部 turn, 等待其 prompt lock 释放 (用 goal show 探测)
+        # 实测 goal set 的内部 AI turn 耗时 10-45s+ 不等, 必须等锁释放
+        # 否则后续 show/compact 会报 "prompt is running"
+        if action in ("set", "replace"):
+            self._wait_for_turn_idle(zcode_sid, timeout=60, probe_method="session/goal")
+            log(f"session/goal action={action} → ok (内部 turn lock 已释放)")
+        else:
+            log(f"session/goal action={action} → ok")
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
     def _on_session_compact(self, msg_id, params):
@@ -966,6 +976,54 @@ class ACPBridge:
             return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
         except Exception:
             return None
+
+    def _wait_for_turn_idle(self, zcode_sid, timeout=45, probe_method=None):
+        """等待 zcode 会话的内部 turn 完成后 lock 释放。
+
+        session/goal(set)、session/compact 等方法会启动内部 AI turn,
+        它们在 request() 返回后仍在后台运行。projection.status=idle 并不
+        意味着内部 prompt lock 已释放 (实测 goal set 后 status 很快变 idle,
+        但 "prompt is running" lock 持续 10-25s)。因此可靠的方式是:
+        重试一个探测调用直到不再报 "while a prompt is running"。
+
+        Args:
+            zcode_sid: zcode 会话 ID
+            timeout: 最大等待秒数
+            probe_method: 可选, 探测用的 zcode 方法 (如 "session/goal" show)。
+                          若为 None 则用 session/read 轮询 status。
+        Returns:
+            True 若 lock 已释放; False 超时。
+        """
+        t0 = time.time()
+        if probe_method:
+            # 用探测调用重试, 直到不再报 "prompt is running"
+            while time.time() - t0 < timeout:
+                probe_id = self._next_id()
+                resp, _ = self.backend.request(probe_id, probe_method,
+                                               {"sessionId": zcode_sid, "action": "show"},
+                                               timeout=10)
+                if "error" not in resp:
+                    log(f"  [probe] lock 已释放 (elapsed {round(time.time()-t0,1)}s)")
+                    return True  # lock 已释放
+                err_msg = resp.get("error", {}).get("message", "")
+                # timeout 或 "prompt is running" 都继续等; 其他错误视为释放
+                if "prompt is running" in err_msg or "timeout" in err_msg.lower():
+                    time.sleep(2)
+                    continue
+                log(f"  [probe] 非锁错误, 视为释放: {err_msg[:50]}")
+                return True
+            log(f"  [probe] 等待超时 ({timeout}s), lock 可能仍占用")
+            return False
+        else:
+            # fallback: 轮询 status
+            monitor = TurnMonitor(self.backend, zcode_sid, self)
+            while time.time() - t0 < timeout:
+                proj = monitor.poll_once()
+                if proj and proj.get("status") == "idle":
+                    time.sleep(1)
+                    return True
+                time.sleep(0.5)
+            return False
 
     def _on_session_prompt(self, msg_id, params):
         """ACP session/prompt → zcode session/send + 监听 state.updated + 返回
