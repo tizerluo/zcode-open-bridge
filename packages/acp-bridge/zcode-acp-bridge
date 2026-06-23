@@ -1135,7 +1135,7 @@ class ACPBridge:
         t0 = time.time()
         emitted_text = False   # 本轮是否已通过事件发过文本 (用于决定兜底)
         last_event_time = time.time()
-        stall_checked = False  # 是否已做过停滞收尾检查
+        last_stall_check = 0   # 上次停滞检查的时间戳 (可重复检查)
 
         while time.time() - t0 < 120:
             # 每轮先处理 inbox: 让 session/cancel 真正生效
@@ -1150,22 +1150,21 @@ class ACPBridge:
             event = listener.poll_event(timeout=0.5)
             if event is None:
                 # 无事件。如果 turn 已启动且超过 15s 无事件,
-                # 可能 turn.completed 事件丢失 → 用 session/read 确认并轮询收尾
-                if translator.turn_started and not stall_checked \
-                        and time.time() - last_event_time > 15:
-                    stall_checked = True
-                    log("  ⚠ 事件流停滞 15s, 用 session/read 确认 turn 状态")
+                # 可能 turn.completed 事件丢失 → 用 session/read 确认并轮询收尾。
+                # 每 15s 可重复检查 (长静默 turn 不会只查一次就放弃)。
+                if translator.turn_started \
+                        and time.time() - last_event_time > 15 \
+                        and time.time() - last_stall_check > 15:
+                    last_stall_check = time.time()
+                    log("  ⚠ 事件流停滞, 用 session/read 确认 turn 状态")
                     monitor = TurnMonitor(self.backend, zcode_sid, self)
                     proj = monitor.poll_once()
                     if proj and proj.get("status") == "idle":
-                        log("  ✓ 确认 turn 已完成 (事件丢失), 轮询收尾")
-                        # 复用轮询模式的收尾: 取 snapshot 发差异事件 + 兜底
-                        cur_snapshot = self._build_snapshot(zcode_sid, proj)
-                        for ev in differ.diff(None, cur_snapshot):
-                            self._dispatch_event(ev, acp_sid, chunk_msg_id)
-                            if ev.get("kind") == "TextDelta":
-                                emitted_text = True
+                        log("  ✓ 确认 turn 已完成 (事件可能丢失), 收尾")
                         del self.pending_turns[msg_id]
+                        # 停滞收尾: 不调 differ.diff() (differ 不知道事件路径已发过什么,
+                        # 会重复发 TextDelta/tool 事件)。只做兜底: 若事件路径未发文本,
+                        # 用 _fetch_last_reply 取最后回复。
                         if not emitted_text:
                             reply_text = self._fetch_last_reply(zcode_sid, differ)
                             if reply_text:
