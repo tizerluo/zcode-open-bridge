@@ -101,6 +101,52 @@ def load_zcode_credentials():
     return {}
 
 
+def _merge_env_with_creds(creds):
+    """合并 config 凭证与环境变量: 显式非空 env 优先, 空串视为未设置;
+    且自动检测/自愈 App 注入的残留 baseURL (issue #3)。
+
+    源自 shared/credentials.py.merge_env_with_creds (单文件可独立运行故内嵌)。
+    残留检测: env 的 ZCODE_BASE_URL 若是 config 里"另一个 provider"的官方 endpoint
+    (App 切换 plan 后的残留), 自愈用 config 值; 用户自建 endpoint 则尊重 env。
+    """
+    merged = {**os.environ, **creds}
+    for k in ("ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"):
+        v = os.environ.get(k)
+        if v:  # 仅非空才覆盖
+            merged[k] = v
+    # 残留检测
+    env_bu = os.environ.get("ZCODE_BASE_URL", "")
+    config_bu = creds.get("ZCODE_BASE_URL", "")
+    if env_bu and config_bu and env_bu != config_bu:
+        all_hosts = set()
+        try:
+            from urllib.parse import urlparse as _up
+            with open(ZCODE_CREDS_PATH) as _f:
+                _cfg = json.load(_f)
+            for _p in _cfg.get("provider", {}).values():
+                _bu = _p.get("options", {}).get("baseURL", "")
+                if _bu:
+                    try:
+                        _h = _up(_bu)
+                        if _h.hostname:
+                            all_hosts.add(f"{_h.scheme}://{_h.netloc}" if _h.scheme else _h.netloc)
+                    except Exception:
+                        pass
+            _eh = _up(env_bu)
+            env_host = f"{_eh.scheme}://{_eh.netloc}" if (_eh.scheme and _eh.hostname) else None
+            _ch = _up(config_bu)
+            config_host = f"{_ch.scheme}://{_ch.netloc}" if (_ch.scheme and _ch.hostname) else None
+        except Exception:
+            env_host = config_host = None
+        # env host 等于某 config provider host, 但不等于 enabled 那个 → 残留
+        if env_host and config_host and env_host != config_host and env_host in all_hosts:
+            merged["ZCODE_BASE_URL"] = config_bu
+            log(f"⚠ ZCODE_BASE_URL 残留检测: env='{env_bu}' 是 config 里另一个 provider "
+                f"的 endpoint, 与 enabled provider (config='{config_bu}') 不一致。已自动用 "
+                f"config 值 (旧 plan 残留)。")
+    return merged
+
+
 # ============================================================
 # ZCode app-server 的 client 封装
 # ============================================================
@@ -114,7 +160,9 @@ class ZCodeBackend:
     """
 
     def __init__(self):
-        env = {**os.environ, **load_zcode_credentials()}
+        # 显式非空环境变量优先 (issue #3 子项2): ZCODE_MODEL=xxx 临时覆盖生效,
+        # 但空串 env 视为未设置 (保留 config 值, 避免误清空)。
+        env = _merge_env_with_creds(load_zcode_credentials())
         self.proc = subprocess.Popen(
             [ZCODE_BIN, "app-server", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -1631,7 +1679,8 @@ class ACPBridge:
         """
         translator = EventTranslator()
         t0 = time.time()
-        emitted_text = False   # 本轮是否已通过事件发过文本 (用于决定兜底)
+        emitted_text = False    # 本轮是否已通过事件发过文本 (决定兜底回复发不发)
+        emitted_output = False  # 本轮是否已发过任何实质输出 (text/tool/patch, 决定失败检测)
         last_event_time = time.time()
         last_stall_check = 0   # 上次停滞检查的时间戳 (可重复检查)
 
@@ -1663,15 +1712,25 @@ class ACPBridge:
                         # 停滞收尾: 不调 differ.diff() (differ 不知道事件路径已发过什么,
                         # 会重复发 TextDelta/tool 事件)。只做兜底: 若事件路径未发文本,
                         # 用 _fetch_last_reply 取最后回复。
+                        stall_reply = None
                         if not emitted_text:
-                            reply_text = self._fetch_last_reply(zcode_sid, differ)
-                            if reply_text:
+                            stall_reply = self._fetch_last_reply(zcode_sid, differ)
+                            if stall_reply:
                                 self._send_acp_notification("session/update", {
                                     "sessionId": acp_sid,
                                     "update": {"sessionUpdate": "agent_message_chunk",
-                                               "content": {"type": "text", "text": reply_text},
+                                               "content": {"type": "text", "text": stall_reply},
                                                "messageId": chunk_msg_id},
                                 })
+                        # 失败检测 (issue #3 子项3d / Codex P1#3): 停滞收尾时若事件路径既没收到
+                        # turn.failed (否则已正常返回), 也无任何实质输出 (text/tool/patch),
+                        # 疑似 turn 失败 (如 turn.completed 事件丢失 + provider 错误)。显式告警而非静默成功。
+                        # 用 emitted_output (含 tool/patch) 而非 emitted_text, 避免纯工具 turn 误判。
+                        if not emitted_output and not stall_reply:
+                            log("  ⚠ 停滞收尾: turn 完成但事件路径无输出, 疑似失败")
+                            return self._error(msg_id, -32603,
+                                               "zcode turn 完成但无输出 (停滞收尾疑似失败; "
+                                               "可能 turn 事件丢失或 provider 错误)")
                         return {"jsonrpc": "2.0", "id": msg_id,
                                 "result": {"stopReason": "end_turn"}}
                 continue
@@ -1681,9 +1740,13 @@ class ACPBridge:
             # 翻译事件 → ACP 事件 dict 列表
             acp_events = translator.translate(event)
             for ev in acp_events:
-                # 标记: 是否已通过 model.streaming 发过文本
+                # 标记: 是否已通过 model.streaming 发过文本 (决定兜底回复)
                 if ev.get("kind") == "TextDelta":
                     emitted_text = True
+                # 标记: 是否已发过任何实质输出 text/tool/patch (决定失败检测, Codex P1#3:
+                # 纯工具 turn 有 ToolCallNew 但无 TextDelta, 失败检测必须认 tool 才不误判)
+                if ev.get("kind") in ("TextDelta", "ToolCallNew", "FilesChanged"):
+                    emitted_output = True
                 self._dispatch_event(ev, acp_sid, chunk_msg_id)
 
             # turn 结束判定
@@ -1777,8 +1840,26 @@ class ACPBridge:
                 # turn 完成: 取一次完整 snapshot, 发本轮新增的 tool/text/reasoning/plan 事件
                 cur_snapshot = self._build_snapshot(zcode_sid, projection)
                 events = differ.diff(None, cur_snapshot)
+                has_output = False
                 for ev in events:
+                    # 标记是否本轮产出了实质内容 (text/tool/patch)。PlanUpdate/UsageDelta
+                    # 是辅助信息 (todos/usage 状态), 不是 turn 的实质产出, 不计入。
+                    if ev.get("kind") in ("TextDelta", "ToolCallNew", "FilesChanged"):
+                        has_output = True
                     self._dispatch_event(ev, acp_sid, chunk_msg_id)
+                # 失败检测 (issue #3 子项3d, 修复 PR#2 遗留):
+                # 轮询模式无法收到 turn.failed 事件 payload (zcode 只在事件里给 resultType,
+                # projection/messages 无失败标志, 实测确认)。但若 turn "完成"却完全无有效输出
+                # (只有 step-start 半成品), 强烈暗示 turn 失败 (如 provider 错误)。
+                # 此时返回明确错误而非静默 end_turn, 把"吞掉失败"变成"显式告警"。
+                if not has_output:
+                    reply_text = self._fetch_last_reply(zcode_sid, differ)
+                    if not reply_text:
+                        del self.pending_turns[msg_id]
+                        log("  ⚠ turn 完成但无任何输出 (无 text/tool/patch), 疑似 turn 失败")
+                        return self._error(msg_id, -32603,
+                                           "zcode turn 完成但无输出 (轮询模式疑似失败; "
+                                           "可能 provider 错误, 见 stderr 日志)")
                 turn_completed = True
                 break
 

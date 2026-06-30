@@ -8,7 +8,7 @@ user-invocable: true
 # 驱动 ZCode（三模式通用说明书）
 
 > 本 skill 是 [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) 项目的配套说明书。
-> 兼容 ZCode CLI **0.14.5 ~ 0.15.0+**（App 3.2.0）。新版功能（事件驱动真流式、fork/rewind/goal/compact/steer、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`。
+> 兼容 ZCode CLI **0.14.5 ~ 0.15.0+**（App 3.2.0+，实测含 3.2.1）。新版功能（事件驱动真流式、fork/rewind/goal/compact/steer、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`。
 
 ## 前置条件
 
@@ -116,9 +116,9 @@ cfg = json.loads((pathlib.Path.home() / ".zcode/v2/config.json").read_text())
 for pid, p in cfg.get("provider", {}).items():
     if p.get("enabled"):
         o = p["options"]
+        # canonical model id = config 里 models 的 key 原样 (如 GLM-5.2), 不加 provider 前缀。
+        # 实测 "zai/GLM-5.2" 也兼容, 但与本项目的权威实现 (shared/credentials.py) 不一致, 故统一用原始 id。
         m = "GLM-5.2" if "GLM-5.2" in p.get("models", {}) else next(iter(p.get("models", {})), "")
-        if pid.startswith("builtin:zai"):
-            m = f"zai/{m}"
         print(m, o.get("baseURL", ""), o.get("apiKey", ""))
         break
 PY
@@ -356,7 +356,7 @@ npm test     # 全量，看实际数字
 
 | ZCode CLI 版本 | 支持情况 | 差异 |
 |:--------------:|:--------:|------|
-| **0.15.0+** (App 3.2.0) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel） |
+| **0.15.0+** (App 3.2.0+) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel） |
 | **0.14.8** (App 3.1.4) | ✅ 完整 | ACP bridge 真流式；fork/rewind/goal/compact/steer 可用；workspace/* 与 setThoughtLevel 返回 -32603 |
 | **0.14.5 ~ 0.14.7** | ✅ 兼容 | ACP bridge 自动降级伪流式；扩展方法不可用（协议未实现） |
 | **< 0.14.5** | ⚠️ 未测 | CLI `--prompt` 基本可用；ACP bridge 未验证 |

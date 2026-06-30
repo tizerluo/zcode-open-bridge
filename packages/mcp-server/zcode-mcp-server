@@ -15,10 +15,13 @@ Claude Code、Cursor 等) 能标准化地发现并调用 headless zcode。
 依赖: 仅 Python3 标准库 (零第三方依赖)
 """
 
+import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # zcode-agent-help 的路径 (能力发现的数据源)
@@ -66,6 +69,173 @@ def load_zcode_credentials():
     except Exception as e:
         log(f"读取凭证失败: {e}")
     return {}
+
+
+def _merge_env_with_creds(creds):
+    """合并 config 凭证与环境变量: 显式非空 env 优先, 空串视为未设置;
+    且自动检测/自愈 App 注入的残留 baseURL (issue #3)。
+
+    源自 shared/credentials.py.merge_env_with_creds (单文件可独立运行故内嵌)。
+    残留检测: env 的 ZCODE_BASE_URL 若是 config 里"另一个 provider"的官方 endpoint
+    (App 切换 plan 后的残留), 自愈用 config 值; 用户自建 endpoint 则尊重 env。
+    """
+    merged = {**os.environ, **creds}
+    for k in ("ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"):
+        v = os.environ.get(k)
+        if v:  # 仅非空才覆盖
+            merged[k] = v
+    # 残留检测
+    env_bu = os.environ.get("ZCODE_BASE_URL", "")
+    config_bu = creds.get("ZCODE_BASE_URL", "")
+    if env_bu and config_bu and env_bu != config_bu:
+        all_hosts = set()
+        try:
+            from urllib.parse import urlparse as _up
+            _cfg_path = Path.home() / ".zcode" / "v2" / "config.json"
+            with open(_cfg_path) as _f:
+                _cfg = json.load(_f)
+            for _p in _cfg.get("provider", {}).values():
+                _bu = _p.get("options", {}).get("baseURL", "")
+                if _bu:
+                    try:
+                        _h = _up(_bu)
+                        if _h.hostname:
+                            all_hosts.add(f"{_h.scheme}://{_h.netloc}" if _h.scheme else _h.netloc)
+                    except Exception:
+                        pass
+            _eh = _up(env_bu)
+            env_host = f"{_eh.scheme}://{_eh.netloc}" if (_eh.scheme and _eh.hostname) else None
+            _ch = _up(config_bu)
+            config_host = f"{_ch.scheme}://{_ch.netloc}" if (_ch.scheme and _ch.hostname) else None
+        except Exception:
+            env_host = config_host = None
+        if env_host and config_host and env_host != config_host and env_host in all_hosts:
+            merged["ZCODE_BASE_URL"] = config_bu
+            log(f"⚠ ZCODE_BASE_URL 残留检测: env='{env_bu}' 是 config 里另一个 provider "
+                f"的 endpoint, 与 enabled provider (config='{config_bu}') 不一致。已自动用 "
+                f"config 值 (旧 plan 残留)。")
+    return merged
+
+
+
+# 识别 zcode headless 调用返回的 provider 限流/配额错误, 用于有限重试。
+# 修改时请同步 shared/provider_error.py。
+# ============================================================
+def _parse_provider_error(text):
+    """分析 zcode 调用输出文本, 返回 {is_rate_limit, is_quota, retry_after_sec, error_kind}。"""
+    if not text:
+        return {"is_rate_limit": False, "is_quota": False, "retry_after_sec": None, "error_kind": "unknown"}
+    sample = text if len(text) <= 2000 else text[:2000]
+    lower = sample.lower()
+    retry_after = _extract_retry_after(sample)
+
+    # 限流 (可安全重试) — 明确限流词 (不含模糊的 exceeded)
+    rl_pats = [r"\b429\b", r"too many requests", r"ratelimit", r"rate_limit",
+               r"rate limit", r"\brate.?limit", r"\b1302\b",
+               r"请求过于频繁", r"频繁访问", r"频繁请求", r"slow\s*down", r"throttl"]
+    if any(re.search(p, lower) for p in rl_pats):
+        return {"is_rate_limit": True, "is_quota": False, "retry_after_sec": retry_after, "error_kind": "rate_limit"}
+
+    # 配额耗尽 (不可短期重试) — 用精确的 quota/credit/配额 词, 不用模糊的 exceeded.*limit
+    # (会误吃 "rate limit exceeded")。中文收紧为带限定词。Codex review P1#2。
+    quota_pats = [r"\bquota\b", r"配额(不足|耗尽|用完|超限)",
+                  r"额度(不足|耗尽|用完)", r"余额不足",
+                  r"insufficient.*credit", r"insufficient.*balance", r"\bcredit\b.*exhaust"]
+    if any(re.search(p, lower) for p in quota_pats):
+        return {"is_rate_limit": False, "is_quota": True, "retry_after_sec": retry_after, "error_kind": "quota"}
+
+    # 明确带 retry-after 但无 quota/限流标志 → 视为限流兜底
+    if retry_after is not None:
+        return {"is_rate_limit": True, "is_quota": False, "retry_after_sec": retry_after, "error_kind": "rate_limit"}
+
+    # 其他 provider 错误 (APICallError/Unauthorized/invalid key 等, 不重试)
+    provider_pats = [r"apicallerror", r"ai_apicallerror", r"providerbusinesserror",
+                     r"unauthorized", r"forbidden", r"invalid.*api.*key",
+                     r"internal\s*server", r"service\s*unavailable", r"bad\s*gateway"]
+    if any(re.search(p, lower) for p in provider_pats):
+        return {"is_rate_limit": False, "is_quota": False, "retry_after_sec": None,
+                "error_kind": "provider_error"}
+
+    return {"is_rate_limit": False, "is_quota": False, "retry_after_sec": None, "error_kind": "unknown"}
+
+
+def _extract_retry_after(sample):
+    """从错误文本提取 retry-after 秒数 (限 [1,300])。"""
+    for pat in [r'retry-?after\s*[:=]\s*"?(\d+)', r'retryAfter"\s*:\s*"?(\d+)',
+                r'(\d+)\s*秒[后以]', r'try\s+again\s+in\s+(\d+)']:
+        m = re.search(pat, sample, re.IGNORECASE)
+        if m:
+            try:
+                return max(1, min(300, int(m.group(1))))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+# ============================================================
+# 进程级文件锁 (防并发 headless review 触发限流, issue #3 子项3)
+# 多个 MCP client 进程会各自 spawn zcode; 文件锁串行化 review 调用。
+# 默认开, ZCODE_BRIDGE_REVIEW_LOCK=0 关闭。
+# ZCODE_BRIDGE_LOCK_DIR 可覆盖锁文件目录 (测试用)。
+# ============================================================
+_DEFAULT_LOCK_DIR = Path.home() / ".zcode"
+
+
+def _review_lock_path():
+    """锁文件路径; 目录可由 ZCODE_BRIDGE_LOCK_DIR 覆盖 (测试隔离用)。"""
+    d = Path(os.environ.get("ZCODE_BRIDGE_LOCK_DIR", _DEFAULT_LOCK_DIR))
+    return d / "zcode-bridge-review.lock"
+
+
+class ReviewFileLock:
+    """跨进程文件锁 (fcntl.flock)。with 块内串行执行; 拿不到锁超时返回。
+
+    打开/加锁失败时 (目录不存在/不可写/权限受限) 降级为无锁并 log 警告,
+    而非打崩 tool — 锁是"防并发"的优化, 不应让权限问题阻断 review 本身。
+    """
+
+    def __init__(self, timeout=300):
+        self.timeout = timeout
+        self.enabled = os.environ.get("ZCODE_BRIDGE_REVIEW_LOCK", "1") != "0"
+        self.fd = None
+        self.acquired = False
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        lock_path = _review_lock_path()
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            self.fd = open(lock_path, "w")
+        except OSError as e:
+            # 目录不存在/不可写 → 降级无锁 (review 本身仍可跑)
+            log(f"⚠ review 锁文件无法创建 ({e}), 降级为无锁 (并发可能触发限流)")
+            self.fd = None
+            return self
+        t0 = time.time()
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                return self  # 拿到锁
+            except (OSError, BlockingIOError):
+                if time.time() - t0 > self.timeout:
+                    self.fd.close()
+                    self.fd = None
+                    raise TimeoutError(
+                        f"review 锁等待超时 ({self.timeout}s), 可能有并发 review 在跑"
+                    ) from None
+                time.sleep(0.5)
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            if self.acquired:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            self.fd.close()
+            self.fd = None
 
 
 # ============================================================
@@ -182,20 +352,58 @@ def tool_zcode_review(args):
 
     log(f"调用 zcode review: {len(attach_files)} 个输入")
 
-    # 注入凭证: MCP server 子进程不继承 shell 环境变量, 需自行读取
-    env = {**os.environ, **load_zcode_credentials()}
+    # 注入凭证: MCP server 子进程不继承 shell 环境变量, 需自行读取。
+    # 显式非空环境变量优先 (issue #3 子项2): 已设置非空的会覆盖 config; 空串视为未设置。
+    env = _merge_env_with_creds(load_zcode_credentials())
 
+    # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数。
+    # clamp 到 >=0, 防止 ZCODE_BRIDGE_MAX_RETRIES=-1 导致不执行 zcode (Codex P2)
+    max_retries = max(0, _env_int("ZCODE_BRIDGE_MAX_RETRIES", 3))
+
+    last_err = None
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120, env=env
-        )
-        output = result.stdout
-        if result.returncode != 0 and not output:
-            return {"content": [{"type": "text", "text": f"zcode 调用失败: {result.stderr}"}],
+        # 文件锁 (issue #3 子项3b): 串行化 headless review, 防并发触发限流
+        with ReviewFileLock(timeout=300):
+            for attempt in range(max_retries + 1):
+                try:
+                    result = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=120, env=env
+                    )
+                    output = result.stdout
+                    # 错误判定: 只解析 stderr (Claude review P1-1: 若把 stdout 审查正文
+                    # 也喂进 parse_provider_error, 审查"限流/配额"相关代码时会被误判
+                    # 成限流而白重试, 甚至把成功结果截断成报错)。zcode headless 错误
+                    # 常在 stderr (APICallError 堆栈), stdout 是审查结论正文。
+                    err_info = _parse_provider_error(result.stderr or "")
+                    has_error = result.returncode != 0 or (result.stderr and err_info["error_kind"] != "unknown")
+
+                    if has_error and err_info["is_rate_limit"] and attempt < max_retries:
+                        # 限流 → 退避后重试 (优先用 retry-after, 否则指数 + jitter)
+                        wait = err_info["retry_after_sec"] or min(60, (2 ** attempt) + 1)
+                        last_err = f"限流 (attempt {attempt+1}/{max_retries}): {err_info['error_kind']}"
+                        log(f"  {last_err}, {wait}s 后重试")
+                        time.sleep(wait)
+                        continue
+
+                    if has_error:
+                        # 非限流错误, 或重试耗尽 → 返回错误 (重试过的话附说明)
+                        suffix = f" (已重试 {attempt} 次)" if attempt > 0 else ""
+                        err_text = result.stderr.strip() or output or "未知错误"
+                        # 提取简短错误 (脱敏: provider 错误一般不含 apiKey, 但截断防泄漏)
+                        return {"content": [{"type": "text",
+                                             "text": f"zcode 调用失败{suffix}: {err_text[:500]}"}],
+                                "isError": True}
+                    # 成功 (也可能 stdout 空但无错误 → 正常返回空)
+                    return {"content": [{"type": "text", "text": output}]}
+
+                except subprocess.TimeoutExpired:
+                    return {"content": [{"type": "text", "text": "zcode review 超时 (120s)"}],
+                            "isError": True}
+            # 理论不可达 (循环内都 return), 兜底
+            return {"content": [{"type": "text", "text": f"zcode 调用失败: 重试耗尽 {last_err}"}],
                     "isError": True}
-        return {"content": [{"type": "text", "text": output}]}
-    except subprocess.TimeoutExpired:
-        return {"content": [{"type": "text", "text": "zcode review 超时 (120s)"}],
+    except TimeoutError as e:
+        return {"content": [{"type": "text", "text": f"zcode review 获取锁超时: {e}"}],
                 "isError": True}
     finally:
         # 只清理本次创建的临时文件 (不用 glob, 避免误删并发请求的文件)
@@ -204,6 +412,14 @@ def tool_zcode_review(args):
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def _env_int(name, default):
+    """从环境变量读整数, 失败用默认值。"""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 TOOL_HANDLERS = {
