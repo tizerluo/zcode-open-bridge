@@ -211,52 +211,63 @@ class TestCredentials(unittest.TestCase):
             }
         }
 
+    def _multi_path(self, enabled_url, stale_url):
+        """写多 provider config 到临时文件, 返回路径 (残留检测需 config_path)。"""
+        return _write_config(self._config_multi_provider(enabled_url, stale_url))
+
     def test_c10_stale_env_self_heals(self):
         """C10: env baseURL 是 config 另一 provider 的残留 → 自愈用 config 值"""
-        cfg = self._config_multi_provider(
-            "https://api.z.ai/api/anthropic",
-            "https://zcode.z.ai/api/v1/zcode-plan/anthropic")
-        c = self._creds(cfg)
-        # env 设为 stale provider 的根域名 (App 注入的真实形态)
-        merged = merge_env_with_creds(c, {"ZCODE_BASE_URL": "https://zcode.z.ai"})
+        path = self._multi_path("https://api.z.ai/api/anthropic",
+                                "https://zcode.z.ai/api/v1/zcode-plan/anthropic")
+        self._tmp_paths.append(path)
+        c = load_zcode_credentials(config_path=path)
+        # env 设为 stale provider 的根域名 (App 注入的真实形态); 传 config_path 让检测读到临时 config
+        merged = merge_env_with_creds(c, {"ZCODE_BASE_URL": "https://zcode.z.ai"},
+                                      config_path=path)
         self.assertEqual(merged["ZCODE_BASE_URL"], "https://api.z.ai/api/anthropic",
                          "残留 env 应被自愈为 config enabled provider 的值")
 
     def test_c10b_stale_warning_fired(self):
         """C10b: 残留时 warn 回调被触发"""
-        cfg = self._config_multi_provider("https://api.z.ai/api/anthropic",
-                                          "https://zcode.z.ai/api/v1/zcode-plan/anthropic")
-        c = self._creds(cfg)
+        path = self._multi_path("https://api.z.ai/api/anthropic",
+                                "https://zcode.z.ai/api/v1/zcode-plan/anthropic")
+        self._tmp_paths.append(path)
+        c = load_zcode_credentials(config_path=path)
         warnings = []
-        merge_env_with_creds(c, {"ZCODE_BASE_URL": "https://zcode.z.ai"}, warn=warnings.append)
+        merge_env_with_creds(c, {"ZCODE_BASE_URL": "https://zcode.z.ai"},
+                             config_path=path, warn=warnings.append)
         self.assertTrue(any("残留" in w for w in warnings), "残留时应触发告警")
 
     def test_c10c_custom_endpoint_respected(self):
         """C10c: env baseURL 是用户自建 (不在 config 任何 provider) → 尊重 env"""
-        cfg = self._config_multi_provider("https://api.z.ai/api/anthropic",
-                                          "https://zcode.z.ai/api/v1/zcode-plan/anthropic")
-        c = self._creds(cfg)
-        merged = merge_env_with_creds(c, {"ZCODE_BASE_URL": "https://my-proxy.example.com"})
+        path = self._multi_path("https://api.z.ai/api/anthropic",
+                                "https://zcode.z.ai/api/v1/zcode-plan/anthropic")
+        self._tmp_paths.append(path)
+        c = load_zcode_credentials(config_path=path)
+        merged = merge_env_with_creds(c, {"ZCODE_BASE_URL": "https://my-proxy.example.com"},
+                                      config_path=path)
         self.assertEqual(merged["ZCODE_BASE_URL"], "https://my-proxy.example.com",
                          "自定义 endpoint 应被尊重 (issue #3 调试场景)")
 
     def test_c10d_consistent_no_warning(self):
         """C10d: env 与 config 一致 → 不告警, 用一致值"""
-        cfg = self._config_multi_provider("https://api.z.ai/api/anthropic",
-                                          "https://zcode.z.ai/api/v1/zcode-plan/anthropic")
-        c = self._creds(cfg)
+        path = self._multi_path("https://api.z.ai/api/anthropic",
+                                "https://zcode.z.ai/api/v1/zcode-plan/anthropic")
+        self._tmp_paths.append(path)
+        c = load_zcode_credentials(config_path=path)
         warnings = []
         merged = merge_env_with_creds(c, {"ZCODE_BASE_URL": "https://api.z.ai/api/anthropic"},
-                                      warn=warnings.append)
+                                      config_path=path, warn=warnings.append)
         self.assertEqual(merged["ZCODE_BASE_URL"], "https://api.z.ai/api/anthropic")
         self.assertEqual(warnings, [], "一致时不应告警")
 
     def test_c10e_stale_exact_url_also_heals(self):
         """C10e: env baseURL 是 stale provider 的完整 URL (非根域名) → 同样自愈"""
         stale = "https://zcode.z.ai/api/v1/zcode-plan/anthropic"
-        cfg = self._config_multi_provider("https://api.z.ai/api/anthropic", stale)
-        c = self._creds(cfg)
-        merged = merge_env_with_creds(c, {"ZCODE_BASE_URL": stale})
+        path = self._multi_path("https://api.z.ai/api/anthropic", stale)
+        self._tmp_paths.append(path)
+        c = load_zcode_credentials(config_path=path)
+        merged = merge_env_with_creds(c, {"ZCODE_BASE_URL": stale}, config_path=path)
         self.assertEqual(merged["ZCODE_BASE_URL"], "https://api.z.ai/api/anthropic")
 
     def test_c10f_is_stale_helper_host_matching(self):
@@ -274,11 +285,11 @@ class TestCredentials(unittest.TestCase):
             "https://api.z.ai/api/anthropic", "https://api.z.ai/api/anthropic", all_urls))
 
     def test_c10g_no_config_path_still_safe(self):
-        """C10g: config_path 默认 (None) 也能安全检测, 不崩"""
-        # 不传 config_path, 用真实 config (CI 环境可能没有, 但不应崩)
+        """C10g: config_path 默认 (None) 也能安全检测, 不崩 (CI 无 ~/.zcode 时)"""
+        # 不传 config_path; CI 环境 ~ 不存在 config, _all_provider_base_urls 返回空 set,
+        # 残留检测应安全跳过 (自建 endpoint 尊重 env, 不崩)
         c = {"ZCODE_BASE_URL": "https://api.z.ai/api/anthropic"}
         merged = merge_env_with_creds(c, {"ZCODE_BASE_URL": "https://self-hosted.test"})
-        # 自建 endpoint 尊重 env
         self.assertEqual(merged["ZCODE_BASE_URL"], "https://self-hosted.test")
 
 
