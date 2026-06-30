@@ -14,7 +14,7 @@ test_app_server_methods.py — app-server 新协议方法 (0.15.0+) 单测
   M6  workspace/_resolve_workspace 选择器 (workspace dict / workspacePath / cwd / 默认)
   M7  workspace/readState + workspace/generateText (含 timeout 60s)
   M8  workspace/setDefault* 三件套 (乐观锁透传)
-  M9  workspace Provider 管理 (apiKey 嵌套对象透传保真 + 日志脱敏)
+  M9  workspace Provider 管理 (apiKey 嵌套对象透传保真 + 日志/错误回显双脱敏)
   M10 旧 handler 回归 (fork/rewind/goal/compact/steer 路由, 补盲区)
 
 运行: python3 tests/test_app_server_methods.py
@@ -469,6 +469,51 @@ class TestAppServerMethods(unittest.TestCase):
                           {"workspacePath": "/p"})
         self._assert_error_code(resp, -32602)
 
+    def test_m9_upsert_provider_error_no_apikey(self):
+        """M9g: upsertModelProvider 后端 error 回显脱敏 (Codex P1: error 路径不能泄露 apiKey)"""
+        bridge, fake = self._new_bridge()
+        # 后端错误消息里夹带了入参的 inline apiKey 明文
+        fake.next_response = {"error": {"message":
+            "validation failed: apiKey invalid sk-LEAK-IN-ERR-9876 in provider custom"}}
+        resp = self._call(bridge, "workspace/upsertModelProvider",
+                          {"workspacePath": "/p",
+                           "provider": {"providerId": "custom",
+                                        "apiKey": {"source": "inline",
+                                                   "value": "sk-LEAK-IN-ERR-9876"},
+                                        "models": [{"modelId": "m1"}]}})
+        self._assert_error_code(resp, -32603)
+        err_msg = resp["error"]["message"]
+        self.assertNotIn("sk-LEAK-IN-ERR-9876", err_msg,
+                         "error 回显不得泄露 apiKey 明文")
+        self.assertIn("sk-***", err_msg, "sk- 前缀应被遮蔽为 sk-***")
+
+    def test_m9_update_registry_error_no_apikey(self):
+        """M9h: updateProviderRegistry 后端 error 回显脱敏 (registry 含多个 provider apiKey)"""
+        bridge, fake = self._new_bridge()
+        fake.next_response = {"error": {"message":
+            'provider[1] invalid: {"value":"sk-REG-ERR-5555"} rejected'}}
+        resp = self._call(bridge, "workspace/updateProviderRegistry",
+                          {"workspacePath": "/p",
+                           "registry": {"providers": [
+                               {"providerId": "p1", "models": [{"modelId": "m1"}]},
+                               {"providerId": "p2",
+                                "apiKey": {"source": "inline", "value": "sk-REG-ERR-5555"},
+                                "models": [{"modelId": "m2"}]}]}})
+        self._assert_error_code(resp, -32603)
+        err_msg = resp["error"]["message"]
+        self.assertNotIn("sk-REG-ERR-5555", err_msg,
+                         "registry error 回显不得泄露 apiKey 明文")
+
+    def test_m9_remove_provider_error_not_redacted(self):
+        """M9i: removeModelProvider error 不需脱敏 (入参无 apiKey, 保留原文利于排查)"""
+        bridge, fake = self._new_bridge()
+        fake.next_response = {"error": {"message": "provider old not found"}}
+        resp = self._call(bridge, "workspace/removeModelProvider",
+                          {"workspacePath": "/p", "providerId": "old"})
+        self._assert_error_code(resp, -32603)
+        # remove 入参不含 apiKey, 后端错误原样回显 (便于排查)
+        self.assertIn("not found", resp["error"]["message"])
+
     # ---------- M10: 旧 handler 回归 (补盲区) ----------
     def test_m10_fork_routes(self):
         """M10: session/fork 仍正确路由到 session/fork"""
@@ -510,7 +555,7 @@ class TestAppServerMethods(unittest.TestCase):
         self._assert_error_code(resp, -32601)
 
     def test_m10_dispatch_registry_complete(self):
-        """M10f: 所有 12 个新方法名都已在 dispatch 注册 (无遗漏)"""
+        """M10f: 所有 14 个新方法名都已在 dispatch 注册 (无遗漏)"""
         bridge, _ = self._new_bridge()
         new_methods = [
             "session/setThoughtLevel", "session/updateRuntimeModelConfig",

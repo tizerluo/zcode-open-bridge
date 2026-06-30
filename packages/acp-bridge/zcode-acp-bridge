@@ -1056,14 +1056,37 @@ class ACPBridge:
           2. params["workspacePath"] 或 params["cwd"] → 构造 {workspacePath, workspaceKey}
           3. 都没有 → 用 os.getcwd() 兜底
 
+        Args:
+            msg_id: 预留 (当前四级解析总能成功, 不会返回错误响应; 保留参数以与其它
+                    handler 签名一致, 且未来若加 workspace 路径校验可直接返回错误)。
         Returns:
-          (workspace_dict, None) 成功; 或 (None, error_response) 失败 (返回给 client)。
+            (workspace_dict, None) 成功; 或 (None, error_response) 失败 (返回给 client)。
         """
         ws = params.get("workspace")
         if isinstance(ws, dict) and ws.get("workspacePath"):
             return ws, None
         path = params.get("workspacePath") or params.get("cwd") or os.getcwd()
         return {"workspacePath": path, "workspaceKey": path}, None
+
+    @staticmethod
+    def _redact_secret(text):
+        """对后端错误消息做最小脱敏, 防止 apiKey 泄漏到 ACP client。
+
+        provider/registry 相关方法 (upsert/remove/updateProviderRegistry) 的入参会
+        携带 apiKey。虽然 bridge 透传时不读取其值, 但若 zcode 后端把入参片段回显在
+        error.message 里, 原样返回会泄漏。这里用正则遮蔽常见密钥形态:
+          - sk- 开头的 OpenAI/Anthropic 风格 key 前缀
+          - JSON 里 "value":"..." / "apiKey":{...} 的敏感值
+        保留非敏感部分以便排查。
+        """
+        import re
+        if not text:
+            return text
+        s = re.sub(r'sk-[A-Za-z0-9_-]{6,}', 'sk-***', text)
+        s = re.sub(r'("value"\s*:\s*")([^"]{4,})(")', r'\1***\3', s)
+        s = re.sub(r'("apiKey"\s*:\s*)("?\{[^}]*\}"?|"[^"]{4,}")',
+                   r'\1***', s)
+        return s
 
     # ---------- session 级新方法 (0.15.0+) ----------
     # 纯透传, 遵循与 fork/rewind/goal 相同的模板。均不启动内部 AI turn (区别于 goal set)。
@@ -1380,7 +1403,8 @@ class ACPBridge:
                                        zc_params, timeout=15)
         if "error" in resp:
             return self._error(msg_id, -32603,
-                               f"zcode upsertModelProvider failed: {resp['error'].get('message', '')}")
+                               f"zcode upsertModelProvider failed: "
+                               f"{self._redact_secret(resp['error'].get('message', ''))}")
         result = resp.get("result", {})
         # 只打 providerId, 不打 provider 原文 (含 apiKey)
         log(f"workspace/upsertModelProvider → ok ({provider.get('providerId', '?')})")
@@ -1435,7 +1459,8 @@ class ACPBridge:
                                        zc_params, timeout=15)
         if "error" in resp:
             return self._error(msg_id, -32603,
-                               f"zcode updateProviderRegistry failed: {resp['error'].get('message', '')}")
+                               f"zcode updateProviderRegistry failed: "
+                               f"{self._redact_secret(resp['error'].get('message', ''))}")
         result = resp.get("result", {})
         provider_count = len(registry.get("providers", []))
         log(f"workspace/updateProviderRegistry → {result.get('status', '?')} "
