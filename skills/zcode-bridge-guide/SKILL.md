@@ -1,14 +1,14 @@
 ---
 name: zcode-bridge-guide
-version: 1.0.0
-description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.14.8+。
+version: 1.1.0
+description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.15.0+。
 user-invocable: true
 ---
 
 # 驱动 ZCode（三模式通用说明书）
 
 > 本 skill 是 [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) 项目的配套说明书。
-> 兼容 ZCode CLI **0.14.5 ~ 0.14.8+**（App 3.1.4）。新版功能（事件驱动真流式、fork/rewind/goal/compact/steer）在旧版上自动降级。
+> 兼容 ZCode CLI **0.14.5 ~ 0.15.0+**（App 3.2.0）。新版功能（事件驱动真流式、fork/rewind/goal/compact/steer、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`。
 
 ## 前置条件
 
@@ -228,17 +228,39 @@ ACP bridge 根据运行时检测自动选择模式：
 
 **无需手动选择**——bridge 先尝试 `session/subscribe`，失败则自动降级轮询。
 
-### 扩展方法（非标准 ACP，0.14.8+ 新增）
+### 扩展方法（非标准 ACP）
+
+ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**session 级**用 `{sessionId}` 定位会话；**workspace 级**用 `{workspace, workspaceKey}`（或 `workspacePath`/`cwd`）定位工作区，不依赖会话。
+
+**session 级扩展方法**：
+
+| 方法 | 作用 | 引入版本 | params |
+|------|------|:--------:|--------|
+| `session/fork` | 从 checkpoint 分叉新会话 | 0.14.8 | `{sessionId, target?}` |
+| `session/rewind` | 回退工作区文件到 checkpoint | 0.14.8 | `{sessionId, target?, expectedRevision?}` |
+| `session/goal` | 读取/设置 session 目标 | 0.14.8 | `{sessionId, action: show\|set\|replace\|clear, objective?}` |
+| `session/compact` | 压缩对话上下文 | 0.14.8 | `{sessionId}` |
+| `session/steer` | turn 进行中追加指令 | 0.14.8 | `{sessionId, content}` |
+| `session/setThoughtLevel` | ⭐ 设置思考强度 | 0.15.0 | `{sessionId, thoughtLevel}` |
+| `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, modelId}` / `{sessionId, mode}` |
+| `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
+| `session/rewindCascade` | 级联回退（同 rewind schema） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
+| `session/updateRuntimeModelConfig` | 运行时覆盖模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}` |
+
+**workspace 级扩展方法**（0.15.0+）：
 
 | 方法 | 作用 | params |
 |------|------|--------|
-| `session/fork` | 从 checkpoint 分叉新会话 | `{sessionId, target?}` |
-| `session/rewind` | 回退工作区文件到 checkpoint | `{sessionId, target?, expectedRevision?}` |
-| `session/goal` | 读取/设置 session 目标 | `{sessionId, action: show\|set\|replace\|clear, objective?}` |
-| `session/compact` | 压缩对话上下文 | `{sessionId}` |
-| `session/steer` | turn 进行中追加指令 | `{sessionId, content}` |
+| `workspace/readState` | 读工作区状态（模型目录/设置） | `{workspace, runtimeModel?}` |
+| `workspace/generateText` | 一次性文本生成（不建会话） | `{workspace, modelRef, prompt, querySource, ...}` |
+| `workspace/setDefaultModel` / `setDefaultMode` / `setDefaultThoughtLevel` | 设工作区默认值（持久化） | `{workspace, model\|mode\|thoughtLevel, expectedWorkspaceRevision?}` |
+| `workspace/upsertModelProvider` / `removeModelProvider` / `updateProviderRegistry` | 管理模型供应商（含 apiKey，敏感） | `{workspace, provider\|providerId\|registry, ...}` |
 
 > ⚠️ `session/goal action=set` 会启动内部 AI turn（异步），耗时 10~45s。bridge 会自动等待 prompt lock 释放后返回，但调用方需预期较长延迟。
+>
+> 💡 **思考强度控制**（0.15.0+）：`session/setThoughtLevel` 可在跑任务前调高（如 `high`/`max`）让模型多推理，跑完后调回（如 `nothink`）。`thoughtLevel` 是动态值，按当前模型的 reasoning 能力决定可选值（实测 GLM-5.2：`max`/`high`/`nothink`，其他模型可能不同）。这与 drive-claude 的 `--effort`、drive-codex 的 reasoning effort 形成对称能力。设置后会话内的后续 turn 都生效。
+>
+> ⚠️ **apiKey 透传**：Provider 管理类方法的参数会携带 `apiKey`，bridge 仅透传不打印明文；调用方应确保 stdio 通道可信。
 
 ### ⚠️ ACP 模式已知限制
 1. **默认 `mode=yolo`**：所有 prompt 可能触发无确认的文件修改和命令执行。信任环境要隔离（worktree / 受信目录）
@@ -334,7 +356,8 @@ npm test     # 全量，看实际数字
 
 | ZCode CLI 版本 | 支持情况 | 差异 |
 |:--------------:|:--------:|------|
-| **0.14.8+** (App 3.1.4) | ✅ 完整 | ACP bridge 真流式；fork/rewind/goal/compact/steer 可用 |
+| **0.15.0+** (App 3.2.0) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel） |
+| **0.14.8** (App 3.1.4) | ✅ 完整 | ACP bridge 真流式；fork/rewind/goal/compact/steer 可用；workspace/* 与 setThoughtLevel 返回 -32603 |
 | **0.14.5 ~ 0.14.7** | ✅ 兼容 | ACP bridge 自动降级伪流式；扩展方法不可用（协议未实现） |
 | **< 0.14.5** | ⚠️ 未测 | CLI `--prompt` 基本可用；ACP bridge 未验证 |
 
