@@ -34,7 +34,7 @@ ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 # ============================================================
 OVERVIEW = {
     "tool": "zcode",
-    "version_described": "0.14.8 (App 3.1.4)",
+    "version_described": "0.15.0 (App 3.2.0)",
     "what_it_is": (
         "ZCode 是智谱(Z.AI)的 Agentic Coding CLI, 由 GLM 系列模型驱动。"
         "它能自主完成代码编写/审查/调试/分析等任务, 可调用工具(读写文件、"
@@ -224,7 +224,34 @@ APP_SERVER = {
         {"method": "session/goal", "params": "sessionId, goal?", "note": "0.14.8+: 读/设 session 目标 (新)"},
         {"method": "session/compact", "params": "sessionId", "note": "0.14.8+: 压缩对话上下文 (新)"},
         {"method": "session/setModel", "params": "sessionId, modelId", "note": "0.14.8+: 切换模型 (新)"},
-        {"method": "session/cancelBackgroundTask", "params": "sessionId", "note": "0.14.8+: 取消后台任务 (新)"},
+        {"method": "session/cancelBackgroundTask", "params": "sessionId, taskId",
+         "note": "0.14.8+: 取消后台 Bash 任务 (新)"},
+        # ----- 0.15.0 (App 3.2.0) 新增 session 级方法 -----
+        {"method": "session/setThoughtLevel", "params": "sessionId, thoughtLevel",
+         "note": "0.15.0+: 设置思考强度 (动态值, 按模型 reasoning 能力; 实测 GLM-5.2: max/high/nothink)"},
+        {"method": "session/updateRuntimeModelConfig", "params": "sessionId, runtimeModel, applyModelSelection?",
+         "note": "0.15.0+: 运行时覆盖模型配置 (含 provider/providerOptions/thoughtLevel)"},
+        {"method": "session/rewindCascade", "params": "sessionId, target?, scope?, expectedRevision?",
+         "note": "0.15.0+: 级联回退 (与 rewind 同 schema, 内部 /rewind cascade)"},
+        {"method": "session/setMode", "params": "sessionId, mode",
+         "note": "0.15.0+ 暴露: 切换会话权限模式 (mode: plan|build|edit|yolo|auto)"},
+        # ----- 0.15.0 (App 3.2.0) 新增 workspace/* 方法 (按工作区定位, 非 session) -----
+        {"method": "workspace/readState", "params": "workspace:{workspacePath,workspaceKey}, runtimeModel?",
+         "note": "0.15.0+: 读工作区状态 (settings/modelCatalog/slashCommands)"},
+        {"method": "workspace/generateText", "params": "workspace, modelRef, prompt, querySource, maxOutputTokens?, temperature?",
+         "note": "0.15.0+: 一次性文本生成 (不建会话, 无 messages/tools)"},
+        {"method": "workspace/setDefaultModel", "params": "workspace, model, runtimeModel?, expectedWorkspaceRevision?",
+         "note": "0.15.0+: 设工作区默认模型 (持久化, 乐观锁)"},
+        {"method": "workspace/setDefaultMode", "params": "workspace, mode, expectedWorkspaceRevision?",
+         "note": "0.15.0+: 设工作区默认权限模式 (持久化)"},
+        {"method": "workspace/setDefaultThoughtLevel", "params": "workspace, thoughtLevel, expectedWorkspaceRevision?",
+         "note": "0.15.0+: 设工作区默认思考强度 (持久化)"},
+        {"method": "workspace/upsertModelProvider", "params": "workspace, provider, expectedWorkspaceRevision?",
+         "note": "0.15.0+: 新增/更新模型供应商 (provider 含 apiKey, 敏感)"},
+        {"method": "workspace/removeModelProvider", "params": "workspace, providerId, expectedWorkspaceRevision?",
+         "note": "0.15.0+: 移除模型供应商"},
+        {"method": "workspace/updateProviderRegistry", "params": "workspace, registry, includeWorkspaceState?",
+         "note": "0.15.0+: 批量更新供应商注册表 (registry.providers 含 apiKey, 敏感)"},
     ],
     "turn_model": {
         "description": "异步模型: send 立即返回, turn 完成需轮询 session/read",
@@ -278,6 +305,16 @@ ECOSYSTEM = {
                 # 扩展方法 (非标准 ACP, 透传 zcode 0.14.8+ 协议):
                 "session/fork", "session/rewind", "session/goal",
                 "session/compact", "session/steer",
+                # 扩展方法 (透传 zcode 0.15.0+ 协议, session 级):
+                "session/setThoughtLevel", "session/updateRuntimeModelConfig",
+                "session/cancelBackgroundTask", "session/rewindCascade",
+                "session/setModel", "session/setMode",
+                # 扩展方法 (透传 zcode 0.15.0+ 协议, workspace 级):
+                "workspace/readState", "workspace/generateText",
+                "workspace/setDefaultModel", "workspace/setDefaultMode",
+                "workspace/setDefaultThoughtLevel",
+                "workspace/upsertModelProvider", "workspace/removeModelProvider",
+                "workspace/updateProviderRegistry",
             ],
             "acp_events_emitted": [
                 {"event": "tool_call/tool_call_update", "status": "✅ 实时 (事件驱动)"},

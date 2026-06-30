@@ -45,7 +45,11 @@ zcode-acp-bridge — 把 headless ZCode 桥接为 ACP (Agent Client Protocol) Ag
   ✅ 流式文本 (model.streaming → agent_message_chunk 逐段)
   ✅ 工具调用展示 (tool.updated → tool_call/tool_call_update 实时)
   ✅ session/cancel → session/stop
-  ✅ 扩展方法: fork/rewind/goal/compact/steer (0.14.8+)
+  ✅ 扩展方法 (session 级, 0.14.8+): fork/rewind/goal/compact/steer
+  ✅ 扩展方法 (session 级, 0.15.0+): setThoughtLevel/updateRuntimeModelConfig/
+     cancelBackgroundTask/rewindCascade/setModel/setMode
+  ✅ workspace/* 方法 (0.15.0+): readState/generateText/setDefault{Model,Mode,ThoughtLevel}/
+     upsertModelProvider/removeModelProvider/updateProviderRegistry
 
 协议: ACP (JSON-RPC 2.0 over stdio) 对外; ZCode Protocol (无 jsonrpc 字段) 对内
 依赖: 仅 Python3 标准库
@@ -767,6 +771,38 @@ class ACPBridge:
         if method == "session/steer":
             return self._on_session_steer(msg_id, req.get("params", {}))
 
+        # ----- session 级新方法 (0.15.0+, 纯透传) -----
+        if method == "session/setThoughtLevel":
+            return self._on_session_set_thought_level(msg_id, req.get("params", {}))
+        if method == "session/updateRuntimeModelConfig":
+            return self._on_session_update_runtime_model_config(msg_id, req.get("params", {}))
+        if method == "session/cancelBackgroundTask":
+            return self._on_session_cancel_background_task(msg_id, req.get("params", {}))
+        if method == "session/rewindCascade":
+            return self._on_session_rewind_cascade(msg_id, req.get("params", {}))
+        if method == "session/setModel":
+            return self._on_session_set_model(msg_id, req.get("params", {}))
+        if method == "session/setMode":
+            return self._on_session_set_mode(msg_id, req.get("params", {}))
+
+        # ----- workspace/* 方法 (0.15.0+, 按 workspace 选择器定位) -----
+        if method == "workspace/readState":
+            return self._on_workspace_read_state(msg_id, req.get("params", {}))
+        if method == "workspace/generateText":
+            return self._on_workspace_generate_text(msg_id, req.get("params", {}))
+        if method == "workspace/setDefaultModel":
+            return self._on_workspace_set_default_model(msg_id, req.get("params", {}))
+        if method == "workspace/setDefaultMode":
+            return self._on_workspace_set_default_mode(msg_id, req.get("params", {}))
+        if method == "workspace/setDefaultThoughtLevel":
+            return self._on_workspace_set_default_thought_level(msg_id, req.get("params", {}))
+        if method == "workspace/upsertModelProvider":
+            return self._on_workspace_upsert_model_provider(msg_id, req.get("params", {}))
+        if method == "workspace/removeModelProvider":
+            return self._on_workspace_remove_model_provider(msg_id, req.get("params", {}))
+        if method == "workspace/updateProviderRegistry":
+            return self._on_workspace_update_provider_registry(msg_id, req.get("params", {}))
+
         # 未实现的 method
         if method and msg_id is not None:
             return self._error(msg_id, -32601, f"Method not supported: {method}")
@@ -1003,6 +1039,432 @@ class ACPBridge:
                                f"zcode steer failed: {resp['error'].get('message', '')}")
         result = resp.get("result", {})
         log(f"session/steer → kind={result.get('kind', '?')}")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    # ---------- workspace/* 方法 (非标准 ACP, 透传 zcode 0.15.0+ 协议) ----------
+    # 这些方法作用于 workspace (工作区), 通过 {workspacePath, workspaceKey} 选择器定位,
+    # 与 session 级方法 (按 sessionId) 不同。ZCode 3.2.0 (CLI 0.15.0) 新增。
+
+    def _resolve_workspace(self, msg_id, params):
+        """从 ACP params 解析 workspace 选择器。
+
+        zcode 的 workspace 选择器形如 {workspacePath, workspaceKey, workspaceIdentity?},
+        其中 workspacePath/workspaceKey 都是路径字符串 (现有 session/create 也这样用,
+        见 _on_session_new)。ACP client 可能以下面任一方式传入工作区:
+
+          1. params["workspace"] 已是合法 dict (含 workspacePath) → 直接透传
+          2. params["workspacePath"] 或 params["cwd"] → 构造 {workspacePath, workspaceKey}
+          3. 都没有 → 用 os.getcwd() 兜底
+
+        Args:
+            msg_id: 预留 (当前四级解析总能成功, 不会返回错误响应; 保留参数以与其它
+                    handler 签名一致, 且未来若加 workspace 路径校验可直接返回错误)。
+        Returns:
+            (workspace_dict, None) 成功; 或 (None, error_response) 失败 (返回给 client)。
+        """
+        ws = params.get("workspace")
+        if isinstance(ws, dict) and ws.get("workspacePath"):
+            return ws, None
+        path = params.get("workspacePath") or params.get("cwd") or os.getcwd()
+        return {"workspacePath": path, "workspaceKey": path}, None
+
+    @staticmethod
+    def _redact_secret(text):
+        """对后端错误消息做最小脱敏, 防止 apiKey 泄漏到 ACP client。
+
+        provider/registry 相关方法 (upsert/remove/updateProviderRegistry) 的入参会
+        携带 apiKey。虽然 bridge 透传时不读取其值, 但若 zcode 后端把入参片段回显在
+        error.message 里, 原样返回会泄漏。这里用正则遮蔽常见密钥形态:
+          - sk- 开头的 OpenAI/Anthropic 风格 key 前缀
+          - JSON 里 "value":"..." / "apiKey":{...} 的敏感值
+        保留非敏感部分以便排查。
+        """
+        import re
+        if not text:
+            return text
+        s = re.sub(r'sk-[A-Za-z0-9_-]{6,}', 'sk-***', text)
+        s = re.sub(r'("value"\s*:\s*")([^"]{4,})(")', r'\1***\3', s)
+        s = re.sub(r'("apiKey"\s*:\s*)("?\{[^}]*\}"?|"[^"]{4,}")',
+                   r'\1***', s)
+        return s
+
+    # ---------- session 级新方法 (0.15.0+) ----------
+    # 纯透传, 遵循与 fork/rewind/goal 相同的模板。均不启动内部 AI turn (区别于 goal set)。
+
+    def _on_session_set_thought_level(self, msg_id, params):
+        """扩展 session/setThoughtLevel → zcode session/setThoughtLevel: 设置思考强度。
+
+        params: {sessionId, thoughtLevel}
+          thoughtLevel 是动态值 (非固定 enum, schema 仅校验非空字符串, 运行时由
+          当前模型的 reasoning 能力决定。实测 GLM-5.2 可选值: max/high/nothink;
+          其他模型可能不同)。故 bridge 不做 enum 硬校验, 透传给 zcode 由其按模型
+          能力判定 (非法值由 zcode 返回 -32602)。
+        """
+        self.ensure_backend()
+        acp_sid = params.get("sessionId")
+        zcode_sid = self.session_map.get(acp_sid) or acp_sid
+        thought_level = params.get("thoughtLevel")
+        if not thought_level:
+            return self._error(msg_id, -32602, "setThoughtLevel 需要 thoughtLevel")
+        zc_params = {"sessionId": zcode_sid, "thoughtLevel": thought_level}
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "session/setThoughtLevel", zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode setThoughtLevel failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log("session/setThoughtLevel → ok")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_session_update_runtime_model_config(self, msg_id, params):
+        """扩展 session/updateRuntimeModelConfig → 同名: 运行时覆盖会话模型配置。
+
+        params: {sessionId, runtimeModel, applyModelSelection?}
+          runtimeModel 是复杂嵌套对象 ({revision, generatedAt, model, provider, thoughtLevel?}),
+          原样透传不篡改。
+        """
+        self.ensure_backend()
+        acp_sid = params.get("sessionId")
+        zcode_sid = self.session_map.get(acp_sid) or acp_sid
+        runtime_model = params.get("runtimeModel")
+        if not runtime_model:
+            return self._error(msg_id, -32602, "updateRuntimeModelConfig 需要 runtimeModel")
+        zc_params = {"sessionId": zcode_sid, "runtimeModel": runtime_model}
+        if params.get("applyModelSelection") is not None:
+            zc_params["applyModelSelection"] = params["applyModelSelection"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "session/updateRuntimeModelConfig",
+                                       zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode updateRuntimeModelConfig failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log("session/updateRuntimeModelConfig → ok")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_session_cancel_background_task(self, msg_id, params):
+        """扩展 session/cancelBackgroundTask → 同名: 取消后台 Bash 任务。
+
+        params: {sessionId, taskId}
+        返回: {cancelled, reason?, snapshot?, status, taskId}
+        """
+        self.ensure_backend()
+        acp_sid = params.get("sessionId")
+        zcode_sid = self.session_map.get(acp_sid) or acp_sid
+        task_id = params.get("taskId")
+        if not task_id:
+            return self._error(msg_id, -32602, "cancelBackgroundTask 需要 taskId")
+        zc_params = {"sessionId": zcode_sid, "taskId": task_id}
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "session/cancelBackgroundTask",
+                                       zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode cancelBackgroundTask failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log(f"session/cancelBackgroundTask → cancelled={result.get('cancelled')}")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_session_rewind_cascade(self, msg_id, params):
+        """扩展 session/rewindCascade → zcode session/rewindCascade: 级联回退。
+
+        与 session/rewind 参数 schema 完全一致 (zcode 内部 G2e=lZ 同一引用),
+        仅 method 名不同, zcode 内部构建 /rewind cascade <scope> <id>。
+        params: {sessionId, target?, scope?, expectedRevision?}
+          target: 默认 {kind:"latestCheckpoint"}; 或 {kind:"checkpoint", checkpointId}
+          scope: conversation(默认)|workspace|both
+        """
+        self.ensure_backend()
+        acp_sid = params.get("sessionId")
+        zcode_sid = self.session_map.get(acp_sid) or acp_sid
+        zc_params = {"sessionId": zcode_sid}
+        if params.get("checkpointId"):
+            zc_params["target"] = {"kind": "checkpoint", "checkpointId": params["checkpointId"]}
+        else:
+            zc_params["target"] = params.get("target", {"kind": "latestCheckpoint"})
+        if params.get("scope"):
+            zc_params["scope"] = params["scope"]
+        if params.get("expectedRevision") is not None:
+            zc_params["expectedRevision"] = params["expectedRevision"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "session/rewindCascade", zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode rewindCascade failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log("session/rewindCascade → ok")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_session_set_model(self, msg_id, params):
+        """扩展 session/setModel → zcode session/setModel: 切换会话模型。
+
+        (0.14.8 旧方法, bridge 之前未暴露, 本次补齐)
+        params: {sessionId, modelId}
+        """
+        self.ensure_backend()
+        acp_sid = params.get("sessionId")
+        zcode_sid = self.session_map.get(acp_sid) or acp_sid
+        model_id = params.get("modelId")
+        if not model_id:
+            return self._error(msg_id, -32602, "setModel 需要 modelId")
+        zc_params = {"sessionId": zcode_sid, "modelId": model_id}
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "session/setModel", zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode setModel failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log(f"session/setModel → {model_id}")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_session_set_mode(self, msg_id, params):
+        """扩展 session/setMode → zcode session/setMode: 切换会话权限模式。
+
+        (0.14.8 旧方法, bridge 之前未暴露, 本次补齐)
+        params: {sessionId, mode}  mode: plan|build|edit|yolo|auto
+        """
+        self.ensure_backend()
+        acp_sid = params.get("sessionId")
+        zcode_sid = self.session_map.get(acp_sid) or acp_sid
+        mode = params.get("mode")
+        if not mode:
+            return self._error(msg_id, -32602, "setMode 需要 mode")
+        zc_params = {"sessionId": zcode_sid, "mode": mode}
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "session/setMode", zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode setMode failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log(f"session/setMode → {mode}")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    # ---------- workspace 查询/生成/设置 (0.15.0+) ----------
+
+    def _on_workspace_read_state(self, msg_id, params):
+        """workspace/readState → 同名: 一次性读取工作区状态。
+
+        params: {workspace, runtimeModel?}
+        返回: {workspace, settings, modelCatalog?, slashCommands?}
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        zc_params = {"workspace": ws}
+        if params.get("runtimeModel") is not None:
+            zc_params["runtimeModel"] = params["runtimeModel"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "workspace/readState", zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode readState failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log("workspace/readState → ok")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_workspace_generate_text(self, msg_id, params):
+        """workspace/generateText → 同名: 一次性文本生成 (不创建会话)。
+
+        params: {workspace, modelRef:{providerId,modelId,variant?}, prompt, querySource,
+                 maxOutputTokens?, temperature?}
+        返回: {text, modelRef}
+        注意: 涉及模型调用, timeout 设 60s。
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        model_ref = params.get("modelRef")
+        prompt = params.get("prompt")
+        if not model_ref:
+            return self._error(msg_id, -32602, "generateText 需要 modelRef")
+        if not prompt:
+            return self._error(msg_id, -32602, "generateText 需要 prompt")
+        zc_params = {
+            "workspace": ws,
+            "modelRef": model_ref,
+            "prompt": prompt,
+            "querySource": params.get("querySource", "bridge"),
+        }
+        if params.get("maxOutputTokens") is not None:
+            zc_params["maxOutputTokens"] = params["maxOutputTokens"]
+        if params.get("temperature") is not None:
+            zc_params["temperature"] = params["temperature"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "workspace/generateText", zc_params, timeout=60)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode generateText failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log(f"workspace/generateText → ok (text {len(result.get('text', ''))} chars)")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_workspace_set_default_model(self, msg_id, params):
+        """workspace/setDefaultModel → 同名: 设置工作区默认模型 (持久化)。
+
+        params: {workspace, model:{providerId,modelId,variant?}, runtimeModel?,
+                 expectedWorkspaceRevision?}
+        返回: workspace 状态 {workspace, settings, modelCatalog?, slashCommands?}
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        model = params.get("model")
+        if not model:
+            return self._error(msg_id, -32602, "setDefaultModel 需要 model")
+        zc_params = {"workspace": ws, "model": model}
+        if params.get("runtimeModel") is not None:
+            zc_params["runtimeModel"] = params["runtimeModel"]
+        if params.get("expectedWorkspaceRevision") is not None:
+            zc_params["expectedWorkspaceRevision"] = params["expectedWorkspaceRevision"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "workspace/setDefaultModel", zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode setDefaultModel failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log("workspace/setDefaultModel → ok")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_workspace_set_default_mode(self, msg_id, params):
+        """workspace/setDefaultMode → 同名: 设置工作区默认权限模式 (持久化)。
+
+        params: {workspace, mode, expectedWorkspaceRevision?}
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        mode = params.get("mode")
+        if not mode:
+            return self._error(msg_id, -32602, "setDefaultMode 需要 mode")
+        zc_params = {"workspace": ws, "mode": mode}
+        if params.get("expectedWorkspaceRevision") is not None:
+            zc_params["expectedWorkspaceRevision"] = params["expectedWorkspaceRevision"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "workspace/setDefaultMode", zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode setDefaultMode failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log(f"workspace/setDefaultMode → {mode}")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_workspace_set_default_thought_level(self, msg_id, params):
+        """workspace/setDefaultThoughtLevel → 同名: 设置工作区默认思考强度 (持久化)。
+
+        params: {workspace, thoughtLevel, expectedWorkspaceRevision?}
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        thought_level = params.get("thoughtLevel")
+        if not thought_level:
+            return self._error(msg_id, -32602, "setDefaultThoughtLevel 需要 thoughtLevel")
+        zc_params = {"workspace": ws, "thoughtLevel": thought_level}
+        if params.get("expectedWorkspaceRevision") is not None:
+            zc_params["expectedWorkspaceRevision"] = params["expectedWorkspaceRevision"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "workspace/setDefaultThoughtLevel",
+                                       zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode setDefaultThoughtLevel failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log("workspace/setDefaultThoughtLevel → ok")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    # ---------- workspace Provider 管理 (0.15.0+, 含 apiKey, 注意脱敏) ----------
+
+    def _on_workspace_upsert_model_provider(self, msg_id, params):
+        """workspace/upsertModelProvider → 同名: 新增/更新模型供应商。
+
+        params: {workspace, provider:{providerId, kind, baseURL?, apiKey?, models:[...], ...},
+                 expectedWorkspaceRevision?}
+        返回: workspace 状态。
+        ⚠ provider 对象可能含 apiKey (inline value 或 credential key), log 绝不打印其原文,
+          只打印 providerId; 透传对象整体交给 zcode, 不读取/篡改 apiKey。
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        provider = params.get("provider")
+        if not provider:
+            return self._error(msg_id, -32602, "upsertModelProvider 需要 provider")
+        zc_params = {"workspace": ws, "provider": provider}
+        if params.get("expectedWorkspaceRevision") is not None:
+            zc_params["expectedWorkspaceRevision"] = params["expectedWorkspaceRevision"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "workspace/upsertModelProvider",
+                                       zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode upsertModelProvider failed: "
+                               f"{self._redact_secret(resp['error'].get('message', ''))}")
+        result = resp.get("result", {})
+        # 只打 providerId, 不打 provider 原文 (含 apiKey)
+        log(f"workspace/upsertModelProvider → ok ({provider.get('providerId', '?')})")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_workspace_remove_model_provider(self, msg_id, params):
+        """workspace/removeModelProvider → 同名: 移除模型供应商。
+
+        params: {workspace, providerId, expectedWorkspaceRevision?}
+        返回: workspace 状态。
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        provider_id = params.get("providerId")
+        if not provider_id:
+            return self._error(msg_id, -32602, "removeModelProvider 需要 providerId")
+        zc_params = {"workspace": ws, "providerId": provider_id}
+        if params.get("expectedWorkspaceRevision") is not None:
+            zc_params["expectedWorkspaceRevision"] = params["expectedWorkspaceRevision"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "workspace/removeModelProvider",
+                                       zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode removeModelProvider failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log(f"workspace/removeModelProvider → ok ({provider_id})")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_workspace_update_provider_registry(self, msg_id, params):
+        """workspace/updateProviderRegistry → 同名: 批量更新供应商注册表。
+
+        params: {workspace, registry:{revision, generatedAt, providers:[...]},
+                 includeWorkspaceState?}
+        返回: {workspace, appliedProviderRevision, status, providerCount, workspaceState?}
+        ⚠ registry.providers 内可能含 apiKey, log 只打数量, 不打 registry 原文。
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        registry = params.get("registry")
+        if not registry:
+            return self._error(msg_id, -32602, "updateProviderRegistry 需要 registry")
+        zc_params = {"workspace": ws, "registry": registry}
+        if params.get("includeWorkspaceState") is not None:
+            zc_params["includeWorkspaceState"] = params["includeWorkspaceState"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "workspace/updateProviderRegistry",
+                                       zc_params, timeout=15)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode updateProviderRegistry failed: "
+                               f"{self._redact_secret(resp['error'].get('message', ''))}")
+        result = resp.get("result", {})
+        provider_count = len(registry.get("providers", []))
+        log(f"workspace/updateProviderRegistry → {result.get('status', '?')} "
+            f"({provider_count} providers)")
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
     @staticmethod
