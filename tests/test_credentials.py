@@ -25,7 +25,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
-from credentials import load_zcode_credentials  # noqa: E402
+from credentials import load_zcode_credentials, merge_env_with_creds  # noqa: E402
 
 
 def _write_config(config_dict):
@@ -146,6 +146,27 @@ class TestCredentials(unittest.TestCase):
         c = self._creds(_config_with_provider(models={"GLM-5.2": {}}))
         merged = {**c, **{}}  # 无显式 env
         self.assertEqual(merged["ZCODE_MODEL"], "GLM-5.2")
+
+    # ---------- C9: merge_env_with_creds 空串不覆盖 (Codex P0) ----------
+    def test_c9_empty_env_not_override(self):
+        """C9: 空串 env 视为未设置, 保留 config 值 (Codex P0 修复)"""
+        c = self._creds(_config_with_provider(models={"GLM-5.2": {}}))
+        merged = merge_env_with_creds(c, {"ZCODE_MODEL": "", "OTHER": "x"})
+        self.assertEqual(merged["ZCODE_MODEL"], "GLM-5.2",
+                         "空串 env 不应覆盖 config 的有效值")
+        self.assertEqual(merged["OTHER"], "x", "非凭证 env 应保留")
+
+    def test_c9b_nonempty_env_overrides(self):
+        """C9b: 非空 env 覆盖 config (merge_env_with_creds)"""
+        c = self._creds(_config_with_provider(models={"GLM-5.2": {}}))
+        merged = merge_env_with_creds(c, {"ZCODE_MODEL": "GLM-5-Turbo"})
+        self.assertEqual(merged["ZCODE_MODEL"], "GLM-5-Turbo")
+
+    def test_c9c_empty_apikey_not_clear_config(self):
+        """C9c: ANTHROPIC_API_KEY="" 不应清空 config 的 key"""
+        c = self._creds(_config_with_provider(api_key="sk-real-key-123456"))
+        merged = merge_env_with_creds(c, {"ANTHROPIC_API_KEY": ""})
+        self.assertEqual(merged["ANTHROPIC_API_KEY"], "sk-real-key-123456")
 
     # ---------- C7: 多 provider ----------
     def test_c7_multiple_providers_first_enabled(self):

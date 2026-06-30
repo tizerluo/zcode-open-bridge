@@ -204,7 +204,7 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 |------|------|------|
 | **进程级文件锁** | 多个 MCP client 并发调用时，串行化 headless review，防并发触发限流 | `ZCODE_BRIDGE_REVIEW_LOCK=0` 关闭 |
 | **provider 错误解析** | 识别 429 / 1302 / `Too Many Requests` / `请求过于频繁` / `retry-after`，区分限流/配额/其他 | — |
-| **有限重试 + 退避** | 仅对**限流**错误重试（配额/Unauthorized 不重试），退避用 retry-after 或指数+ jitter | `ZCODE_BRIDGE_MAX_RETRIES`（默认 3） |
+| **有限重试 + 退避** | 仅对**限流**错误重试（配额/Unauthorized 不重试），退避用 retry-after 或指数退避（`2^n+1`） | `ZCODE_BRIDGE_MAX_RETRIES`（默认 3） |
 
 注意：zcode 内部已有自己的指数退避重试（`_retryWithExponentialBackoff`），MCP 层的重试是补充，默认保守（max 3）。
 

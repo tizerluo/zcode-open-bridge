@@ -53,17 +53,36 @@ class _FakeCompletedProcess:
 
 
 class TestReviewFileLock(unittest.TestCase):
-    """进程级文件锁 (ReviewFileLock) 测试"""
+    """进程级文件锁 (ReviewFileLock) 测试。
+
+    用 ZCODE_BRIDGE_LOCK_DIR 隔离到临时目录, 避免写真实 ~/.zcode (Codex P1-2:
+    沙箱/CI 里真实 HOME 可能不可写, 导致 PermissionError)。
+    """
 
     @classmethod
     def setUpClass(cls):
         cls.mod = _load_mcp_module()
         cls.Lock = cls.mod.ReviewFileLock
 
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="zcode-lock-test-")
+        self._saved_dir = os.environ.get("ZCODE_BRIDGE_LOCK_DIR")
+        os.environ["ZCODE_BRIDGE_LOCK_DIR"] = self._tmpdir
+
+    def tearDown(self):
+        import shutil
+        if self._saved_dir is None:
+            os.environ.pop("ZCODE_BRIDGE_LOCK_DIR", None)
+        else:
+            os.environ["ZCODE_BRIDGE_LOCK_DIR"] = self._saved_dir
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
     def test_rl0_acquire_release(self):
         """RL0: 锁可获取, with 块结束自动释放"""
         with self.Lock(timeout=5) as lock:
-            self.assertIsNotNone(lock)
+            self.assertTrue(lock.acquired, "应成功获取锁")
+            self.assertIsNotNone(lock.fd)
 
     def test_rl1_disabled_by_env(self):
         """RL1: ZCODE_BRIDGE_REVIEW_LOCK=0 → 禁用锁 (enabled=False)"""
@@ -86,6 +105,26 @@ class TestReviewFileLock(unittest.TestCase):
             pass
         with self.Lock(timeout=5):
             pass  # 第二次也能拿到 (前次已释放)
+
+    def test_rl3_lock_file_in_temp_dir(self):
+        """RL3: 锁文件创建在隔离的临时目录, 不写真实 ~/.zcode"""
+        with self.Lock(timeout=5):
+            lock_files = os.listdir(self._tmpdir)
+        self.assertIn("zcode-bridge-review.lock", lock_files,
+                       "锁文件应在 ZCODE_BRIDGE_LOCK_DIR 指定的临时目录")
+
+    def test_rl4_degrade_when_dir_unwritable(self):
+        """RL4: 锁目录不可写时降级为无锁 (不崩, Codex P1-2)"""
+        # 指向一个不存在的、且无法 mkdir 的路径 (父父目录无权限通常难造,
+        # 改用: 指向一个已存在的普通文件作为 dir, mkdir 会失败)
+        import tempfile
+        f = tempfile.NamedTemporaryFile(delete=False)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        os.environ["ZCODE_BRIDGE_LOCK_DIR"] = f.name  # 这是一个文件, 不是目录
+        with self.Lock(timeout=5) as lock:
+            # 应降级为无锁 (fd=None), 而非抛异常
+            self.assertIsNone(lock.fd, "目录无效时应降级无锁, fd=None")
 
 
 class TestRetryLogic(unittest.TestCase):
@@ -240,6 +279,35 @@ class TestRetryLogic(unittest.TestCase):
                 self._restore(mod, saved_run, real_sleep)
             self.assertTrue(result.get("isError"))
             self.assertEqual(calls["n"], 1, "配额耗尽不应重试")
+        finally:
+            if old is None:
+                os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+            else:
+                os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = old
+
+    # ---------- RT5: exit=0 + stderr=Unauthorized 不当成功 (Codex P1-1) ----------
+    def test_rt5_exit0_with_stderr_error_not_success(self):
+        """RT5: zcode exit=0 但 stderr 含 APICallError: Unauthorized → 当错误返回 (Codex P1-1)
+
+        zcode 错误常 exit=0 + stdout 空 + stderr 含堆栈。修复前 parser 副本缺
+        provider_error 分支, 会误判为成功空输出。补分支后应识别为错误。
+        """
+        mod = self.mod
+        procs = [_FakeCompletedProcess(
+            returncode=0, stdout="",
+            stderr="APICallError [AI_APICallError]: Unauthorized\n    at ...")]
+        old = os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        try:
+            calls, saved_run, real_sleep = self._patch(mod, procs)
+            try:
+                result = self._review(mod)
+            finally:
+                self._restore(mod, saved_run, real_sleep)
+            self.assertTrue(result.get("isError"),
+                            "exit=0+stderr=Unauthorized 应识别为错误, 不当成功空输出")
+            self.assertEqual(calls["n"], 1, "provider_error 不重试")
+            self.assertIn("Unauthorized", result["content"][0]["text"])
         finally:
             if old is None:
                 os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)

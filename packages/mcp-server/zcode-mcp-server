@@ -71,8 +71,21 @@ def load_zcode_credentials():
     return {}
 
 
-# ============================================================
-# provider 错误解析 (源自 shared/provider_error.py, 单文件可独立运行故内嵌)
+def _merge_env_with_creds(creds):
+    """合并 config 凭证与环境变量: 显式非空 env 优先, 空串视为未设置 (issue #3 子项2)。
+
+    源自 shared/credentials.py.merge_env_with_creds (单文件可独立运行故内嵌)。
+    避免 ZCODE_MODEL="" 这类空串 env 把 config 的有效值覆盖成空。
+    """
+    merged = {**os.environ, **creds}
+    for k in ("ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"):
+        v = os.environ.get(k)
+        if v:  # 仅非空才覆盖
+            merged[k] = v
+    return merged
+
+
+
 # 识别 zcode headless 调用返回的 provider 限流/配额错误, 用于有限重试。
 # 修改时请同步 shared/provider_error.py。
 # ============================================================
@@ -95,6 +108,14 @@ def _parse_provider_error(text):
     if any(re.search(p, lower) for p in rl_pats) or retry_after is not None:
         return {"is_rate_limit": True, "is_quota": False, "retry_after_sec": retry_after, "error_kind": "rate_limit"}
 
+    # 其他 provider 错误 (APICallError/Unauthorized/invalid key 等, 不重试)
+    provider_pats = [r"apicallerror", r"ai_apicallerror", r"providerbusinesserror",
+                     r"unauthorized", r"forbidden", r"invalid.*api.*key",
+                     r"internal\s*server", r"service\s*unavailable", r"bad\s*gateway"]
+    if any(re.search(p, lower) for p in provider_pats):
+        return {"is_rate_limit": False, "is_quota": False, "retry_after_sec": None,
+                "error_kind": "provider_error"}
+
     return {"is_rate_limit": False, "is_quota": False, "retry_after_sec": None, "error_kind": "unknown"}
 
 
@@ -115,26 +136,47 @@ def _extract_retry_after(sample):
 # 进程级文件锁 (防并发 headless review 触发限流, issue #3 子项3)
 # 多个 MCP client 进程会各自 spawn zcode; 文件锁串行化 review 调用。
 # 默认开, ZCODE_BRIDGE_REVIEW_LOCK=0 关闭。
+# ZCODE_BRIDGE_LOCK_DIR 可覆盖锁文件目录 (测试用)。
 # ============================================================
-_REVIEW_LOCK_PATH = Path.home() / ".zcode" / "zcode-bridge-review.lock"
+_DEFAULT_LOCK_DIR = Path.home() / ".zcode"
+
+
+def _review_lock_path():
+    """锁文件路径; 目录可由 ZCODE_BRIDGE_LOCK_DIR 覆盖 (测试隔离用)。"""
+    d = Path(os.environ.get("ZCODE_BRIDGE_LOCK_DIR", _DEFAULT_LOCK_DIR))
+    return d / "zcode-bridge-review.lock"
 
 
 class ReviewFileLock:
-    """跨进程文件锁 (fcntl.flock)。with 块内串行执行; 拿不到锁超时返回。"""
+    """跨进程文件锁 (fcntl.flock)。with 块内串行执行; 拿不到锁超时返回。
+
+    打开/加锁失败时 (目录不存在/不可写/权限受限) 降级为无锁并 log 警告,
+    而非打崩 tool — 锁是"防并发"的优化, 不应让权限问题阻断 review 本身。
+    """
 
     def __init__(self, timeout=300):
         self.timeout = timeout
         self.enabled = os.environ.get("ZCODE_BRIDGE_REVIEW_LOCK", "1") != "0"
         self.fd = None
+        self.acquired = False
 
     def __enter__(self):
         if not self.enabled:
             return self
-        self.fd = open(_REVIEW_LOCK_PATH, "w")
+        lock_path = _review_lock_path()
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            self.fd = open(lock_path, "w")
+        except OSError as e:
+            # 目录不存在/不可写 → 降级无锁 (review 本身仍可跑)
+            log(f"⚠ review 锁文件无法创建 ({e}), 降级为无锁 (并发可能触发限流)")
+            self.fd = None
+            return self
         t0 = time.time()
         while True:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
                 return self  # 拿到锁
             except (OSError, BlockingIOError):
                 if time.time() - t0 > self.timeout:
@@ -145,11 +187,13 @@ class ReviewFileLock:
 
     def __exit__(self, *exc):
         if self.fd is not None:
-            try:
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
+            if self.acquired:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
             self.fd.close()
+            self.fd = None
 
 
 # ============================================================
@@ -267,8 +311,8 @@ def tool_zcode_review(args):
     log(f"调用 zcode review: {len(attach_files)} 个输入")
 
     # 注入凭证: MCP server 子进程不继承 shell 环境变量, 需自行读取。
-    # 显式环境变量优先 (issue #3 子项2): 已设置的会覆盖 config 读出的值, 便于调试。
-    env = {**load_zcode_credentials(), **os.environ}
+    # 显式非空环境变量优先 (issue #3 子项2): 已设置非空的会覆盖 config; 空串视为未设置。
+    env = _merge_env_with_creds(load_zcode_credentials())
 
     # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数 + jitter。
     max_retries = _env_int("ZCODE_BRIDGE_MAX_RETRIES", 3)

@@ -101,6 +101,20 @@ def load_zcode_credentials():
     return {}
 
 
+def _merge_env_with_creds(creds):
+    """合并 config 凭证与环境变量: 显式非空 env 优先, 空串视为未设置 (issue #3 子项2)。
+
+    源自 shared/credentials.py.merge_env_with_creds (单文件可独立运行故内嵌)。
+    避免 ZCODE_MODEL="" 这类空串 env 把 config 的有效值覆盖成空。
+    """
+    merged = {**os.environ, **creds}
+    for k in ("ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"):
+        v = os.environ.get(k)
+        if v:  # 仅非空才覆盖
+            merged[k] = v
+    return merged
+
+
 # ============================================================
 # ZCode app-server 的 client 封装
 # ============================================================
@@ -114,9 +128,9 @@ class ZCodeBackend:
     """
 
     def __init__(self):
-        # 显式环境变量优先: 已设置的 ZCODE_MODEL/ZCODE_BASE_URL/ANTHROPIC_API_KEY
-        # 会覆盖 config 读出的值, 便于调试/临时覆盖 (issue #3 子项2)。
-        env = {**load_zcode_credentials(), **os.environ}
+        # 显式非空环境变量优先 (issue #3 子项2): ZCODE_MODEL=xxx 临时覆盖生效,
+        # 但空串 env 视为未设置 (保留 config 值, 避免误清空)。
+        env = _merge_env_with_creds(load_zcode_credentials())
         self.proc = subprocess.Popen(
             [ZCODE_BIN, "app-server", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

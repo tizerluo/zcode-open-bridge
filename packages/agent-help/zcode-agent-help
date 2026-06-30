@@ -79,17 +79,20 @@ def print_injected_env():
         print(f"❌ 未从 {ZCODE_CREDS_PATH} 读取到凭证 (config 无 enabled provider 或文件缺失)")
         return 0
     keys = ["ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"]
-    print("=== 凭证注入诊断 (显式 env 优先于 config) ===")
+    print("=== 凭证注入诊断 (显式非空 env 优先于 config; 空串 env 视为未设置) ===")
     print(f"config 源: {ZCODE_CREDS_PATH}")
     for k in keys:
         config_val = creds.get(k, "")
         env_val = os.environ.get(k)
-        if env_val is not None:
-            # 显式 env 覆盖 config
+        if env_val:  # 非空显式 env 才覆盖 (空串视为未设置, 与 _merge_env_with_creds 一致)
             shown = _mask_key(env_val) if k == "ANTHROPIC_API_KEY" else env_val
             print(f"  {k}:")
             print(f"    config → {('脱敏 ' + _mask_key(config_val)) if k == 'ANTHROPIC_API_KEY' and config_val else (config_val or '(空)')}")
             print(f"    env    → {shown}  ⚠ 使用此值 (env 覆盖)")
+        elif env_val == "":
+            # 空串 env: 视为未设置, 仍用 config
+            shown = _mask_key(config_val) if k == "ANTHROPIC_API_KEY" else config_val
+            print(f"  {k}: {shown}  (来自 config; env 为空串, 视为未设置)")
         else:
             shown = _mask_key(config_val) if k == "ANTHROPIC_API_KEY" else config_val
             print(f"  {k}: {shown}  (来自 config)")

@@ -65,6 +65,39 @@ def load_zcode_credentials(config_path=None):
     return {}
 
 
+# 受凭证注入影响的 env key (显式设置时优先于 config, 但空串视为未设置)
+_CRED_ENV_KEYS = ("ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY")
+
+
+def merge_env_with_creds(creds=None, environ=None):
+    """合并 config 凭证与环境变量, 实现"显式 env 优先, 空串视为未设置"。
+
+    issue #3 子项2: 让 ZCODE_MODEL=xxx 临时覆盖生效, 但避免空串 env
+    (如 ZCODE_MODEL="") 把 config 的有效值覆盖成空。
+
+    Args:
+        creds: load_zcode_credentials() 的返回 (config 凭证), 默认 {}
+        environ: 环境变量 dict, 默认 os.environ
+
+    Returns:
+        合并后的 env dict: config 凭证作基底, 仅非空的显式 env 覆盖之,
+        其余 os.environ 原样保留。
+    """
+    import os
+    if creds is None:
+        creds = {}
+    if environ is None:
+        environ = os.environ
+    # 基底: 完整 os.environ + config 凭证 (config 覆盖 os.environ 里的同名空串/旧值)
+    merged = {**environ, **creds}
+    # 显式非空 env 再覆盖回去 (解决"显式 env 优先")
+    for k in _CRED_ENV_KEYS:
+        v = environ.get(k)
+        if v:  # 仅非空才覆盖 (空串视为未设置, 保留 config 值)
+            merged[k] = v
+    return merged
+
+
 if __name__ == "__main__":
     # 自测: 打印读取到的凭证 (脱敏)
     creds = load_zcode_credentials()
