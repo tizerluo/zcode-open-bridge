@@ -116,9 +116,9 @@ cfg = json.loads((pathlib.Path.home() / ".zcode/v2/config.json").read_text())
 for pid, p in cfg.get("provider", {}).items():
     if p.get("enabled"):
         o = p["options"]
+        # canonical model id = config 里 models 的 key 原样 (如 GLM-5.2), 不加 provider 前缀。
+        # 实测 "zai/GLM-5.2" 也兼容, 但与本项目的权威实现 (shared/credentials.py) 不一致, 故统一用原始 id。
         m = "GLM-5.2" if "GLM-5.2" in p.get("models", {}) else next(iter(p.get("models", {})), "")
-        if pid.startswith("builtin:zai"):
-            m = f"zai/{m}"
         print(m, o.get("baseURL", ""), o.get("apiKey", ""))
         break
 PY
