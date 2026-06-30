@@ -16,7 +16,9 @@ shared/credentials.py — ZCode 凭证动态读取 (单一真相源)
 
 用法:
   from shared.credentials import load_zcode_credentials
-  env = {**os.environ, **load_zcode_credentials()}
+  # 显式环境变量优先 (调试/覆盖用): 已设置的 ZCODE_MODEL 等会覆盖 config 读出的值。
+  # 合并顺序: config 凭证作基底, os.environ 覆盖之。
+  env = {**load_zcode_credentials(), **os.environ}
 """
 
 import json

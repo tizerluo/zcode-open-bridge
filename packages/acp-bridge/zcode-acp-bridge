@@ -114,7 +114,9 @@ class ZCodeBackend:
     """
 
     def __init__(self):
-        env = {**os.environ, **load_zcode_credentials()}
+        # 显式环境变量优先: 已设置的 ZCODE_MODEL/ZCODE_BASE_URL/ANTHROPIC_API_KEY
+        # 会覆盖 config 读出的值, 便于调试/临时覆盖 (issue #3 子项2)。
+        env = {**load_zcode_credentials(), **os.environ}
         self.proc = subprocess.Popen(
             [ZCODE_BIN, "app-server", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -1663,15 +1665,24 @@ class ACPBridge:
                         # 停滞收尾: 不调 differ.diff() (differ 不知道事件路径已发过什么,
                         # 会重复发 TextDelta/tool 事件)。只做兜底: 若事件路径未发文本,
                         # 用 _fetch_last_reply 取最后回复。
+                        stall_reply = None
                         if not emitted_text:
-                            reply_text = self._fetch_last_reply(zcode_sid, differ)
-                            if reply_text:
+                            stall_reply = self._fetch_last_reply(zcode_sid, differ)
+                            if stall_reply:
                                 self._send_acp_notification("session/update", {
                                     "sessionId": acp_sid,
                                     "update": {"sessionUpdate": "agent_message_chunk",
-                                               "content": {"type": "text", "text": reply_text},
+                                               "content": {"type": "text", "text": stall_reply},
                                                "messageId": chunk_msg_id},
                                 })
+                        # 失败检测 (issue #3 子项3d): 停滞收尾时若事件路径既没收到
+                        # turn.failed (否则已正常返回), 也无任何文本输出, 疑似 turn 失败
+                        # (如 turn.completed 事件丢失 + provider 错误)。显式告警而非静默成功。
+                        if not emitted_text and not stall_reply:
+                            log("  ⚠ 停滞收尾: turn 完成但事件路径无输出, 疑似失败")
+                            return self._error(msg_id, -32603,
+                                               "zcode turn 完成但无输出 (停滞收尾疑似失败; "
+                                               "可能 turn 事件丢失或 provider 错误)")
                         return {"jsonrpc": "2.0", "id": msg_id,
                                 "result": {"stopReason": "end_turn"}}
                 continue
@@ -1777,8 +1788,26 @@ class ACPBridge:
                 # turn 完成: 取一次完整 snapshot, 发本轮新增的 tool/text/reasoning/plan 事件
                 cur_snapshot = self._build_snapshot(zcode_sid, projection)
                 events = differ.diff(None, cur_snapshot)
+                has_output = False
                 for ev in events:
+                    # 标记是否本轮产出了实质内容 (text/tool/patch)。PlanUpdate/UsageDelta
+                    # 是辅助信息 (todos/usage 状态), 不是 turn 的实质产出, 不计入。
+                    if ev.get("kind") in ("TextDelta", "ToolCallNew", "FilesChanged"):
+                        has_output = True
                     self._dispatch_event(ev, acp_sid, chunk_msg_id)
+                # 失败检测 (issue #3 子项3d, 修复 PR#2 遗留):
+                # 轮询模式无法收到 turn.failed 事件 payload (zcode 只在事件里给 resultType,
+                # projection/messages 无失败标志, 实测确认)。但若 turn "完成"却完全无有效输出
+                # (只有 step-start 半成品), 强烈暗示 turn 失败 (如 provider 错误)。
+                # 此时返回明确错误而非静默 end_turn, 把"吞掉失败"变成"显式告警"。
+                if not has_output:
+                    reply_text = self._fetch_last_reply(zcode_sid, differ)
+                    if not reply_text:
+                        del self.pending_turns[msg_id]
+                        log("  ⚠ turn 完成但无任何输出 (无 text/tool/patch), 疑似 turn 失败")
+                        return self._error(msg_id, -32603,
+                                           "zcode turn 完成但无输出 (轮询模式疑似失败; "
+                                           "可能 provider 错误, 见 stderr 日志)")
                 turn_completed = True
                 break
 

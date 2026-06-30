@@ -14,6 +14,7 @@ zcode-agent-help — ZCode 开放生态能力说明书
   zcode-agent-help              # 完整能力清单 (JSON)
   zcode-agent-help --pretty     # 人类可读的格式化输出
   zcode-agent-help --section <name>   # 只看某一节
+  zcode-agent-help --print-injected-env   # 诊断: 会注入哪些凭证 (脱敏, issue #3)
   zcode-agent-help --help       # 本帮助
 
 可用 section:
@@ -27,6 +28,72 @@ import sys
 from pathlib import Path
 
 ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
+
+# 模型 ID 的 canonical 格式: config 里 models 的 key 原样 (如 GLM-5.2), 不加 provider 前缀。
+# 实测 "zai/GLM-5.2" 也兼容, 但与 shared/credentials.py 权威实现不一致, 故统一用原始 id。
+ZCODE_CREDS_PATH = Path.home() / ".zcode" / "v2" / "config.json"
+
+
+def _load_creds_internal(config_path=None):
+    """内嵌的凭证读取 (源自 shared/credentials.py, 单文件可独立运行故内嵌)。
+
+    返回从 config 读出的凭证 dict (不含 env 覆盖); 读取失败返回 {}。
+    与 shared/credentials.py.load_zcode_credentials 行为一致 (原始 model id)。
+    """
+    path = config_path or ZCODE_CREDS_PATH
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        for _pid, p in cfg.get("provider", {}).items():
+            if p.get("enabled"):
+                opts = p.get("options", {})
+                models = p.get("models", {})
+                model_id = next(iter(models)) if models else "GLM-5.2"
+                return {
+                    "ZCODE_MODEL": model_id,
+                    "ZCODE_BASE_URL": opts.get("baseURL", ""),
+                    "ANTHROPIC_API_KEY": opts.get("apiKey", ""),
+                }
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _mask_key(key):
+    """脱敏 apiKey: 只留前 4 后 4。"""
+    if not key or len(key) <= 12:
+        return "(短或空)" if not key else f"{key[:2]}...{key[-2:]}"
+    return f"{key[:4]}...{key[-4:]}"
+
+
+def print_injected_env():
+    """打印"如果现在注入凭证, 会用哪些值"(脱敏), 用于不改 config 诊断 model/baseURL 来源。
+
+    显示每个 key 的来源 (config vs 显式 env) + 最终值 (apiKey 脱敏),
+    体现"显式 env 优先"的合并语义 (issue #3 子项2)。
+    """
+    creds = _load_creds_internal()
+    if not creds:
+        print(f"❌ 未从 {ZCODE_CREDS_PATH} 读取到凭证 (config 无 enabled provider 或文件缺失)")
+        return 0
+    keys = ["ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"]
+    print("=== 凭证注入诊断 (显式 env 优先于 config) ===")
+    print(f"config 源: {ZCODE_CREDS_PATH}")
+    for k in keys:
+        config_val = creds.get(k, "")
+        env_val = os.environ.get(k)
+        if env_val is not None:
+            # 显式 env 覆盖 config
+            shown = _mask_key(env_val) if k == "ANTHROPIC_API_KEY" else env_val
+            print(f"  {k}:")
+            print(f"    config → {('脱敏 ' + _mask_key(config_val)) if k == 'ANTHROPIC_API_KEY' and config_val else (config_val or '(空)')}")
+            print(f"    env    → {shown}  ⚠ 使用此值 (env 覆盖)")
+        else:
+            shown = _mask_key(config_val) if k == "ANTHROPIC_API_KEY" else config_val
+            print(f"  {k}: {shown}  (来自 config)")
+    return 0
 
 
 # ============================================================
@@ -487,6 +554,10 @@ def main():
     if "--help" in args or "-h" in args:
         print(__doc__)
         return 0
+
+    # 诊断: 打印"会注入哪些凭证"(脱敏), 不改 config 即可排查 model/baseURL 来源
+    if "--print-injected-env" in args:
+        return print_injected_env()
 
     if "--section" in args:
         idx = args.index("--section")
