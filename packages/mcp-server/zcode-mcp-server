@@ -129,15 +129,23 @@ def _parse_provider_error(text):
     lower = sample.lower()
     retry_after = _extract_retry_after(sample)
 
-    # 配额耗尽 (不可短期重试)
-    quota_pats = [r"\bquota\b", r"配额", r"额度", r"余额", r"exceeded.*limit", r"insufficient.*credit"]
+    # 限流 (可安全重试) — 明确限流词 (不含模糊的 exceeded)
+    rl_pats = [r"\b429\b", r"too many requests", r"ratelimit", r"rate_limit",
+               r"rate limit", r"\brate.?limit", r"\b1302\b",
+               r"请求过于频繁", r"频繁访问", r"频繁请求", r"slow\s*down", r"throttl"]
+    if any(re.search(p, lower) for p in rl_pats):
+        return {"is_rate_limit": True, "is_quota": False, "retry_after_sec": retry_after, "error_kind": "rate_limit"}
+
+    # 配额耗尽 (不可短期重试) — 用精确的 quota/credit/配额 词, 不用模糊的 exceeded.*limit
+    # (会误吃 "rate limit exceeded")。中文收紧为带限定词。Codex review P1#2。
+    quota_pats = [r"\bquota\b", r"配额(不足|耗尽|用完|超限)",
+                  r"额度(不足|耗尽|用完)", r"余额不足",
+                  r"insufficient.*credit", r"insufficient.*balance", r"\bcredit\b.*exhaust"]
     if any(re.search(p, lower) for p in quota_pats):
         return {"is_rate_limit": False, "is_quota": True, "retry_after_sec": retry_after, "error_kind": "quota"}
 
-    # 限流 (可安全重试)
-    rl_pats = [r"\b429\b", r"too many requests", r"ratelimit", r"rate_limit",
-               r"rate limit", r"\b1302\b", r"请求过于频繁", r"频繁", r"slow\s*down", r"throttl"]
-    if any(re.search(p, lower) for p in rl_pats) or retry_after is not None:
+    # 明确带 retry-after 但无 quota/限流标志 → 视为限流兜底
+    if retry_after is not None:
         return {"is_rate_limit": True, "is_quota": False, "retry_after_sec": retry_after, "error_kind": "rate_limit"}
 
     # 其他 provider 错误 (APICallError/Unauthorized/invalid key 等, 不重试)
@@ -348,8 +356,9 @@ def tool_zcode_review(args):
     # 显式非空环境变量优先 (issue #3 子项2): 已设置非空的会覆盖 config; 空串视为未设置。
     env = _merge_env_with_creds(load_zcode_credentials())
 
-    # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数 + jitter。
-    max_retries = _env_int("ZCODE_BRIDGE_MAX_RETRIES", 3)
+    # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数。
+    # clamp 到 >=0, 防止 ZCODE_BRIDGE_MAX_RETRIES=-1 导致不执行 zcode (Codex P2)
+    max_retries = max(0, _env_int("ZCODE_BRIDGE_MAX_RETRIES", 3))
 
     last_err = None
     try:
@@ -361,10 +370,11 @@ def tool_zcode_review(args):
                         cmd, capture_output=True, text=True, timeout=120, env=env
                     )
                     output = result.stdout
-                    combined = (output or "") + "\n" + (result.stderr or "")
-                    # 失败判定: 非零退出 + (无 stdout 或 stderr 含 provider 错误)
-                    # 注意 zcode 错误常 exit=0 但 stderr 含 APICallError, 故也解析 stderr
-                    err_info = _parse_provider_error(combined)
+                    # 错误判定: 只解析 stderr (Claude review P1-1: 若把 stdout 审查正文
+                    # 也喂进 parse_provider_error, 审查"限流/配额"相关代码时会被误判
+                    # 成限流而白重试, 甚至把成功结果截断成报错)。zcode headless 错误
+                    # 常在 stderr (APICallError 堆栈), stdout 是审查结论正文。
+                    err_info = _parse_provider_error(result.stderr or "")
                     has_error = result.returncode != 0 or (result.stderr and err_info["error_kind"] != "unknown")
 
                     if has_error and err_info["is_rate_limit"] and attempt < max_retries:

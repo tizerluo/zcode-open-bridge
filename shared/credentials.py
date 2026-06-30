@@ -15,10 +15,10 @@ shared/credentials.py — ZCode 凭证动态读取 (单一真相源)
   本文件是权威实现; 修改凭证逻辑时, 请同步更新两处副本。
 
 用法:
-  from shared.credentials import load_zcode_credentials
-  # 显式环境变量优先 (调试/覆盖用): 已设置的 ZCODE_MODEL 等会覆盖 config 读出的值。
-  # 合并顺序: config 凭证作基底, os.environ 覆盖之。
-  env = {**load_zcode_credentials(), **os.environ}
+  from shared.credentials import load_zcode_credentials, merge_env_with_creds
+  # 显式非空环境变量优先 (调试/覆盖用), 空串视为未设置, 且自动检测 baseURL 残留。
+  # 不要手写 {**creds, **os.environ} (会绕过空串保护和残留自愈), 用 merge_env_with_creds。
+  env = merge_env_with_creds(load_zcode_credentials())
 """
 
 import json

@@ -1679,7 +1679,8 @@ class ACPBridge:
         """
         translator = EventTranslator()
         t0 = time.time()
-        emitted_text = False   # 本轮是否已通过事件发过文本 (用于决定兜底)
+        emitted_text = False    # 本轮是否已通过事件发过文本 (决定兜底回复发不发)
+        emitted_output = False  # 本轮是否已发过任何实质输出 (text/tool/patch, 决定失败检测)
         last_event_time = time.time()
         last_stall_check = 0   # 上次停滞检查的时间戳 (可重复检查)
 
@@ -1721,10 +1722,11 @@ class ACPBridge:
                                                "content": {"type": "text", "text": stall_reply},
                                                "messageId": chunk_msg_id},
                                 })
-                        # 失败检测 (issue #3 子项3d): 停滞收尾时若事件路径既没收到
-                        # turn.failed (否则已正常返回), 也无任何文本输出, 疑似 turn 失败
-                        # (如 turn.completed 事件丢失 + provider 错误)。显式告警而非静默成功。
-                        if not emitted_text and not stall_reply:
+                        # 失败检测 (issue #3 子项3d / Codex P1#3): 停滞收尾时若事件路径既没收到
+                        # turn.failed (否则已正常返回), 也无任何实质输出 (text/tool/patch),
+                        # 疑似 turn 失败 (如 turn.completed 事件丢失 + provider 错误)。显式告警而非静默成功。
+                        # 用 emitted_output (含 tool/patch) 而非 emitted_text, 避免纯工具 turn 误判。
+                        if not emitted_output and not stall_reply:
                             log("  ⚠ 停滞收尾: turn 完成但事件路径无输出, 疑似失败")
                             return self._error(msg_id, -32603,
                                                "zcode turn 完成但无输出 (停滞收尾疑似失败; "
@@ -1738,9 +1740,13 @@ class ACPBridge:
             # 翻译事件 → ACP 事件 dict 列表
             acp_events = translator.translate(event)
             for ev in acp_events:
-                # 标记: 是否已通过 model.streaming 发过文本
+                # 标记: 是否已通过 model.streaming 发过文本 (决定兜底回复)
                 if ev.get("kind") == "TextDelta":
                     emitted_text = True
+                # 标记: 是否已发过任何实质输出 text/tool/patch (决定失败检测, Codex P1#3:
+                # 纯工具 turn 有 ToolCallNew 但无 TextDelta, 失败检测必须认 tool 才不误判)
+                if ev.get("kind") in ("TextDelta", "ToolCallNew", "FilesChanged"):
+                    emitted_output = True
                 self._dispatch_event(ev, acp_sid, chunk_msg_id)
 
             # turn 结束判定

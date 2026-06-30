@@ -119,6 +119,21 @@ class TestParseProviderError(unittest.TestCase):
         self.assertFalse(r["is_rate_limit"])
         self.assertEqual(r["retry_after_sec"], 300, "retry_after 被截断到 300")
 
+    # ---------- PE5d: rate limit exceeded 不被 quota 误吃 (Codex P1#2) ----------
+    def test_pe5d_rate_limit_exceeded_not_quota(self):
+        """PE5d: 'rate limit exceeded' 应判为限流 (rate_limit), 而非被 quota 的 exceeded.*limit 吃掉"""
+        r = self._rl("Rate limit exceeded, retry-after: 30")
+        self.assertEqual(r["error_kind"], "rate_limit")
+        self.assertFalse(r["is_quota"])
+
+    def test_pe5e_quota_vs_rate_limit_disambig(self):
+        """PE5e: quota 需带限定词, 裸'额度/余额'不当配额 (避免审查正文误判)"""
+        # 真配额
+        self.assertTrue(pe("额度不足")["is_quota"])
+        # 裸词不当配额 (审查正文可能含)
+        self.assertNotIn(pe("代码里的额度计算逻辑")["error_kind"], ["quota"])
+        self.assertNotIn(pe("频繁调用的优化建议")["error_kind"], ["quota", "rate_limit"])
+
     # ---------- PE6: 其他 provider 错误 ----------
     def test_pe6_unauthorized_not_rate_limit(self):
         """PE6: Unauthorized → provider_error, 非限流 (不重试)"""

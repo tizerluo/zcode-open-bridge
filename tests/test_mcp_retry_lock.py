@@ -314,6 +314,37 @@ class TestRetryLogic(unittest.TestCase):
             else:
                 os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = old
 
+    # ---------- RT6: stdout 含限流词 + stderr 非空 → 不误判限流 (Claude P1-1) ----------
+    def test_rt6_review_text_with_rate_keywords_not_misjudged(self):
+        """RT6: 审查"限流逻辑"代码的结论含 429/频繁, 但 stderr 非空诊断 → 不当限流重试
+
+        Claude review P1-1: 若把 stdout 审查正文喂进 parse_provider_error, 审查限流
+        相关代码会被误判限流而白重试。修复: 只解析 stderr。
+        """
+        mod = self.mod
+        # stdout 是审查结论 (含 429/频繁), stderr 有诊断 (非限流)
+        procs = [_FakeCompletedProcess(
+            returncode=0,
+            stdout="这段代码处理 429 限流和频繁请求的逻辑建议加退避。额度计算也有问题。",
+            stderr="some diagnostic noise\nfinished")]
+        old = os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        try:
+            calls, saved_run, real_sleep = self._patch(mod, procs)
+            try:
+                result = self._review(mod)
+            finally:
+                self._restore(mod, saved_run, real_sleep)
+            # 关键: 不应重试 (calls=1), 不应 isError, 应返回审查结论
+            self.assertEqual(calls["n"], 1, "审查正文含限流词不应触发重试")
+            self.assertNotIn("isError", result, "成功审查不应被误判为错误")
+            self.assertIn("429", result["content"][0]["text"], "审查结论应原样返回")
+        finally:
+            if old is None:
+                os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+            else:
+                os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = old
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

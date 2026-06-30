@@ -52,26 +52,27 @@ def parse_provider_error(text):
     # 先尝试提取 retry-after (多处会用到)
     retry_after = _extract_retry_after(sample)
 
-    # 配额/额度耗尽 (通常不可短期重试)
-    quota_patterns = [
-        r"\bquota\b", r"配额", r"额度(不足|耗尽|用完)", r"insufficient.*(quota|credit|balance)",
-        r"余额不足", r"exceeded.*limit", r"limit.*exceeded",
-    ]
-    if any(re.search(p, lower) for p in quota_patterns):
-        return {"is_rate_limit": False, "is_quota": True, "retry_after_sec": retry_after,
-                "error_kind": "quota", "raw_hint": raw_hint}
-
-    # 限流 (可安全重试)
+    # 限流 (可安全重试) — 明确限流词 (不含模糊的 exceeded)
     rate_limit_patterns = [
         r"\b429\b", r"too many requests", r"ratelimit", r"rate_limit",
-        r"rate limit", r"\b1302\b", r"请求过于频繁", r"频繁访问", r"频繁请求",
-        r"slow\s*down", r"throttl",
+        r"rate limit", r"\brate.?limit", r"\b1302\b", r"请求过于频繁",
+        r"频繁访问", r"频繁请求", r"slow\s*down", r"throttl",
     ]
     if any(re.search(p, lower) for p in rate_limit_patterns):
         return {"is_rate_limit": True, "is_quota": False, "retry_after_sec": retry_after,
                 "error_kind": "rate_limit", "raw_hint": raw_hint}
 
-    # 明确带 retry-after 的也视为限流 (很多 API 错误体只给 retry-after 不给 429 文案)
+    # 配额/额度耗尽 (通常不可短期重试) — 用精确的 quota/credit/配额 词, 不用模糊的
+    # "exceeded.*limit" (会误吃 "rate limit exceeded")。Codex review P1#2。
+    quota_patterns = [
+        r"\bquota\b", r"配额(不足|耗尽|用完|超限)", r"额度(不足|耗尽|用完)",
+        r"余额不足", r"insufficient.*(quota|credit|balance)", r"\bcredit\b.*exhaust",
+    ]
+    if any(re.search(p, lower) for p in quota_patterns):
+        return {"is_rate_limit": False, "is_quota": True, "retry_after_sec": retry_after,
+                "error_kind": "quota", "raw_hint": raw_hint}
+
+    # 明确带 retry-after 但无 quota/限流标志 → 视为限流兜底 (很多 API 只给 retry-after)
     if retry_after is not None:
         return {"is_rate_limit": True, "is_quota": False, "retry_after_sec": retry_after,
                 "error_kind": "rate_limit", "raw_hint": raw_hint}
