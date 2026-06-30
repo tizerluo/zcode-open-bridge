@@ -102,16 +102,48 @@ def load_zcode_credentials():
 
 
 def _merge_env_with_creds(creds):
-    """合并 config 凭证与环境变量: 显式非空 env 优先, 空串视为未设置 (issue #3 子项2)。
+    """合并 config 凭证与环境变量: 显式非空 env 优先, 空串视为未设置;
+    且自动检测/自愈 App 注入的残留 baseURL (issue #3)。
 
     源自 shared/credentials.py.merge_env_with_creds (单文件可独立运行故内嵌)。
-    避免 ZCODE_MODEL="" 这类空串 env 把 config 的有效值覆盖成空。
+    残留检测: env 的 ZCODE_BASE_URL 若是 config 里"另一个 provider"的官方 endpoint
+    (App 切换 plan 后的残留), 自愈用 config 值; 用户自建 endpoint 则尊重 env。
     """
     merged = {**os.environ, **creds}
     for k in ("ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"):
         v = os.environ.get(k)
         if v:  # 仅非空才覆盖
             merged[k] = v
+    # 残留检测
+    env_bu = os.environ.get("ZCODE_BASE_URL", "")
+    config_bu = creds.get("ZCODE_BASE_URL", "")
+    if env_bu and config_bu and env_bu != config_bu:
+        all_hosts = set()
+        try:
+            from urllib.parse import urlparse as _up
+            with open(ZCODE_CREDS_PATH) as _f:
+                _cfg = json.load(_f)
+            for _p in _cfg.get("provider", {}).values():
+                _bu = _p.get("options", {}).get("baseURL", "")
+                if _bu:
+                    try:
+                        _h = _up(_bu)
+                        if _h.hostname:
+                            all_hosts.add(f"{_h.scheme}://{_h.netloc}" if _h.scheme else _h.netloc)
+                    except Exception:
+                        pass
+            _eh = _up(env_bu)
+            env_host = f"{_eh.scheme}://{_eh.netloc}" if (_eh.scheme and _eh.hostname) else None
+            _ch = _up(config_bu)
+            config_host = f"{_ch.scheme}://{_ch.netloc}" if (_ch.scheme and _ch.hostname) else None
+        except Exception:
+            env_host = config_host = None
+        # env host 等于某 config provider host, 但不等于 enabled 那个 → 残留
+        if env_host and config_host and env_host != config_host and env_host in all_hosts:
+            merged["ZCODE_BASE_URL"] = config_bu
+            log(f"⚠ ZCODE_BASE_URL 残留检测: env='{env_bu}' 是 config 里另一个 provider "
+                f"的 endpoint, 与 enabled provider (config='{config_bu}') 不一致。已自动用 "
+                f"config 值 (旧 plan 残留)。")
     return merged
 
 

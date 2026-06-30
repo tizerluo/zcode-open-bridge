@@ -196,6 +196,17 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 # 输出每个 key 的来源（config vs env）+ 最终值（apiKey 脱敏）
 ```
 
+### ZCODE_BASE_URL 残留自动检测（切换过 plan 的用户）
+
+**背景**：ZCode App 切换过订阅 plan 的用户，旧 plan 的 baseURL 会残留在子进程环境（即使该 plan 已失效）。例如 `ZCODE_BASE_URL=https://zcode.z.ai`（start-plan 残留）与 config 当前 enabled 的 `zai-coding-plan`（`api.z.ai`）不一致，会导致 headless 调用打到错误端点（404）。
+
+**自动自愈**：bridge 启动时检测——若 env 的 `ZCODE_BASE_URL` 指向 config 里**另一个 provider** 的官方 endpoint（host 匹配），判定为 App 注入的残留 → **自动用 config enabled provider 的值** + stderr 告警。用户自建/代理 endpoint（不在 config 任何 provider 里）则正常尊重 env（issue #3 调试场景不受影响）。
+
+```bash
+# 用 --print-injected-env 看是否检测到残留 (标 🚫)
+./packages/agent-help/zcode-agent-help --print-injected-env
+```
+
 ### 限流与重试（MCP server）
 
 `zcode_review` 调用 headless zcode 做 PR 审查时，多个 gate 并发可能触发 provider 限流。MCP server 做了三层防护（issue #3）：

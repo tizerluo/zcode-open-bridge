@@ -78,8 +78,33 @@ def print_injected_env():
     if not creds:
         print(f"❌ 未从 {ZCODE_CREDS_PATH} 读取到凭证 (config 无 enabled provider 或文件缺失)")
         return 0
+    # 读 config 里所有 provider 的 baseURL (残留检测用, host 集合)
+    all_config_hosts = set()
+    try:
+        from urllib.parse import urlparse as _up
+        with open(ZCODE_CREDS_PATH) as _f:
+            _cfg = json.load(_f)
+        for _p in _cfg.get("provider", {}).values():
+            _bu = _p.get("options", {}).get("baseURL", "")
+            if _bu:
+                try:
+                    _h = _up(_bu)
+                    if _h.hostname:
+                        all_config_hosts.add(f"{_h.scheme}://{_h.netloc}" if _h.scheme else _h.netloc)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    def _host(u):
+        try:
+            h = _up(u)
+            return f"{h.scheme}://{h.netloc}" if (h.scheme and h.hostname) else None
+        except Exception:
+            return None
+
     keys = ["ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"]
-    print("=== 凭证注入诊断 (显式非空 env 优先于 config; 空串 env 视为未设置) ===")
+    print("=== 凭证注入诊断 (显式非空 env 优先于 config; 空串视为未设置) ===")
     print(f"config 源: {ZCODE_CREDS_PATH}")
     for k in keys:
         config_val = creds.get(k, "")
@@ -88,7 +113,18 @@ def print_injected_env():
             shown = _mask_key(env_val) if k == "ANTHROPIC_API_KEY" else env_val
             print(f"  {k}:")
             print(f"    config → {('脱敏 ' + _mask_key(config_val)) if k == 'ANTHROPIC_API_KEY' and config_val else (config_val or '(空)')}")
-            print(f"    env    → {shown}  ⚠ 使用此值 (env 覆盖)")
+            # ZCODE_BASE_URL 特殊: 检测 App 注入的残留官方 endpoint (host 匹配)
+            if k == "ZCODE_BASE_URL" and config_val and env_val != config_val:
+                _eh = _host(env_val)
+                _ch = _host(config_val)
+                if _eh and _ch and _eh != _ch and _eh in all_config_hosts:
+                    print(f"    env    → {shown}  🚫 残留! 是 config 里另一个 provider 的 endpoint")
+                    print(f"             → bridge 会自动用 config 值: {config_val}")
+                    print("             (App 切换 plan 后的残留; 在 config 切回该 provider 或用自建 endpoint 可消除)")
+                else:
+                    print(f"    env    → {shown}  ⚠ 使用此值 (env 覆盖, 自定义 endpoint)")
+            else:
+                print(f"    env    → {shown}  ⚠ 使用此值 (env 覆盖)")
         elif env_val == "":
             # 空串 env: 视为未设置, 仍用 config
             shown = _mask_key(config_val) if k == "ANTHROPIC_API_KEY" else config_val
