@@ -182,7 +182,9 @@ class ReviewFileLock:
                 if time.time() - t0 > self.timeout:
                     self.fd.close()
                     self.fd = None
-                    raise TimeoutError(f"review 锁等待超时 ({self.timeout}s), 可能有并发 review 在跑")
+                    raise TimeoutError(
+                        f"review 锁等待超时 ({self.timeout}s), 可能有并发 review 在跑"
+                    ) from None
                 time.sleep(0.5)
 
     def __exit__(self, *exc):
