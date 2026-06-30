@@ -140,7 +140,7 @@ def print_injected_env():
 # ============================================================
 OVERVIEW = {
     "tool": "zcode",
-    "version_described": "0.15.0 (App 3.2.0)",
+    "version_described": "0.15.0 (App 3.2.1)",
     "what_it_is": (
         "ZCode 是智谱(Z.AI)的 Agentic Coding CLI, 由 GLM 系列模型驱动。"
         "它能自主完成代码编写/审查/调试/分析等任务, 可调用工具(读写文件、"
