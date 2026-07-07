@@ -50,6 +50,7 @@ zcode-acp-bridge — 把 headless ZCode 桥接为 ACP (Agent Client Protocol) Ag
      cancelBackgroundTask/rewindCascade/setModel/setMode
   ✅ workspace/* 方法 (0.15.0+): readState/generateText/setDefault{Model,Mode,ThoughtLevel}/
      upsertModelProvider/removeModelProvider/updateProviderRegistry
+  ✅ prompt/* 方法 (App 3.3.0+): enhance (同步) / enhance/start+result+cancel (异步 job)
 
 协议: ACP (JSON-RPC 2.0 over stdio) 对外; ZCode Protocol (无 jsonrpc 字段) 对内
 依赖: 仅 Python3 标准库
@@ -178,6 +179,11 @@ class ZCodeBackend:
         # 当前事件监听器: {zcode_sid: EventStreamListener}
         self._event_listeners = {}
         self._listeners_lock = threading.Lock()
+        # prompt/enhance 异步 job 的 result 通知路由: requestId → Queue
+        # (3.3.0+): server 完成 enhance job 后推送 prompt/enhance/result notification,
+        # reader 按 requestId 路由到对应等待中的 start 调用 (仿 _response_queues 模式)
+        self._enhance_result_queues = {}
+        self._enhance_lock = threading.Lock()
         # reader 线程健康标志: 退出后设 True, request() 快速失败而非慢速假死
         self._reader_dead = False
         self._reader_stop = False
@@ -221,6 +227,17 @@ class ZCodeBackend:
                     else:
                         # 没人监听: 忽略 (订阅是按需的)
                         pass
+                elif method == "prompt/enhance/result":
+                    # (3.3.0+) enhance job 完成 notification: 按 requestId 路由到等待中的 start
+                    params = msg.get("params", {})
+                    rid = params.get("requestId")
+                    with self._enhance_lock:
+                        eq = self._enhance_result_queues.pop(rid, None)
+                    if eq is not None:
+                        eq.put(params)
+                    else:
+                        # 没人等 (start 未注册/已超时退出): 放通用队列兜底
+                        self._notification_queue.put(msg)
                 elif method is not None:
                     # 其他 notification (如 state.updated) → 通用队列
                     self._notification_queue.put(msg)
@@ -240,6 +257,12 @@ class ZCodeBackend:
             for q in self._response_queues.values():
                 q.put({"error": {"message": "zcode backend reader exited"}})
             self._response_queues.clear()
+        # 同样清理等待中的 enhance result 队列, 防止 start 调用永久挂起
+        with self._enhance_lock:
+            for q in self._enhance_result_queues.values():
+                q.put({"requestId": None, "status": "failed",
+                       "errorMessage": "zcode backend reader exited"})
+            self._enhance_result_queues.clear()
         log("reader 线程退出 (backend 已标记为 dead)")
 
     def register_event_listener(self, zcode_sid, listener):
@@ -251,6 +274,22 @@ class ZCodeBackend:
         """注销事件监听器。"""
         with self._listeners_lock:
             self._event_listeners.pop(zcode_sid, None)
+
+    def register_enhance_listener(self, request_id):
+        """注册 prompt/enhance result 监听, 返回用于等待 result 的 Queue。
+
+        必须在发 prompt/enhance/start 之前调用 (时序: 先注册, 再 start),
+        否则 start 返回与 result 推送之间到达的通知会进兜底队列被丢弃。
+        """
+        q = queue.Queue()
+        with self._enhance_lock:
+            self._enhance_result_queues[request_id] = q
+        return q
+
+    def unregister_enhance_listener(self, request_id):
+        """注销 enhance result 监听 (超时/取消时清理)。"""
+        with self._enhance_lock:
+            self._enhance_result_queues.pop(request_id, None)
 
     def send(self, msg):
         """发一条消息给 zcode (无 jsonrpc 字段)"""
@@ -851,6 +890,15 @@ class ACPBridge:
         if method == "workspace/updateProviderRegistry":
             return self._on_workspace_update_provider_registry(msg_id, req.get("params", {}))
 
+        # ----- prompt/* 方法 (App 3.3.0+, 提示词增强) -----
+        # prompt/enhance/result 是 server 推送通知 (非 client 可调), 故不在此分发
+        if method == "prompt/enhance":
+            return self._on_prompt_enhance(msg_id, req.get("params", {}))
+        if method == "prompt/enhance/start":
+            return self._on_prompt_enhance_start(msg_id, req.get("params", {}))
+        if method == "prompt/enhance/cancel":
+            return self._on_prompt_enhance_cancel(msg_id, req.get("params", {}))
+
         # 未实现的 method
         if method and msg_id is not None:
             return self._error(msg_id, -32601, f"Method not supported: {method}")
@@ -1346,6 +1394,126 @@ class ACPBridge:
                                f"zcode generateText failed: {resp['error'].get('message', '')}")
         result = resp.get("result", {})
         log(f"workspace/generateText → ok (text {len(result.get('text', ''))} chars)")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    # ---------- prompt/* 方法 (App 3.3.0+): 提示词增强 ----------
+    def _on_prompt_enhance(self, msg_id, params):
+        """prompt/enhance → 同名: 同步增强提示词 (阻塞返回增强后文本)。
+
+        params: {workspace:{workspacePath,workspaceKey}, sessionId?, prompt, context?}
+          - prompt: 待增强的原始提示词 (必填, 非空)
+          - sessionId?: 复用已有 session (可选); 不传则 zcode 按 workspaceKey 匹配/临时建
+          - context?: 历史对话 [{role, content}] (可选, 有助于上下文相关增强)
+        返回: {enhanced: string}
+        注意: 底层是模型 generateText 调用, timeout 设 90s (比 generateText 的 60s 宽裕,
+              因 enhance 还含 prompt 构造 + 清洗)。
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        prompt = params.get("prompt")
+        if not prompt:
+            return self._error(msg_id, -32602, "prompt/enhance 需要 prompt")
+        zc_params = {"workspace": ws, "prompt": prompt}
+        if params.get("sessionId") is not None:
+            zc_params["sessionId"] = params["sessionId"]
+        if params.get("context") is not None:
+            zc_params["context"] = params["context"]
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "prompt/enhance", zc_params, timeout=90)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode enhance failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log(f"prompt/enhance → ok (enhanced {len(result.get('enhanced', ''))} chars)")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _on_prompt_enhance_start(self, msg_id, params):
+        """prompt/enhance/start → 同名: 异步启动增强 job (阻塞等待 result 通知)。
+
+        params: {workspace, sessionId?, prompt, context?, requestId}
+          - requestId: client 生成的 job 标识 (必填, 非空); 用于匹配 result 通知
+          - 其余同 prompt/enhance
+        返回: {enhanced} (status=completed 时) / {status:"cancelled"} (被取消时)
+        失败 (status=failed) → -32603 带 errorMessage; 超时未收到 result → -32603。
+
+        实现: zcode 的 start 立即返回 {requestId, accepted:true}, 结果由 server 主动推送
+        prompt/enhance/result notification。本 handler 把异步模型转成 ACP 阻塞语义——
+        start 后注册 enhance listener, 阻塞等待 result 通知 (总超时 120s), 然后返回。
+        时序关键: 必须先注册 listener 再发 start, 否则两者间的通知会丢 (参考 session/prompt
+        的 "先 subscribe 再 send" 教训)。
+        """
+        self.ensure_backend()
+        ws, err = self._resolve_workspace(msg_id, params)
+        if err:
+            return err
+        prompt = params.get("prompt")
+        if not prompt:
+            return self._error(msg_id, -32602, "prompt/enhance/start 需要 prompt")
+        request_id = params.get("requestId")
+        if not request_id:
+            return self._error(msg_id, -32602, "prompt/enhance/start 需要 requestId")
+        zc_params = {"workspace": ws, "prompt": prompt, "requestId": request_id}
+        if params.get("sessionId") is not None:
+            zc_params["sessionId"] = params["sessionId"]
+        if params.get("context") is not None:
+            zc_params["context"] = params["context"]
+        # 时序: 先注册 listener (确保不丢 result 通知), 再发 start
+        result_q = self.backend.register_enhance_listener(request_id)
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "prompt/enhance/start", zc_params, timeout=15)
+        if "error" in resp:
+            self.backend.unregister_enhance_listener(request_id)
+            return self._error(msg_id, -32603,
+                               f"zcode enhance start failed: {resp['error'].get('message', '')}")
+        start_result = resp.get("result", {})
+        if not start_result.get("accepted"):
+            # zcode 拒绝了 (理论上幂等会返回 accepted:true; 此处兜底)
+            self.backend.unregister_enhance_listener(request_id)
+            return self._error(msg_id, -32603,
+                               f"zcode enhance start not accepted: {start_result}")
+        # 阻塞等待 result 通知 (模型调用 + 清洗, 给 120s 兜底; 比模型层 AbortSignal.timeout 宽裕)
+        try:
+            result_params = result_q.get(timeout=120)
+        except queue.Empty:
+            self.backend.unregister_enhance_listener(request_id)
+            return self._error(msg_id, -32603, "prompt/enhance result 等待超时 (120s)")
+        status = result_params.get("status")
+        if status == "completed":
+            enhanced = result_params.get("enhanced", "")
+            log(f"prompt/enhance/start → completed (enhanced {len(enhanced)} chars)")
+            return {"jsonrpc": "2.0", "id": msg_id,
+                    "result": {"enhanced": enhanced}}
+        if status == "cancelled":
+            log("prompt/enhance/start → cancelled")
+            return {"jsonrpc": "2.0", "id": msg_id,
+                    "result": {"status": "cancelled"}}
+        # failed (或未知 status)
+        err_msg = result_params.get("errorMessage", f"enhance job failed (status={status})")
+        log(f"prompt/enhance/start → failed: {err_msg}")
+        return self._error(msg_id, -32603, f"zcode enhance failed: {err_msg}")
+
+    def _on_prompt_enhance_cancel(self, msg_id, params):
+        """prompt/enhance/cancel → 同名: 取消进行中的增强 job。
+
+        params: {requestId}
+        返回: {requestId, cancelled: bool}
+          - cancelled:true 表示当时有在跑的 job 已被中止 (zcode 随后推送 cancelled 通知)
+          - cancelled:false 表示 job 不存在或已自然结束
+        """
+        self.ensure_backend()
+        request_id = params.get("requestId")
+        if not request_id:
+            return self._error(msg_id, -32602, "prompt/enhance/cancel 需要 requestId")
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(
+            zc_id, "prompt/enhance/cancel", {"requestId": request_id}, timeout=10)
+        if "error" in resp:
+            return self._error(msg_id, -32603,
+                               f"zcode enhance cancel failed: {resp['error'].get('message', '')}")
+        result = resp.get("result", {})
+        log(f"prompt/enhance/cancel → cancelled={result.get('cancelled')}")
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
     def _on_workspace_set_default_model(self, msg_id, params):
