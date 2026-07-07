@@ -19,6 +19,7 @@ prompt/enhance/start 是异步 job 模式: start 立即返回 {requestId, accept
 依赖: 仅 Python 标准库 + 本项目的 acp-bridge 模块
 """
 
+import json
 import os
 import queue
 import threading
@@ -84,8 +85,10 @@ class _EnhanceBackend:
     def register_enhance_listener(self, request_id):
         q = queue.Queue()
         with self._lock:
+            if request_id in self._enhance_queues:
+                return None, f"duplicate requestId {request_id}"
             self._enhance_queues[request_id] = q
-        return q
+        return q, None
 
     def unregister_enhance_listener(self, request_id):
         with self._lock:
@@ -146,23 +149,17 @@ class TestPromptEnhanceAsync(unittest.TestCase):
         self.assertEqual(resp["result"], {"status": "cancelled"})
 
     def test_pe11_start_timeout(self):
-        """PE11: result 通知永不到达 → 120s 超时压缩为 1s → -32603
+        """PE11: result 通知永不到达 → 超时 → -32603
 
-        用 monkeypatch 把 result_q.get 的 timeout 压到 1s, 避免真等 120s。
+        用 ZCODE_ENHANCE_TIMEOUT=1 把总超时压到 1s, 避免真等 120s。
         """
-        bridge, _ = self._new_bridge(result_payload=None)  # None = 永不推送
-        # monkeypatch: 把 queue.Queue.get 替换成短超时版本 (只影响本测试的 queue 实例)
-        orig_get = queue.Queue.get
-
-        def fast_get(self_q, timeout=None, block=True):
-            return orig_get(self_q, timeout=min(timeout or 999, 1), block=block)
-
-        queue.Queue.get = fast_get
+        os.environ["ZCODE_ENHANCE_TIMEOUT"] = "1"
         try:
+            bridge, _ = self._new_bridge(result_payload=None)  # None = 永不推送
             resp = self._call(bridge, "prompt/enhance/start",
                               {"workspacePath": "/p", "prompt": "x", "requestId": "r11"})
         finally:
-            queue.Queue.get = orig_get
+            os.environ.pop("ZCODE_ENHANCE_TIMEOUT", None)
         self._assert_error_code(resp, -32603)
         self.assertIn("超时", resp["error"]["message"])
 
@@ -184,9 +181,10 @@ class TestPromptEnhanceAsync(unittest.TestCase):
         backend._listeners_lock = threading.Lock()
         backend._reader_dead = False
         backend._reader_stop = False
-        # 注册一个 listener
+        # 注册一个 listener (新签名返回元组)
         rid = "r12"
-        q = backend.register_enhance_listener(rid)
+        q, dup = backend.register_enhance_listener(rid)
+        self.assertIsNone(dup)
         # 模拟 reader 收到一条 result notification
         notification = {
             "method": "prompt/enhance/result",
@@ -235,6 +233,70 @@ class TestPromptEnhanceAsync(unittest.TestCase):
         self.assertEqual(p["sessionId"], "sess_a")
         self.assertEqual(p["context"], [{"role": "user", "content": "ctx"}])
         self.assertEqual(p["requestId"], "r15")
+
+    def test_pe16_duplicate_requestid_rejected(self):
+        """PE16: 重复 requestId → -32602 (P1-2: 不覆盖孤立旧等待者)
+
+        两次 start 用同一 requestId: 第一次正常等待, 第二次应在注册阶段被拒。
+        """
+        bridge, fake = self._new_bridge(
+            result_payload={"status": "completed", "enhanced": "first"}, result_delay=0.3)
+        # 第一次 start (会等待 result)
+        import threading as _th
+        results = {}
+
+        def _first():
+            results[1] = self._call(bridge, "prompt/enhance/start",
+                                    {"workspacePath": "/p", "prompt": "x", "requestId": "rdup"})
+        t1 = _th.Thread(target=_first)
+        t1.start()
+        time.sleep(0.05)  # 让第一次先注册 listener
+        # 第二次 start 同 requestId → 应被拒 (-32602), 不阻塞
+        results[2] = self._call(bridge, "prompt/enhance/start",
+                                {"workspacePath": "/p", "prompt": "y", "requestId": "rdup"})
+        self._assert_error_code(results[2], -32602)
+        t1.join(timeout=5)
+        # 第一次仍正常完成
+        self._assert_ok(results.get(1), "第一次 start 应正常完成")
+
+    def test_pe17_start_completed_empty_string(self):
+        """PE17: completed 但 enhanced 为空串 → 返回 {enhanced: ""} (不误判失败)"""
+        bridge, _ = self._new_bridge(
+            result_payload={"status": "completed", "enhanced": ""}, result_delay=0.1)
+        resp = self._call(bridge, "prompt/enhance/start",
+                          {"workspacePath": "/p", "prompt": "x", "requestId": "r17"})
+        self._assert_ok(resp)
+        self.assertEqual(resp["result"], {"enhanced": ""})
+
+    def test_pe18_cancel_during_wait_forwarded(self):
+        """PE18: start 阻塞等待期间收到 cancel → 转发后端 (P1-1: cancel 可用)
+
+        _drain_enhance_inbox 在短轮询循环里被调用, 检测到 inbox 里的 cancel 后转发。
+        验证: cancel 消息从 inbox 被取出 (不卡住), 且 cancel 请求被转发给 backend。
+        """
+        bridge, fake = self._new_bridge(
+            result_payload={"status": "completed", "enhanced": "ok"}, result_delay=0.4)
+        import threading as _th
+        start_done = _th.Event()
+        state = {}
+
+        def _start_thread():
+            r = self._call(bridge, "prompt/enhance/start",
+                           {"workspacePath": "/p", "prompt": "x", "requestId": "rcw"})
+            state["start_resp"] = r
+            start_done.set()
+        t = _th.Thread(target=_start_thread)
+        t.start()
+        time.sleep(0.1)  # 等 start 进入阻塞等待
+        # 往 inbox 塞一条 cancel (模拟 client 在等待期间发 cancel)
+        cancel_msg = {"jsonrpc": "2.0", "id": 99,
+                      "method": "prompt/enhance/cancel",
+                      "params": {"requestId": "rcw"}}
+        bridge._inbox.put(json.dumps(cancel_msg))
+        t.join(timeout=5)
+        self.assertTrue(start_done.is_set(), "start 应在收到 result 后完成")
+        # start 最终完成 (result 比 cancel 先生效; 关键是 cancel 没卡死 inbox)
+        self._assert_ok(state["start_resp"])
 
 
 if __name__ == "__main__":

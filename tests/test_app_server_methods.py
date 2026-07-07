@@ -69,11 +69,12 @@ class FakeBackend:
     # prompt/enhance/start 的 listener 桩 (M10 注册完整性测试会调到 start handler;
     # 真正的异步等待逻辑测试在 test_prompt_enhance.py)。这里立即塞一条 cancelled
     # 结果, 让 start handler 快速返回, 避免 M10 阻塞在 120s 等待上。
+    # 返回元组 (q, error) 与真实 ZCodeBackend.register_enhance_listener 签名一致。
     def register_enhance_listener(self, request_id):
         import queue as _q
         q = _q.Queue()
         q.put({"requestId": request_id, "status": "cancelled"})
-        return q
+        return q, None
 
     def unregister_enhance_listener(self, request_id):
         pass
