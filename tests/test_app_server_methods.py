@@ -16,6 +16,7 @@ test_app_server_methods.py — app-server 新协议方法 (0.15.0+) 单测
   M8  workspace/setDefault* 三件套 (乐观锁透传)
   M9  workspace Provider 管理 (apiKey 嵌套对象透传保真 + 日志/错误回显双脱敏)
   M10 旧 handler 回归 (fork/rewind/goal/compact/steer 路由, 补盲区)
+  PE  prompt/enhance 同步 + cancel (3.3.0+, 透传 + 缺参 + 错误回显)
 
 运行: python3 tests/test_app_server_methods.py
 依赖: 仅 Python 标准库 + 本项目的 acp-bridge 模块
@@ -63,6 +64,19 @@ class FakeBackend:
 
     def send(self, msg):
         # 仅用于兼容 (本次测试不覆盖 fire-and-forget 路径)
+        pass
+
+    # prompt/enhance/start 的 listener 桩 (M10 注册完整性测试会调到 start handler;
+    # 真正的异步等待逻辑测试在 test_prompt_enhance.py)。这里立即塞一条 cancelled
+    # 结果, 让 start handler 快速返回, 避免 M10 阻塞在 120s 等待上。
+    # 返回元组 (q, error) 与真实 ZCodeBackend.register_enhance_listener 签名一致。
+    def register_enhance_listener(self, request_id):
+        import queue as _q
+        q = _q.Queue()
+        q.put({"requestId": request_id, "status": "cancelled"})
+        return q, None
+
+    def unregister_enhance_listener(self, request_id):
         pass
 
 
@@ -566,6 +580,8 @@ class TestAppServerMethods(unittest.TestCase):
             "workspace/setDefaultThoughtLevel",
             "workspace/upsertModelProvider", "workspace/removeModelProvider",
             "workspace/updateProviderRegistry",
+            # App 3.3.0+ prompt/* (client 可调; result 是 server 推送, 不在此列)
+            "prompt/enhance", "prompt/enhance/start", "prompt/enhance/cancel",
         ]
         for m in new_methods:
             resp = self._call(bridge, m, {"sessionId": "sess_x", "workspacePath": "/p",
@@ -573,12 +589,77 @@ class TestAppServerMethods(unittest.TestCase):
                                           "model": {"modelId": "m"}, "mode": "yolo",
                                           "taskId": "t", "provider": {"models": [{"modelId": "m"}]},
                                           "providerId": "p", "registry": {"providers": []},
-                                          "prompt": "x", "modelRef": {"modelId": "m"}})
+                                          "prompt": "x", "modelRef": {"modelId": "m"},
+                                          "requestId": "r1"})
             # 关键: 不能是 -32601 (未注册)。各方法要么成功, 要么因缺参报 -32602,
             # 但绝不应该是 "Method not supported"
             if "error" in resp:
                 self.assertNotEqual(resp["error"]["code"], -32601,
                                     f"{m} 未注册到 dispatch (返回 -32601)")
+
+    # ---------- PE: prompt/enhance 同步 + cancel (App 3.3.0+) ----------
+    def test_pe_sync_passthrough(self):
+        """PE1: prompt/enhance 透传 workspace + prompt + 可选 sessionId/context"""
+        bridge, fake = self._new_bridge()
+        fake.next_response = {"result": {"enhanced": "更好的提示词"}}
+        resp = self._call(bridge, "prompt/enhance", {
+            "workspacePath": "/p", "prompt": "写个函数",
+            "sessionId": "sess_x", "context": [{"role": "user", "content": "hi"}],
+        })
+        self._assert_ok(resp)
+        self.assertEqual(fake.calls[0]["method"], "prompt/enhance")
+        p = fake.calls[0]["params"]
+        self.assertEqual(p["prompt"], "写个函数")
+        self.assertEqual(p["sessionId"], "sess_x")
+        self.assertEqual(p["context"], [{"role": "user", "content": "hi"}])
+        self.assertEqual(p["workspace"], {"workspacePath": "/p", "workspaceKey": "/p"})
+        self.assertEqual(resp["result"], {"enhanced": "更好的提示词"})
+
+    def test_pe_sync_missing_prompt(self):
+        """PE2: 缺 prompt → -32602"""
+        bridge, _ = self._new_bridge()
+        resp = self._call(bridge, "prompt/enhance", {"workspacePath": "/p"})
+        self._assert_error_code(resp, -32602)
+
+    def test_pe_sync_backend_error(self):
+        """PE3: 后端错误 → -32603"""
+        bridge, fake = self._new_bridge()
+        fake.next_response = {"error": {"message": "model unavailable"}}
+        resp = self._call(bridge, "prompt/enhance",
+                          {"workspacePath": "/p", "prompt": "x"})
+        self._assert_error_code(resp, -32603)
+
+    def test_pe_sync_timeout_90(self):
+        """PE4: prompt/enhance timeout=90 (模型调用, 比 generateText 的 60 宽裕)"""
+        bridge, fake = self._new_bridge()
+        self._call(bridge, "prompt/enhance",
+                   {"workspacePath": "/p", "prompt": "x"})
+        self.assertEqual(fake.calls[0]["timeout"], 90)
+
+    def test_pe_sync_context_omitted(self):
+        """PE5: 不传 sessionId/context → zc_params 不含这俩键"""
+        bridge, fake = self._new_bridge()
+        self._call(bridge, "prompt/enhance",
+                   {"workspacePath": "/p", "prompt": "x"})
+        p = fake.calls[0]["params"]
+        self.assertNotIn("sessionId", p)
+        self.assertNotIn("context", p)
+
+    def test_pe_cancel_passthrough(self):
+        """PE6: prompt/enhance/cancel 透传 requestId, 返回 cancelled"""
+        bridge, fake = self._new_bridge()
+        fake.next_response = {"result": {"requestId": "r1", "cancelled": True}}
+        resp = self._call(bridge, "prompt/enhance/cancel", {"requestId": "r1"})
+        self._assert_ok(resp)
+        self.assertEqual(fake.calls[0]["method"], "prompt/enhance/cancel")
+        self.assertEqual(fake.calls[0]["params"], {"requestId": "r1"})
+        self.assertEqual(resp["result"], {"requestId": "r1", "cancelled": True})
+
+    def test_pe_cancel_missing_requestid(self):
+        """PE7: cancel 缺 requestId → -32602"""
+        bridge, _ = self._new_bridge()
+        resp = self._call(bridge, "prompt/enhance/cancel", {})
+        self._assert_error_code(resp, -32602)
 
 
 if __name__ == "__main__":
