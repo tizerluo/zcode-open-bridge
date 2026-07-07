@@ -1439,20 +1439,12 @@ class ACPBridge:
         """prompt/enhance/start → 同名: 异步启动增强 job (阻塞等待 result 通知)。
 
         params: {workspace, sessionId?, prompt, context?, requestId}
-          - requestId: client 生成的 job 标识 (必填, 非空); 用于匹配 result 通知
-          - 其余同 prompt/enhance
-        返回: {enhanced} (status=completed 时) / {status:"cancelled"} (被取消时)
-        失败 (status=failed) → -32603 带 errorMessage; 超时未收到 result → -32603。
+        返回: {enhanced} (completed) / {status:"cancelled"} (被取消)
+        失败 (failed) → -32603 带 errorMessage; 超时未收到 result → -32603。
 
-        实现: zcode 的 start 立即返回 {requestId, accepted:true}, 结果由 server 主动推送
-        prompt/enhance/result notification。本 handler 把异步模型转成 ACP 阻塞语义——
-        先注册 listener 再发 start (时序关键, 参考session/prompt 的"先 subscribe 再 send"),
-        然后短轮询等待 result 通知 (总超时 120s)。
-
-        等待期间通过 _drain_inbox 处理带外消息: 主循环在 handle_acp 里串行处理请求,
-        本 handler 阻塞期间主循环不会取下一条消息, 所以 client 若在等待 start 返回时
-        发 prompt/enhance/cancel, 它会进 _inbox。本循环每轮 drain inbox, 检测到 cancel
-        就转发给后端并写响应, 使 cancel 在阻塞等待期间可用 (Codex review P1-1 修复)。
+        时序关键: 必须先注册 listener 再发 start (参考 session/prompt "先 subscribe 再 send"),
+        否则 start 返回与 result 推送之间的通知会丢。阻塞期间主循环串行不取下条消息,
+        故每轮 _drain_enhance_inbox 把 inbox 里的 cancel 转发后端, 使 cancel 在等待期可用。
         """
         self.ensure_backend()
         ws, err = self._resolve_workspace(msg_id, params)
@@ -1485,10 +1477,8 @@ class ACPBridge:
             self.backend.unregister_enhance_listener(request_id)
             return self._error(msg_id, -32603,
                                f"zcode enhance start not accepted: {start_result}")
-        # 短轮询等待 result 通知 (总超时默认 120s; 比模型层 AbortSignal.timeout 宽裕)。
-        # 每轮 drain inbox: 检测中途到达的 prompt/enhance/cancel, 转发后端并响应,
-        # 使 cancel 在阻塞期间可用 (主循环串行, 不 drain 则 cancel 卡在 inbox)。
-        # ZCODE_ENHANCE_TIMEOUT 可覆盖 (仅用于测试加速, 生产留默认)。
+        # 短轮询等待 result 通知。每轮 drain inbox 让中途的 cancel 可用 (主循环串行,
+        # 不 drain 则 cancel 卡在 inbox)。总超时默认 120s, ZCODE_ENHANCE_TIMEOUT 可覆盖。
         try:
             enhance_timeout = int(os.environ.get("ZCODE_ENHANCE_TIMEOUT", "120"))
         except ValueError:
@@ -1504,7 +1494,8 @@ class ACPBridge:
                 continue
         self.backend.unregister_enhance_listener(request_id)
         if result_params is None:
-            return self._error(msg_id, -32603, "prompt/enhance result 等待超时 (120s)")
+            return self._error(msg_id, -32603,
+                               f"prompt/enhance result 等待超时 ({enhance_timeout}s)")
         status = result_params.get("status")
         if status == "completed":
             enhanced = result_params.get("enhanced", "")
@@ -1521,15 +1512,12 @@ class ACPBridge:
         return self._error(msg_id, -32603, f"zcode enhance failed: {err_msg}")
 
     def _drain_enhance_inbox(self, request_id):
-        """阻塞等待 enhance result 期间, 处理 inbox 里到达的 prompt/enhance/cancel。
+        """阻塞等待 enhance result 期间, 把 inbox 里的 cancel 转发给后端。
 
-        主循环 run() 串行处理请求; _on_prompt_enhance_start 阻塞时, client 发来的
-        cancel 会卡在 _inbox 直到 start 返回。本方法每轮调用, 把 cancel 从 inbox 取出,
-        转发给 zcode 后端, 并把 cancel 的响应写回 stdout (因主循环此刻不处理它)。
-
-        其他消息 (session/cancel 等已有处理逻辑) 放回 inbox 尾部, 不吞掉。
+        主循环串行, _on_prompt_enhance_start 阻塞时 client 发的 cancel 会卡在 inbox。
+        本方法每轮短轮询调用: 匹配 requestId 的 cancel 转发后端并写响应到 stdout,
+        其他消息放回 inbox 尾部不吞掉。
         """
-        replay = []
         while True:
             try:
                 line = self._inbox.get_nowait()
@@ -1546,13 +1534,11 @@ class ACPBridge:
                     and req.get("params", {}).get("requestId") == request_id):
                 cancel_id = req.get("id")
                 cancel_resp = self._on_prompt_enhance_cancel(cancel_id, req.get("params", {}))
-                if cancel_resp is not None and cancel_id is not None:
+                if cancel_id is not None:
                     sys.stdout.write(json.dumps(cancel_resp, ensure_ascii=False) + "\n")
                     sys.stdout.flush()
                 continue
-            # 非 cancel: 放回, 避免吞掉其他带外消息
-            replay.append(line)
-        for line in replay:
+            # 非 cancel: 放回尾部, 不吞掉其他带外消息 (顺序保持)
             self._inbox.put(line)
 
     def _on_prompt_enhance_cancel(self, msg_id, params):

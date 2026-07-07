@@ -269,13 +269,14 @@ class TestPromptEnhanceAsync(unittest.TestCase):
         self.assertEqual(resp["result"], {"enhanced": ""})
 
     def test_pe18_cancel_during_wait_forwarded(self):
-        """PE18: start 阻塞等待期间收到 cancel → 转发后端 (P1-1: cancel 可用)
+        """PE18: start 阻塞等待期间收到 cancel → drain 转发后端 (P1-1: cancel 可用)
 
         _drain_enhance_inbox 在短轮询循环里被调用, 检测到 inbox 里的 cancel 后转发。
-        验证: cancel 消息从 inbox 被取出 (不卡住), 且 cancel 请求被转发给 backend。
+        真实验证: cancel 必须出现在 fake.calls 里 (证明 drain 从 inbox 取出并转发了),
+        否则就是"假绿"——删掉 drain 转发逻辑测试仍过。
         """
         bridge, fake = self._new_bridge(
-            result_payload={"status": "completed", "enhanced": "ok"}, result_delay=0.4)
+            result_payload={"status": "completed", "enhanced": "ok"}, result_delay=1.0)
         import threading as _th
         start_done = _th.Event()
         state = {}
@@ -287,7 +288,7 @@ class TestPromptEnhanceAsync(unittest.TestCase):
             start_done.set()
         t = _th.Thread(target=_start_thread)
         t.start()
-        time.sleep(0.1)  # 等 start 进入阻塞等待
+        time.sleep(0.15)  # 等 start 进入阻塞等待 (已发出 start, 进入 result_q.get 轮询)
         # 往 inbox 塞一条 cancel (模拟 client 在等待期间发 cancel)
         cancel_msg = {"jsonrpc": "2.0", "id": 99,
                       "method": "prompt/enhance/cancel",
@@ -295,8 +296,14 @@ class TestPromptEnhanceAsync(unittest.TestCase):
         bridge._inbox.put(json.dumps(cancel_msg))
         t.join(timeout=5)
         self.assertTrue(start_done.is_set(), "start 应在收到 result 后完成")
-        # start 最终完成 (result 比 cancel 先生效; 关键是 cancel 没卡死 inbox)
         self._assert_ok(state["start_resp"])
+        # 关键断言: cancel 被 _drain_enhance_inbox 从 inbox 取出并转发给后端
+        # (code-reviewer P1: 没这个断言则删掉转发逻辑测试仍绿 = 假绿)
+        cancel_forwarded = any(
+            c["method"] == "prompt/enhance/cancel" and c["params"].get("requestId") == "rcw"
+            for c in fake.calls)
+        self.assertTrue(cancel_forwarded,
+                        "cancel 应被 drain 转发给 backend, 实际 fake.calls 无该调用")
 
 
 if __name__ == "__main__":
