@@ -1,14 +1,14 @@
 ---
 name: zcode-bridge-guide
-version: 1.1.0
-description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.15.0+。
+version: 1.2.0
+description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级 + prompt 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.15.0+（App 3.3.0+）。
 user-invocable: true
 ---
 
 # 驱动 ZCode（三模式通用说明书）
 
 > 本 skill 是 [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) 项目的配套说明书。
-> 兼容 ZCode CLI **0.14.5 ~ 0.15.0+**（App 3.2.0+，实测含 3.2.1）。新版功能（事件驱动真流式、fork/rewind/goal/compact/steer、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`。
+> 兼容 ZCode CLI **0.14.5 ~ 0.15.0+**（App 3.3.0+，实测含 3.2.1~3.3.0）。新版功能（事件驱动真流式、fork/rewind/goal/compact/steer、workspace/*、setThoughtLevel 思考强度控制、prompt/enhance 提示词增强）在旧版上自动降级或返回 `-32603`。
 
 ## 前置条件
 
@@ -256,6 +256,16 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 | `workspace/setDefaultModel` / `setDefaultMode` / `setDefaultThoughtLevel` | 设工作区默认值（持久化） | `{workspace, model\|mode\|thoughtLevel, expectedWorkspaceRevision?}` |
 | `workspace/upsertModelProvider` / `removeModelProvider` / `updateProviderRegistry` | 管理模型供应商（含 apiKey，敏感） | `{workspace, provider\|providerId\|registry, ...}` |
 
+**prompt 级扩展方法**（App 3.3.0+，提示词增强）：
+
+| 方法 | 作用 | params |
+|------|------|--------|
+| `prompt/enhance` | 同步增强提示词（阻塞返回增强后文本） | `{workspace, prompt, sessionId?, context?}` |
+| `prompt/enhance/start` | 异步启动增强 job（阻塞等待结果通知） | `{workspace, prompt, requestId, sessionId?, context?}` |
+| `prompt/enhance/cancel` | 取消进行中的增强 job | `{requestId}` |
+
+> 💡 `prompt/enhance` 让外部调用方复用 ZCode 内置的"提示词增强"能力（模型把简短 prompt 扩展成精确、结构化的指令）。同步版（`prompt/enhance`）直接阻塞返回 `{enhanced}`；异步版（`start`）转成阻塞语义——start 后内部等待 server 推送的 `result` 通知，期间收到的 `cancel` 会被转发给后端。`prompt/enhance/result` 本身是 server 推送通知，非 client 可调。App < 3.3.0 调用会返回 `-32603`。
+
 > ⚠️ `session/goal action=set` 会启动内部 AI turn（异步），耗时 10~45s。bridge 会自动等待 prompt lock 释放后返回，但调用方需预期较长延迟。
 >
 > 💡 **思考强度控制**（0.15.0+）：`session/setThoughtLevel` 可在跑任务前调高（如 `high`/`max`）让模型多推理，跑完后调回（如 `nothink`）。`thoughtLevel` 是动态值，按当前模型的 reasoning 能力决定可选值（实测 GLM-5.2：`max`/`high`/`nothink`，其他模型可能不同）。这与 drive-claude 的 `--effort`、drive-codex 的 reasoning effort 形成对称能力。设置后会话内的后续 turn 都生效。
@@ -356,10 +366,13 @@ npm test     # 全量，看实际数字
 
 | ZCode CLI 版本 | 支持情况 | 差异 |
 |:--------------:|:--------:|------|
-| **0.15.0+** (App 3.2.0+) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel） |
+| **0.15.0+** (App 3.3.0+) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel、**prompt/enhance**） |
+| **0.15.0** (App 3.2.0 ~ 3.2.5) | ✅ 完整 | 同上，但无 prompt/enhance（3.3.0 引入） |
 | **0.14.8** (App 3.1.4) | ✅ 完整 | ACP bridge 真流式；fork/rewind/goal/compact/steer 可用；workspace/* 与 setThoughtLevel 返回 -32603 |
 | **0.14.5 ~ 0.14.7** | ✅ 兼容 | ACP bridge 自动降级伪流式；扩展方法不可用（协议未实现） |
 | **< 0.14.5** | ⚠️ 未测 | CLI `--prompt` 基本可用；ACP bridge 未验证 |
+
+> 注：CLI 版本自 0.15.0 起未再升，但 App 持续更新。`prompt/enhance` 是 App 3.3.0 引入的——CLI 仍是 0.15.0，仅 App 3.3.0+ 的 app-server 才支持。判断 prompt/* 可用性以 App ≥ 3.3.0 为准。
 
 **降级行为**：
 - ACP bridge 检测到 `session/subscribe` 不可用时，自动切换到轮询 `session/read`（伪流式）
