@@ -124,6 +124,8 @@ zcode --prompt "继续" --resume sess_xxxx
 | usage_update（token 用量）| ✅ |
 | agent_message_chunk（文本输出）| ✅ **真流式**（0.14.8+）|
 | agent_thought_chunk（思考过程）| ✅ 流式（GLM-5-Turbo）|
+
+> `session/prompt` 的 `prompt` 参数除标准 ACP ContentBlock[] 外，bridge 还兼容纯字符串与 `{"content": "..."}` 键别名（内部统一归一，zcode review P3-5）。
 | plan（任务清单）| ⚠️ 代码就位，数据驱动 |
 | diff（文件变更）| ⚠️ 仅文件名，无 diff 内容 |
 

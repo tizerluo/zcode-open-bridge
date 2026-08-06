@@ -399,6 +399,21 @@ class TestAppServerMethods(unittest.TestCase):
                      if isinstance(f, dict) and f.get("method") == "session/stop"]
         self.assertEqual(stop_sent, [], "也不经 send() 直发 (补发是 turn 循环的职责)")
 
+    def test_x3_cancel_idle_stop_backend_error_ignored(self):
+        """X3: 空闲 cancel 直发 stop, 后端报错被吞掉不抛 (zcode review P3-1)
+
+        无活动 turn 时后端会对 session/stop 报错 (幂等语义), bridge 只记日志,
+        notification 仍返回 None — 本地取消标记已生效, 错误不影响调用方。
+        """
+        script = {"session/stop": {"response": {"error": {"code": -32603,
+                                                          "message": "no active turn"}}}}
+        bridge, fake = self._new_bridge(script)
+        bridge.session_map["acp_x3"] = "sess_x3"
+        resp = self._call(bridge, "session/cancel", {"sessionId": "acp_x3"})
+        self.assertIsNone(resp, "后端 stop 报错时 notification 仍无响应 (错误被吞)")
+        stop = [c for c in fake.calls if c["method"] == "session/stop"]
+        self.assertEqual(len(stop), 1, "空闲路径仍直发一次 session/stop")
+
     # ---------- R: server→client 反向调用应答 ----------
     def _bare_backend(self):
         """绕过 __init__ 构造裸 ZCodeBackend (不起子进程), 注入分发所需最小状态。
@@ -585,6 +600,10 @@ class TestAppServerMethods(unittest.TestCase):
         zcode review P1-3 端到端: 探测超时不是实锤 (可能 ≤0.15 server 启动慢),
         此时 subscribe 失败本身就是旧协议实锤 → 推翻 v16 兜底, 回退 legacy 走
         原有轮询降级, 而非硬判 v16 报错把整个 server 判死 (实锤 v16 门禁见 PM4)。
+
+        注意: 下方 monkeypatch 的是模块级 time.time, 依赖实现经 `import time`
+        后调 time.time(); 若实现改为 from time import time 局部别名, 本测试
+        的快进手法会失效, 需同步 (zcode review P3-4)。
         """
         # 先真跑一次超时探测, 拿到真实的超时兜底判定 (mode=v16, confirmed=False)
         probe_backend = self._detect_backend(None)

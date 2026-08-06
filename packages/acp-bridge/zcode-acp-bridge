@@ -431,6 +431,8 @@ class ZCodeBackend:
                 self.protocol_confirmed = True
                 return
             # 字符串 probe id: 避开 bridge 的数字请求空间, 也避开 server 的 "server-N"
+            # 固定值安全依赖: 全程只探一次 (_probe_lock + 结果缓存); 若未来引入
+            # 重连重探, 需改为每次唯一 id 防与残留响应交错 (zcode review P3-3)
             probe_id = "bridge-probe-1"
             resp_q = queue.Queue()
             reject_q = queue.Queue()
@@ -748,6 +750,8 @@ class EventTranslator:
             self.turn_done = True
             self.turn_failed = True
             err = payload.get("error") or {}
+            if not isinstance(err, dict):  # 防御: error 为字符串等非 dict 形态时兜底 (reviewer-1 N1)
+                err = {"message": str(err)}
             self.turn_error = (err.get("message") or err.get("type")
                                or err.get("code") or "unknown error")
             log(f"  [event] turn.failed ({self.turn_error})")
@@ -1091,6 +1095,8 @@ class ACPBridge:
         return self._msg_counter
 
     # 0.16 已删方法 (实测后端返 -32601 Method not found, 规格书 §2)
+    # 0.16 已删方法清单 — 与 README/SKILL 的「0.16 已移除」表格标注双处维护,
+    # 未来版本增删方法时两边同步 (zcode review P3-2)
     _REMOVED_IN_016 = frozenset({
         "session/steer", "session/rewind", "session/rewindCascade",
         "prompt/enhance", "prompt/enhance/start", "prompt/enhance/cancel",

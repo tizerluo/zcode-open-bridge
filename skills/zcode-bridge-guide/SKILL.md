@@ -200,6 +200,8 @@ sid = "sess_xxx"
 send({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
       "params": {"sessionId": sid,
                  "prompt": [{"type": "text", "text": "审查这段代码"}]}})
+# 注: prompt 参数也兼容纯字符串 "审查这段代码" 或 {"content": "..."} 键别名,
+#     bridge 内部统一归一为 ContentBlock[] (zcode review P3-5)
 
 # 4. 收集流式事件 + 等最终响应
 chunks = []

@@ -146,7 +146,7 @@
 
 - `session/event` 的 `type` 与 `deliveryKind` 在 **params 顶层**（`{seq, eventId, timestamp, traceId, type, deliveryKind, payload:{…}}`），payload 内不含这两个字段。例外：`session.updated` 的 payload 内有 `type` 子类型字段（`model_request_started` / `model_request_completed`）。
 - 补记 `turn.failed`：无 `resultType`，载荷 `{error:{type, code, message, detail, stack}, turnPhase}`，是终止帧。
-- `process` / `resourceSample` 通知存在，桥正确丢弃（不进事件翻译层）。
+- `process/resourceSample` 通知存在（单个方法名，非两个通知），桥正确丢弃（不进事件翻译层）。
 
 ### §2 历史勘误
 
