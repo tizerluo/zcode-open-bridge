@@ -388,8 +388,8 @@ APP_SERVER = {
         "⚠ 0.16.1 (App 3.6.5) app-server 协议大改 (详见 docs/upgrade-0.16.1-spec.md): "
         "信封不再带 jsonrpc 字段; session/new|prompt|cancel 被 session/create|send|stop 取代; "
         "新增 server→client 反向调用 session/requestRuntimePreferences (client 必须应答, 否则卡住); "
-        "session/subscribe 新增必填 deliveryKind。下列 key_methods 仍是 0.15.0 实测记录 (待重写), "
-        "其中 steer/rewind/rewindCascade/prompt/* 在 0.16.1 均返回 -32601 Method not found。"
+        "session/subscribe 新增必填 deliveryKind。下列 key_methods 已更新到 0.16.1 实况: "
+        "steer/rewind/rewindCascade/prompt/enhance* 均已移除 (调用返 -32601 Method not found)。"
     ),
     "description": (
         "长驻 stdio 服务, 支持多会话/多轮。ZCode 桌面 App 和 ACP 桥接器都用它。"
@@ -397,9 +397,14 @@ APP_SERVER = {
     ),
     "key_methods": [
         {"method": "session/create", "params": "workspace:{workspacePath,workspaceKey}, mode?",
-         "result": "session:{sessionId}, projection, messages", "note": "mode 参数实测不生效, 返回 build"},
+         "result": "session:{sessionId}, protocol:{name,version}, projection, messages",
+         "note": "0.16: 返回带 protocol 版本块 (无握手方法, 可做版本探测); 触发 server→client "
+                 "反向调用 session/requestRuntimePreferences, 必须应答否则卡住; "
+                 "mode 参数 0.16 stdio 下被忽略 (工具自动执行)"},
         {"method": "session/send", "params": "sessionId, content",
-         "result": "{accepted, sessionId, stateRevision}", "note": "立即返回, 不阻塞; turn 完成需轮询"},
+         "result": "{accepted, sessionId, stateRevision}",
+         "note": "立即返回, 不阻塞; turn 完成经 session/event (turn.completed) 推送, 或轮询 session/read; "
+                 "0.16 起 turn 进行中发送即 steer 语义; 同样触发反向调用 (scope=user-execution)"},
         {"method": "session/read", "params": "sessionId",
          "result": "projection:{status, totalTokenCount, activeToolCalls, pendingPermissions...}, todos, messages",
          "note": "查状态用; status: idle/running"},
@@ -413,11 +418,24 @@ APP_SERVER = {
         {"method": "interaction/requestPermission", "params": "requestId, toolCallId, decision",
          "note": "应答权限; decision: allow/deny/escalate/modify"},
         {"method": "session/events", "params": "sessionId?", "note": "0.14.8+: 拉取增量事件 (新)"},
-        {"method": "session/subscribe", "params": "sessionId", "note": "0.14.8+: 订阅事件推送 (新)"},
-        {"method": "session/steer", "params": "sessionId, content", "note": "0.14.8+: 在 turn 进行中追加/改向指令 (新)"},
-        {"method": "session/stop", "params": "sessionId", "note": "0.14.8+: 停止当前 turn (新)"},
+        {"method": "session/subscribe", "params": "sessionId, deliveryKind, includeSnapshot?, afterSeq?",
+         "result": "{eventSeq, snapshot?}",
+         "note": "0.14.8+: 订阅事件推送; 0.16 起 deliveryKind 必填 "
+                 "(枚举 desktop-continuous/web-remote-replayable, 实测 desktop-continuous 可用); "
+                 "事件经 session/event 通知推送 (turn.started/model.streaming/turn.completed/turn.failed 等)"},
+        {"method": "session/requestRuntimePreferences",
+         "direction": "server→client (反向调用, 非 client 可调)",
+         "params": "sessionId, scope (create: runtime-materialization; send: user-execution)",
+         "note": "0.16+: server 在 create/send 时反向请求, client 必须应答 "
+                 "{nativeSearchEnhancementsEnabled, memoryEnabled, "
+                 "askUserQuestionAutoResolutionEnabled} (全 boolean), 否则 create/send 永久挂起"},
+        {"method": "session/steer", "params": "sessionId, content",
+         "note": "❌ 0.16 已移除 (调用返 -32601); 语义并入 session/send (turn 进行中发送即 steer)"},
+        {"method": "session/stop", "params": "sessionId",
+         "note": "0.14.8+: 停止当前 turn; 0.16 起取代 session/cancel (幂等)"},
         {"method": "session/fork", "params": "sessionId, checkpointId?", "note": "0.14.8+: 从 checkpoint 分叉 (新)"},
-        {"method": "session/rewind", "params": "sessionId, checkpointId?", "note": "0.14.8+: 回退工作区文件 (新)"},
+        {"method": "session/rewind", "params": "sessionId, checkpointId?",
+         "note": "❌ 0.16 已移除 (调用返 -32601); 无协议替代, 仅剩 slash 命令 /rewind 与 rewind.triggered 事件"},
         {"method": "session/goal", "params": "sessionId, goal?", "note": "0.14.8+: 读/设 session 目标 (新)"},
         {"method": "session/compact", "params": "sessionId", "note": "0.14.8+: 压缩对话上下文 (新)"},
         {"method": "session/setModel", "params": "sessionId, modelId", "note": "0.14.8+: 切换模型 (新)"},
@@ -427,9 +445,10 @@ APP_SERVER = {
         {"method": "session/setThoughtLevel", "params": "sessionId, thoughtLevel",
          "note": "0.15.0+: 设置思考强度 (动态值, 按模型 reasoning 能力; 实测 GLM-5.2: max/high/nothink)"},
         {"method": "session/updateRuntimeModelConfig", "params": "sessionId, runtimeModel, applyModelSelection?",
-         "note": "0.15.0+: 运行时覆盖模型配置 (含 provider/providerOptions/thoughtLevel)"},
+         "note": "0.15.0+: 运行时覆盖模型配置 (含 provider/providerOptions/thoughtLevel); "
+                 "0.16.1 存活, 但 schema 新要求 runtimeModel.revision (string) 必填"},
         {"method": "session/rewindCascade", "params": "sessionId, target?, scope?, expectedRevision?",
-         "note": "0.15.0+: 级联回退 (与 rewind 同 schema, 内部 /rewind cascade)"},
+         "note": "❌ 0.16 已移除 (调用返 -32601); 原为 0.15.0+ 级联回退 (与 rewind 同 schema)"},
         {"method": "session/setMode", "params": "sessionId, mode",
          "note": "0.15.0+ 暴露: 切换会话权限模式 (mode: plan|build|edit|yolo|auto)"},
         # ----- 0.15.0 (App 3.2.0) 新增 workspace/* 方法 (按工作区定位, 非 session) -----
@@ -449,18 +468,18 @@ APP_SERVER = {
          "note": "0.15.0+: 移除模型供应商"},
         {"method": "workspace/updateProviderRegistry", "params": "workspace, registry, includeWorkspaceState?",
          "note": "0.15.0+: 批量更新供应商注册表 (registry.providers 含 apiKey, 敏感)"},
-        # ----- App 3.3.0 新增 prompt/* 方法 (提示词增强) -----
+        # ----- App 3.3.0 新增 prompt/* 方法 (提示词增强); 0.16 已整族移除 -----
         {"method": "prompt/enhance", "params": "workspace:{workspacePath,workspaceKey}, sessionId?, prompt, context?",
          "result": "{enhanced}",
-         "note": "3.3.0+: 同步增强提示词 (阻塞返回增强后文本; 底层模型调用)"},
+         "note": "❌ 0.16 已移除 (调用返 -32601); 原 3.3.0+ 同步增强提示词 (阻塞返回增强后文本)"},
         {"method": "prompt/enhance/start", "params": "workspace, sessionId?, prompt, context?, requestId",
          "result": "{requestId, accepted}",
-         "note": "3.3.0+: 异步启动增强 job (立即返回, 结果由 prompt/enhance/result 推送)"},
+         "note": "❌ 0.16 已移除 (调用返 -32601); 原 3.3.0+ 异步启动增强 job (结果由 prompt/enhance/result 推送)"},
         {"method": "prompt/enhance/result", "params": "(server 推送通知, 非 client 可调)",
-         "note": "3.3.0+: 增强 job 完成推送 (status: completed/failed/cancelled; enhanced 是 string)"},
+         "note": "❌ 0.16 已移除 (随 enhance 族整体删除); 原 3.3.0+ 增强 job 完成推送"},
         {"method": "prompt/enhance/cancel", "params": "requestId",
          "result": "{requestId, cancelled}",
-         "note": "3.3.0+: 取消进行中的增强 job"},
+         "note": "❌ 0.16 已移除 (调用返 -32601); 原 3.3.0+ 取消进行中的增强 job"},
     ],
     "turn_model": {
         "description": "异步模型: send 立即返回, turn 完成需轮询 session/read",

@@ -48,7 +48,7 @@ CLI 0.16.1 适配 (依据 docs/upgrade-0.16.1-spec.md, 全部经实测复核):
     (旧版桥无此代码路径, 即死于此 — 本适配的最高优先级单项)。
   - session/create 返回 protocol {name, version} (0.16 无握手方法), 记录日志。
   - 0.16 已删方法 (steer/rewind*/prompt/enhance*) 后端返 -32601,
-    不分协议模式, 统一映射为明确文案「ZCode 0.16 已移除该能力」。
+    不分协议模式, 统一映射为明确文案「当前 ZCode 版本已移除该能力」。
   - state.updated 的 patch 合并为状态投影 (供事件流停滞检查);
     v4/telemetry/event 忽略; session.titleUpdated 转 stderr 日志。
 
@@ -217,6 +217,9 @@ class ZCodeBackend:
         # 0.16+ 的信封拒绝帧实测带固定 id "invalid-message") 入 _protocol_error_queue
         self.protocol_mode = None        # "legacy" | "v16" (探测后缓存)
         self.protocol_version = None     # session/create 返回的 protocol.version (0.16+)
+        # 探测判定是否有实锤: True=见过信封拒绝帧/旧协议回显; False=仅超时兜底
+        # (zcode review P1-3: 超时判来的 v16 允许被 subscribe 失败推翻回退 legacy)
+        self.protocol_confirmed = None
         self._probe_lock = threading.Lock()
         self._protocol_error_queue = queue.Queue()
         # 0.16+ state.updated 的 patch 合并投影: {zcode_sid: {status, mode, model, ...}}
@@ -413,14 +416,19 @@ class ZCodeBackend:
           - 0.16+ zod 校验拒收 jsonrpc 键 → -32600 invalid_union; 实测该错误帧的
             id 是固定占位符 "invalid-message" (非请求 id) → 判 "v16"
           - ≤0.15 理解信封 → 回显 probe id 的正常响应 (result 或非信封类 error) → "legacy"
-          - 超时无法判定 → 按 "v16" 处理 (当前发行版; 且新协议代码路径对 0.15 亦兼容:
-            信封/方法集一致, 反向调用 0.15 从不发, 已删方法 0.15 不会返 -32601)
+          - 超时无法判定 → 暂按 "v16" 处理 (当前发行版; 且新协议代码路径对 0.15 亦兼容:
+            信封/方法集一致, 反向调用 0.15 从不发, 已删方法 0.15 不会返 -32601),
+            但标 protocol_confirmed=False (无实锤): 之后 subscribe 失败即推翻该判定,
+            回退 legacy 走原有轮询降级 (zcode review P1-3; 防启动慢于 8s 的 ≤0.15
+            server 被超时误判 v16 后 subscribe 门禁硬报错、完全不可用)
         """
         with self._probe_lock:
             if self.protocol_mode is not None:
                 return  # 已探测过, 直接复用缓存
             if self._reader_dead:
                 self.protocol_mode = "v16"  # 后端已死, 模式无实际影响; 取当前发行版
+                # confirmed=True: 后端已死, 回退 legacy 轮询同样活不了, 不做无谓降级
+                self.protocol_confirmed = True
                 return
             # 字符串 probe id: 避开 bridge 的数字请求空间, 也避开 server 的 "server-N"
             probe_id = "bridge-probe-1"
@@ -443,6 +451,8 @@ class ZCodeBackend:
                     self._response_queues.pop(probe_id, None)
                     self._response_queues.pop("invalid-message", None)
                 self.protocol_mode = "v16"
+                # confirmed=True: 管道已断, 回退 legacy 轮询同样发不出去, 保持硬门禁
+                self.protocol_confirmed = True
                 log(f"协议探测: 发送失败 ({e}), 按 0.16+ 新协议处理")
                 return
             try:
@@ -473,13 +483,21 @@ class ZCodeBackend:
                         pass
                 else:
                     self.protocol_mode = "v16"
-                    log("⚠ 协议探测超时, 按 0.16+ 新协议处理 (当前发行版)")
+                    # 超时兜底无实锤 → 未确认: subscribe 失败可推翻回退 legacy
+                    # (见 docstring 与 _on_session_prompt 的回退分支)
+                    self.protocol_confirmed = False
+                    log("⚠ 协议探测超时, 暂按 0.16+ 处理 (未确认; subscribe 失败将回退旧协议)")
+                # 从 while break 出来的都是实锤判定 (信封拒绝帧或旧协议回显) → 确认
+                if self.protocol_confirmed is None:
+                    self.protocol_confirmed = True
             finally:
                 with self._resp_lock:
                     self._response_queues.pop(probe_id, None)
                     self._response_queues.pop("invalid-message", None)
+            _unconfirmed = "" if self.protocol_confirmed else ", 超时兜底未确认"
             log(f"协议探测: mode={self.protocol_mode} "
-                f"({'0.16+ 新协议' if self.protocol_mode == 'v16' else '≤0.15 旧协议'})")
+                f"({'0.16+ 新协议' if self.protocol_mode == 'v16' else '≤0.15 旧协议'}"
+                f"{_unconfirmed})")
 
     @staticmethod
     def _is_envelope_reject(msg):
@@ -537,6 +555,21 @@ class ZCodeBackend:
             proj = self._state_projections.get(zcode_sid)
             return dict(proj) if proj else None
 
+    def reset_projection(self, zcode_sid):
+        """新 turn 入口清掉该会话的状态投影 (防跨 turn 陈旧; zcode review P1-1)。
+
+        核实结论 (该条为误报, 此处是防御): 投影唯一写入点是 _merge_state_patch
+        (reader 的 state.updated 路由), subscribe/create 快照从不播种 (subscribe
+        快照只取 contextWindow 进 listener); Wave 2 reviewer-1 实测 0.16.1 turn
+        期间 state.updated 只有 {status:running} (prompt_started) 与
+        {mode,model,...} (prompt_completed) 两种 patch, 从不发 status:idle —
+        跨 turn 残留最多卡在 running, 「残留 idle 投影致 _run_event_turn 停滞
+        检查提前收尾」的竞态在 0.16.1 不可达。仍清理: 投影只服务停滞检查, 重置
+        零成本, 未来版本若补发 idle patch 也读不到上一 turn 的旧值。
+        """
+        with self._state_lock:
+            self._state_projections.pop(zcode_sid, None)
+
 
 # ============================================================
 # TurnMonitor: 把轮询循环抽离, 每次返回完整快照 (不只 status)
@@ -577,7 +610,7 @@ class EventStreamListener:
 
     用法:
       listener = EventStreamListener(backend, zcode_sid)
-      sub_result = listener.subscribe()      # 订阅, 返回 result dict (或 None 降级)
+      sub_result = listener.subscribe(msg_id)  # 订阅 (msg_id 为请求 id), 返回 result dict (或 None 降级)
       if sub_result is not None:
           backend.register_event_listener(zcode_sid, listener)
           # ... 主循环里 listener.poll_event() 取事件 ...
@@ -608,9 +641,12 @@ class EventStreamListener:
             "afterSeq": 0,
         }, timeout=10)
         if "error" in resp:
-            # v16 模式下 subscribe 失败由调用方直接报错 (无轮询降级); 仅旧协议降级
-            demote = "" if getattr(self.backend, "protocol_mode", "legacy") == "v16" \
-                else " (降级轮询)"
+            # subscribe 失败: 实锤 v16 由调用方直接报错 (无轮询降级); 旧协议降级。
+            # 例外 (P1-3): 探测超时兜底判的 v16 (protocol_confirmed=False) 会被
+            # 调用方回退 legacy 并降级轮询, 日志同样提示降级。
+            hard_v16 = getattr(self.backend, "protocol_mode", "legacy") == "v16" \
+                and getattr(self.backend, "protocol_confirmed", True)
+            demote = "" if hard_v16 else " (降级轮询)"
             log(f"  session/subscribe 失败{demote}: {resp['error'].get('message', '')}")
             return None
         result = resp.get("result", {})
@@ -1069,11 +1105,13 @@ class ACPBridge:
 
         不分协议模式: ≤0.15 上这些方法存在, 根本不会返 -32601; 任何版本返了
         -32601 就说明该版本已移除它, 直接给出版本不支持文案。
+        文案不硬编码版本号 (zcode review P3-3): 「哪个版本移除」是历史事实,
+        对调用方重要的是「当前版本不支持」; 硬编码 0.16 在未来版本再删方法时会误导。
         """
         if (zcode_method in self._REMOVED_IN_016
                 and resp.get("error", {}).get("code") == -32601):
             return self._error(msg_id, -32601,
-                               f"ZCode 0.16 已移除该能力 ({zcode_method}); "
+                               f"当前 ZCode 版本已移除该能力 ({zcode_method}); "
                                f"该 ZCode 版本不支持此能力")
         return None
 
@@ -2126,6 +2164,14 @@ class ACPBridge:
         turn = {"zcode_sid": zcode_sid, "cancelled": False}
         self.pending_turns[msg_id] = turn
 
+        # zcode review P1-1 防御: 新 turn 入口清该 session 的 state.updated 状态投影,
+        # 防跨 turn 陈旧值误导 _run_event_turn 停滞检查 (核实结论: 该竞态在 0.16.1
+        # 不可达, 此处为零成本防御, 详见 ZCodeBackend.reset_projection docstring)。
+        # getattr 兜底: 测试桩 (FakeBackend) 无此方法。
+        _reset_proj = getattr(self.backend, "reset_projection", None)
+        if callable(_reset_proj):
+            _reset_proj(zcode_sid)
+
         # 建立 baseline: send 前先记录已有消息 id, 让 differ 只产出本轮新增 (修复 P1.1)
         # differ 跨 turn 持久化 (按 session 存), 避免多轮/resume 误发历史
         differ = self._get_or_create_differ(zcode_sid)
@@ -2184,12 +2230,20 @@ class ACPBridge:
                     _unreg(zcode_sid)
             return result
         else:
-            # 0.16+ 新协议模式: 轮询降级为旧协议专用, subscribe 失败直接报错
-            if self._backend_v16():
+            # 0.16+ 新协议模式 (实锤判定): 轮询降级为旧协议专用, subscribe 失败直接报错
+            if self._backend_v16() and getattr(self.backend, "protocol_confirmed", True):
                 del self.pending_turns[msg_id]
                 return self._error(msg_id, -32603,
                                    "zcode session/subscribe 失败 (0.16+ 必须走事件订阅; "
                                    "轮询降级仅限旧协议模式)")
+            # zcode review P1-3 修复: "v16" 若只是探测超时兜底判定 (protocol_confirmed
+            # =False, 无实锤), subscribe 失败本身就是旧协议的实锤 (真 0.16 server 的
+            # subscribe 不会失败) → 推翻探测结果, 回退 legacy 走原有轮询降级
+            # (与 _detect_protocol docstring「新协议代码路径对 0.15 亦兼容」对齐)。
+            if self._backend_v16():
+                self.backend.protocol_mode = "legacy"
+                self.backend.protocol_confirmed = True
+                log("  ⚠ subscribe 失败, 推翻探测超时的 v16 兜底判定 → 回退旧协议轮询")
             # 降级: 轮询模式 — send 在轮询循环前发
             zc_id = self._next_id()
             resp, _ = self.backend.request(zc_id, "session/send",
@@ -2488,21 +2542,26 @@ class ACPBridge:
     def _on_session_cancel(self, params):
         """ACP session/cancel → session/stop (0.16 rename, 规格书 §2)。
 
-        实际路径分两种:
-        - turn 进行中: cancel 在 turn 循环的 _drain_inbox 里被拦截, 仅标记
+        实际路径分三种:
+        - turn 进行中 (常态): cancel 在 turn 循环的 _drain_inbox 里被拦截, 仅标记
           turn.cancelled; session/stop 由 turn 循环经 _cancel_backend_turn
           补发 (fire-and-forget), 不经本方法。
-        - 空闲 (无活动 turn): cancel 经主循环 handle_acp 进本方法, 立即向后端
-          发 session/stop; 无活动 turn 时后端报错忽略 (stop 幂等)。
+        - turn 进行中但 cancel 走到本方法 (竞态窗口): 同样只标记 turn.cancelled,
+          session/stop 仍交由 turn 循环补发, 本方法不直发 — 防同一次 cancel
+          双发 session/stop (zcode review P1-2; stop 虽幂等, 双发无谓)。
+        - 空闲 (无活动 turn): 立即向后端直发 session/stop; 后端报错忽略
+          (stop 幂等)。
         """
         acp_sid = params.get("sessionId")
         zcode_sid = self.session_map.get(acp_sid)
+        has_active_turn = False
         for tid, turn in self.pending_turns.items():
             if turn["zcode_sid"] == zcode_sid:
                 turn["cancelled"] = True
-                log(f"session/cancel: 标记 turn {tid} 取消")
+                has_active_turn = True
+                log(f"session/cancel: 标记 turn {tid} 取消 (stop 由 turn 循环补发)")
                 break
-        if zcode_sid:
+        if zcode_sid and not has_active_turn:
             self.ensure_backend()
             zc_id = self._next_id()
             resp, _ = self.backend.request(zc_id, "session/stop",
