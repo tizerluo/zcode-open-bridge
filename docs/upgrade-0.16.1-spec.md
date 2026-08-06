@@ -133,3 +133,19 @@
 ```
 
 凭证注入方式与桥一致：`ZCODE_MODEL` / `ZCODE_BASE_URL` / `ANTHROPIC_API_KEY` 从 `~/.zcode/v2/config.json` enabled provider 动态读出注入 env。
+
+## 勘误（Wave 2 复审实测）
+
+### §4 事件结构补记
+
+- `session/event` 的 `type` 与 `deliveryKind` 在 **params 顶层**（`{seq, eventId, timestamp, traceId, type, deliveryKind, payload:{…}}`），payload 内不含这两个字段。例外：`session.updated` 的 payload 内有 `type` 子类型字段（`model_request_started` / `model_request_completed`）。
+- 补记 `turn.failed`：无 `resultType`，载荷 `{error:{type, code, message, detail, stack}, turnPhase}`，是终止帧。
+- `process` / `resourceSample` 通知存在，桥正确丢弃（不进事件翻译层）。
+
+### §2 历史勘误
+
+- 桥在 main 上**原本就用**无 `jsonrpc` 信封 + `session/create`/`session/send`/`session/stop`（0.15 服务端兼容这套调用面）；真正的断点是 0.16 新增 `session/requestRuntimePreferences` 反向调用（旧桥无应答代码路径，永久卡住）与已删方法（`steer`/`rewind*`/`prompt/enhance*`），并非 §1/§2 字面表述的"信封与 rename 导致全断"。
+
+### §2 存活清单补记
+
+- `session/updateRuntimeModelConfig`：commander 实测 0.16.1 仍存活，但 schema 新要求 `runtimeModel.revision`（string）必填。

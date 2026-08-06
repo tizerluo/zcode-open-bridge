@@ -129,12 +129,12 @@ zcode --prompt "继续" --resume sess_xxxx
 
 > **0.16.1 协议 rename（bridge 内部适配，ACP 面不变）**：ZCode app-server 在 0.16 把核心方法改名——`session/new`→`session/create`（参数从 `cwd` 改为 `workspace`）、`session/prompt`→`session/send`、`session/cancel`→`session/stop`，同时消息信封去掉了 `jsonrpc` 字段。上表是编辑器侧看到的标准 ACP 方法名，**不变**；rename 由 bridge 内部翻译。
 
-#### 双模式自动降级
+#### 双模式（真流式 / 轮询降级）
 
-ACP bridge 支持**事件驱动**（真流式）和**轮询**（伪流式）两种模式，自动选择：
+ACP bridge 支持**事件驱动**（真流式）和**轮询**（伪流式）两种模式：
 
 - **事件驱动模式**（ZCode CLI ≥ 0.14.8）：通过 `session/subscribe` 订阅事件流，`model.streaming` 事件携带 `text_delta` 逐段推送，实现**真正的流式文本输出**。工具调用状态也实时推送（scheduled → started → progress → result）。
-- **轮询模式**（旧版 CLI 或订阅失败）：自动降级为轮询 `session/read`，turn 完成后整段发文本（伪流式）。
+- **轮询模式（仅限 legacy < 0.16）**：旧协议模式下 `session/subscribe` 不可用时，降级为轮询 `session/read`，turn 完成后整段发文本（伪流式）。**0.16+ 不再自动降级**——新协议模式下 subscribe 失败直接报错 `-32603`（"0.16+ 必须走事件订阅；轮询降级仅限旧协议模式"）。
 
 #### 扩展方法（非标准 ACP）
 
@@ -150,13 +150,15 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | `session/compact` | 压缩对话上下文 | 0.14.8 | `{sessionId}` |
 | `session/steer` ❌ | turn 进行中追加指令（**0.16 已移除**） | 0.14.8 | `{sessionId, content}` |
 | `session/setThoughtLevel` | ⭐ 设置思考强度（实测 GLM-5.2: max/high/nothink，按模型不同） | 0.15.0 | `{sessionId, thoughtLevel}` |
-| `session/updateRuntimeModelConfig` | 运行时覆盖会话模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}` |
+| `session/updateRuntimeModelConfig` | 运行时覆盖会话模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}`（0.16 起 `runtimeModel.revision` 必填） |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
 | `session/rewindCascade` ❌ | 级联回退（与 rewind 同 schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
 | `session/setModel` | 切换会话模型 | 0.14.8 | `{sessionId, modelId}` |
 | `session/setMode` | 切换会话权限模式 | 0.14.8 | `{sessionId, mode}` |
 
 > ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除。steer 语义并入 `session/send`（turn 进行中发送即 steer）；rewind 无协议替代，仅剩 slash 命令 `/rewind` 与 `rewind.triggered` 事件。0.16.1 上调用这些方法会收到 `-32601`。
+>
+> ℹ️ **0.16 schema 变更**：`session/updateRuntimeModelConfig` 在 0.16.1 仍存活（实测），但 schema 新要求 `runtimeModel.revision`（string）必填。
 
 **workspace 级**（按工作区 `{workspacePath, workspaceKey}` 定位，不依赖 sessionId）：
 
@@ -249,7 +251,7 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 | ZCode CLI 版本 | 支持情况 | ACP bridge 流式 | 扩展方法 |
 |:--------------:|:--------:|:---------------:|:--------:|
-| **0.16.1**（App 3.6.5） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（`steer`/`rewind*`/`prompt/enhance*` 已于 0.16 移除） |
+| **0.16.1**（App 3.6.5） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（`steer`/`rewind*`/`prompt/enhance*` 已于 0.16 移除；`updateRuntimeModelConfig` 存活但 `runtimeModel.revision` 必填） |
 | **0.15.0**（App 3.3.0 ~ 3.5.x） | ✅ 完整 | **真流式**（事件驱动） | ✅ 全部（含 workspace/*、setThoughtLevel、**prompt/enhance** 等） |
 | **0.15.0**（App 3.2.0 ~ 3.2.5） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（无 prompt/enhance） |
 | **0.14.8**（App 3.1.4） | ✅ 完整 | **真流式**（事件驱动） | ✅ fork/rewind/goal/compact/steer |
@@ -258,10 +260,10 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 > 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改（信封去 `jsonrpc`、核心方法 rename、删除 steer/rewind/enhance），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)。
 
-**降级行为**（自动，无需手动配置）：
-- ACP bridge 检测到 `session/subscribe` 不可用时，自动切换到轮询 `session/read`（伪流式）
+**降级行为**：
+- 轮询降级**仅限 legacy（< 0.16）协议模式**：旧版下 `session/subscribe` 不可用时自动切换到轮询 `session/read`（伪流式）。**0.16+ 不再自动降级**——新协议模式下 subscribe 失败直接报错 `-32603`（"0.16+ 必须走事件订阅；轮询降级仅限旧协议模式"）。
 - 扩展方法在旧版 ZCode 上会透传后端错误（`-32603 zcode <method> failed: ...`），不影响标准 ACP 方法（new/prompt/cancel/list/resume）。例如在 App 3.2.x 上调用 `prompt/enhance`（3.3.0 新增）会得到 `-32603`，调用方应据此做版本判断。
-- 调用 0.16 已删除的方法（`session/steer`、`session/rewind*`、`prompt/enhance*` 等）时，后端返回 `-32601 Method not found`，bridge 会映射为明确错误文案（"该 ZCode 版本不支持此能力"），而非原始透传，调用方可据此做版本判断。
+- 调用 0.16 已删除的方法（`session/steer`、`session/rewind*`、`prompt/enhance*` 等）时，后端返回 `-32601 Method not found`，bridge 会映射为明确错误文案（"ZCode 0.16 已移除该能力 (<方法名>); 该 ZCode 版本不支持此能力"），而非原始透传，调用方可据此做版本判断。
 
 ### MCP 规范兼容性说明
 
@@ -314,8 +316,14 @@ zcode-open-bridge/
 ├── skills/
 │   └── zcode-bridge-guide/  # 驱动 ZCode 的通用 skill (说明书)
 ├── tests/
+│   ├── test_app_server_methods.py
+│   ├── test_credentials.py
+│   ├── test_event_translator.py
+│   ├── test_mcp_retry_lock.py
+│   ├── test_polling_failure.py
 │   ├── test_projection_differ.py
-│   └── test_event_translator.py
+│   ├── test_prompt_enhance.py
+│   └── test_provider_error.py
 ├── LICENSE              # MIT
 └── README.md
 ```
@@ -335,8 +343,8 @@ ruff check \
   shared/ \
   tests/
 
-# 2. 测试 (纯标准库 unittest, 无需安装依赖)
-python3 tests/test_projection_differ.py
+# 2. 测试 (纯标准库 unittest, 无需安装依赖; 跑全部 8 个测试文件)
+python3 -m unittest discover -s tests -p 'test_*.py'
 
 # 3. 确认三个组件保持可执行位 (100755)
 git ls-files --stage packages/*/zcode-*

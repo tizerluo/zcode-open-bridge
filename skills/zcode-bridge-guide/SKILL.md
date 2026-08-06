@@ -1,7 +1,7 @@
 ---
 name: zcode-bridge-guide
 version: 1.3.0
-description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级 + prompt 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.16.1（App 3.6.5）。
+description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.16.1（App 3.6.5）。
 user-invocable: true
 ---
 
@@ -223,16 +223,16 @@ print("回复:", "".join(chunks))
 proc.terminate()
 ```
 
-### 真流式 vs 伪流式（双模式自动降级）
+### 真流式 vs 伪流式（双模式）
 
-ACP bridge 根据运行时检测自动选择模式：
+ACP bridge 根据运行时检测选择模式：
 
 | 模式 | 条件 | 文本到达 | 工具状态 |
 |------|------|----------|----------|
 | **事件驱动（真流式）** | CLI ≥ 0.14.8 且 subscribe 成功 | 逐段推送（2~8+ 段） | 实时（scheduled→started→result） |
-| **轮询（伪流式）** | 旧版 CLI 或 subscribe 失败 | turn 完成后整段发 | turn 完成后一次性 |
+| **轮询（伪流式）** | 仅限 legacy（< 0.16）旧协议模式 | turn 完成后整段发 | turn 完成后一次性 |
 
-**无需手动选择**——bridge 先尝试 `session/subscribe`，失败则自动降级轮询。
+**无需手动选择**——bridge 先尝试 `session/subscribe`；legacy（< 0.16）模式下失败自动降级轮询。**0.16+ 不再自动降级**：新协议模式下 subscribe 失败直接报错 `-32603`（"0.16+ 必须走事件订阅；轮询降级仅限旧协议模式"）。
 
 ### 扩展方法（非标准 ACP）
 
@@ -251,9 +251,11 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 | `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, modelId}` / `{sessionId, mode}` |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
 | `session/rewindCascade` ❌ | 级联回退（同 rewind schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
-| `session/updateRuntimeModelConfig` | 运行时覆盖模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}` |
+| `session/updateRuntimeModelConfig` | 运行时覆盖模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}`（0.16 起 `runtimeModel.revision` 必填） |
 
 > ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除（steer 并入 `session/send`——turn 进行中发送即 steer；rewind 仅剩 slash 命令 `/rewind`），0.16.1 上调用会收到 `-32601`。
+>
+> ℹ️ **0.16 schema 变更**：`session/updateRuntimeModelConfig` 在 0.16.1 仍存活（实测），但 schema 新要求 `runtimeModel.revision`（string）必填。
 
 **workspace 级扩展方法**（0.15.0+）：
 
@@ -307,7 +309,7 @@ MCP server 暴露两个标准 MCP tool，供 Claude Code / Cursor 等 MCP client
 }
 ```
 
-> ✅ `~/.zcode/cli/config.json` 的 `mcp.servers` 键位在 CLI 0.16.1 实测仍受支持。
+> ✅ `~/.zcode/cli/config.json` 的 `mcpServers` 键（即上例写法）在 CLI 0.16.1 实测仍受支持。
 
 ### 可用 tools
 
@@ -376,7 +378,7 @@ npm test     # 全量，看实际数字
 
 | ZCode CLI 版本 | 支持情况 | 差异 |
 |:--------------:|:--------:|------|
-| **0.16.1** (App 3.6.5) | ✅ 完整 | ACP bridge 真流式；session/* + workspace/* 可用（steer/rewind*/prompt/enhance* 已于 0.16 移除） |
+| **0.16.1** (App 3.6.5) | ✅ 完整 | ACP bridge 真流式；session/* + workspace/* 可用（steer/rewind*/prompt/enhance* 已于 0.16 移除；updateRuntimeModelConfig 存活但 `runtimeModel.revision` 必填） |
 | **0.15.0** (App 3.3.0 ~ 3.5.x) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel、**prompt/enhance**） |
 | **0.15.0** (App 3.2.0 ~ 3.2.5) | ✅ 完整 | 同上，但无 prompt/enhance（3.3.0 引入） |
 | **0.14.8** (App 3.1.4) | ✅ 完整 | ACP bridge 真流式；fork/rewind/goal/compact/steer 可用；workspace/* 与 setThoughtLevel 返回 -32603 |
@@ -386,9 +388,9 @@ npm test     # 全量，看实际数字
 > 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。
 
 **降级行为**：
-- ACP bridge 检测到 `session/subscribe` 不可用时，自动切换到轮询 `session/read`（伪流式）
+- 轮询降级**仅限 legacy（< 0.16）协议模式**：旧版下 `session/subscribe` 不可用时自动切换到轮询 `session/read`（伪流式）。**0.16+ 不再自动降级**——新协议模式下 subscribe 失败直接报错 `-32603`（"0.16+ 必须走事件订阅；轮询降级仅限旧协议模式"）
 - 扩展方法（fork/rewind/goal/compact/steer）在旧版 ZCode 上会透传后端错误（`-32603 zcode <method> failed: ...`），不影响标准 ACP 方法
-- 调用 0.16 已删除的方法（`session/steer`、`session/rewind*`、`prompt/enhance*`）会收到 `-32601 Method not found`，bridge 映射为明确错误文案（"该 ZCode 版本不支持此能力"）
+- 调用 0.16 已删除的方法（`session/steer`、`session/rewind*`、`prompt/enhance*`）会收到 `-32601 Method not found`，bridge 映射为明确错误文案（"ZCode 0.16 已移除该能力 (<方法名>); 该 ZCode 版本不支持此能力"）
 
 ---
 
