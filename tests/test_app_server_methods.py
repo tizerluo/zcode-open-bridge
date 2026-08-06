@@ -13,10 +13,13 @@ session/requestRuntimePreferences (§3)、subscribe 必传 deliveryKind + 新事
   C   session/new → session/create (cwd → workspace{workspacePath,workspaceKey})
   EV  事件/轮询模式选择 · 事件分支: subscribe 必传 deliveryKind → 事件模式
       (不轮询); 轮询降级分支见 test_polling_failure.py PF3
-  PM  协议模式 (legacy/v16): _detect_protocol 三分支探测 / v16 subscribe
-      门禁 / state.updated 投影合并 / reader 反向调用路由
+  PM  协议模式 (legacy/v16): _detect_protocol 三分支探测 + 实锤标志
+      protocol_confirmed (P1-3: 超时兜底未确认, subscribe 失败可推翻回退
+      轮询 — PM7) / v16 subscribe 门禁 / state.updated 投影合并 / prompt
+      入口投影重置 (P1-1 跨 turn 陈旧防御 — PM8/PM8a) / reader 反向调用路由
   S   session/prompt → session/send ({sessionId,content} → {accepted,stateRevision})
-  X   session/cancel → session/stop
+  X   session/cancel → session/stop (X1 空闲直发一次; X2 活动 turn 只置标志,
+      stop 由 turn 循环补发 — zcode review P1-2 单点化)
   R   server→client 反向调用 session/requestRuntimePreferences 应答
       (两个 scope: create=runtime-materialization, send=user-execution)
   M   存活方法回归 (规格书 §2 存活清单: setThoughtLevel/setModel/setMode/
@@ -74,10 +77,12 @@ DELIVERY_KINDS = ("desktop-continuous", "web-remote-replayable")
 # 规格书 §2: 0.16.1 已从 bundle 删除的方法 (steer/rewind 系; prompt/enhance* 见另一文件)
 DELETED_SESSION_METHODS = ("session/steer", "session/rewind", "session/rewindCascade")
 
-# 规格书 §2 存活且实测仍在 bundle 的扩展方法 (回归锚, updateRuntimeModelConfig
-# 不在存活清单内, 状态未证实, 不再纳入回归)
+# 规格书 §2 存活且实测仍在 bundle 的扩展方法 (回归锚; updateRuntimeModelConfig
+# 经 commander 0.16.1 实测确认存活 — schema 新要求 runtimeModel.revision 必填,
+# 已回归纳入, 透传用例见 M2)
 SURVIVING_EXTENSION_METHODS = [
     "session/setThoughtLevel", "session/cancelBackgroundTask",
+    "session/updateRuntimeModelConfig",
     "session/setModel", "session/setMode",
     "workspace/readState", "workspace/generateText",
     "workspace/setDefaultModel", "workspace/setDefaultMode",
@@ -362,13 +367,37 @@ class TestAppServerMethods(unittest.TestCase):
 
     # ---------- X: session/cancel → session/stop ----------
     def test_x1_cancel_routes_to_stop(self):
-        """X1: ACP session/cancel → session/stop (§2 rename; 另有 session/close)"""
+        """X1: ACP session/cancel → session/stop (§2 rename; 另有 session/close)
+
+        空闲 (无活动 turn) 路径: 直发一次 session/stop (stop 幂等, 后端报错忽略)。
+        """
         bridge, fake = self._new_bridge()
         bridge.session_map["acp_x1"] = "sess_x1"
         self._call(bridge, "session/cancel", {"sessionId": "acp_x1"})
         stop = [c for c in fake.calls if c["method"] == "session/stop"]
         self.assertEqual(len(stop), 1, "session/cancel 已重命名为 session/stop (§2)")
         self.assertEqual(stop[0]["params"].get("sessionId"), "sess_x1")
+
+    def test_x2_cancel_with_active_turn_marks_only(self):
+        """X2: 有活动 turn 时 cancel 只置标志, 不直发 session/stop (P1-2 单点化)
+
+        zcode review P1-2: session/stop 由 turn 循环经 _cancel_backend_turn
+        补发 (fire-and-forget); 本方法若同时直发, 同一次 cancel 会双发 stop
+        (stop 虽幂等, 双发无谓)。空闲直发路径见 X1。
+        """
+        bridge, fake = self._new_bridge()
+        bridge.session_map["acp_x2"] = "sess_x2"
+        bridge.pending_turns[10000001] = {"zcode_sid": "sess_x2", "cancelled": False}
+        resp = self._call(bridge, "session/cancel", {"sessionId": "acp_x2"})
+        self.assertIsNone(resp, "session/cancel 是 notification, 无响应")
+        self.assertTrue(bridge.pending_turns[10000001]["cancelled"],
+                        "活动 turn 应被标记取消 (turn 循环据此补发 stop)")
+        stop = [c for c in fake.calls if c["method"] == "session/stop"]
+        self.assertEqual(stop, [],
+                         "有活动 turn 时本方法不直发 session/stop (防同次 cancel 双发)")
+        stop_sent = [f for f in fake.sent
+                     if isinstance(f, dict) and f.get("method") == "session/stop"]
+        self.assertEqual(stop_sent, [], "也不经 send() 直发 (补发是 turn 循环的职责)")
 
     # ---------- R: server→client 反向调用应答 ----------
     def _bare_backend(self):
@@ -391,6 +420,8 @@ class TestAppServerMethods(unittest.TestCase):
         backend._enhance_result_queues = {}
         backend._enhance_lock = threading.Lock()
         backend.protocol_mode = None
+        # 探测判定实锤标志 (P1-3): None=未探测; True=实锤; False=仅超时兜底
+        backend.protocol_confirmed = None
         backend._probe_lock = threading.Lock()
         backend._protocol_error_queue = queue.Queue()
         backend._state_projections = {}
@@ -486,6 +517,8 @@ class TestAppServerMethods(unittest.TestCase):
                                                "path": ["jsonrpc"]}]}}}))
         backend._detect_protocol()
         self.assertEqual(backend.protocol_mode, "v16")
+        self.assertIs(backend.protocol_confirmed, True,
+                      "信封拒绝帧是实锤判定 → confirmed=True (P1-3)")
         probe = backend.sent_frames[0]
         self.assertEqual(probe["id"], "bridge-probe-1")
         self.assertEqual(probe["method"], "workspace/readState")
@@ -501,9 +534,16 @@ class TestAppServerMethods(unittest.TestCase):
                         "error": {"code": c, "message": "Invalid params"}}))
                 backend._detect_protocol()
                 self.assertEqual(backend.protocol_mode, "legacy")
+                self.assertIs(backend.protocol_confirmed, True,
+                              "旧协议回显是实锤判定 → confirmed=True (P1-3)")
 
-    def test_pm3_detect_timeout_defaults_v16(self):
-        """PM3: 探测超时 (无响应) → 按 v16 处理 (当前发行版默认)"""
+    def test_pm3_detect_timeout_unconfirmed_v16(self):
+        """PM3: 探测超时 (无响应) → 暂按 v16 但未确认 (confirmed=False, P1-3)
+
+        zcode review P1-3: 超时不是实锤 (可能只是 server 启动慢于 8s), 不得
+        享受 v16 门禁 — subscribe 失败时应可推翻回退 legacy 轮询 (端到端
+        回退见 PM7; 实锤 v16 门禁见 PM4)。
+        """
         backend = self._detect_backend(None)  # send 只捕获, 不应答
         # time.time 快进, 让 8s 探测窗口立即耗尽 (防套件真等 8s)
         real_time = time.time
@@ -513,8 +553,13 @@ class TestAppServerMethods(unittest.TestCase):
             backend._detect_protocol()
         finally:
             time.time = real_time
-        self.assertEqual(backend.protocol_mode, "v16")
+        self.assertEqual(backend.protocol_mode, "v16", "超时仍暂按当前发行版 v16 处理")
+        self.assertIs(backend.protocol_confirmed, False,
+                      "超时兜底无实锤 → confirmed=False (subscribe 失败可推翻)")
         self.assertEqual(len(backend.sent_frames), 1, "超时前仍发出了一次探测帧")
+        # 判定已缓存: 二次探测直接复用, 不再发帧
+        backend._detect_protocol()
+        self.assertEqual(len(backend.sent_frames), 1, "探测结果全程只探一次 (缓存复用)")
 
     def test_pm4_v16_subscribe_failure_no_polling(self):
         """PM4: v16 模式 subscribe 失败 → 直接报错, 不降级轮询 (0.16+ 必须事件订阅)"""
@@ -533,6 +578,61 @@ class TestAppServerMethods(unittest.TestCase):
                          "v16 门禁: 不得出现 session/read 轮询调用")
         self.assertFalse(any(c["method"] == "session/send" for c in fake.calls),
                          "subscribe 失败即返回, send 不应发出")
+
+    def test_pm7_unconfirmed_v16_subscribe_failure_demotes_to_polling(self):
+        """PM7: 超时兜底判的 v16 (confirmed=False) → subscribe 失败推翻判定回退轮询
+
+        zcode review P1-3 端到端: 探测超时不是实锤 (可能 ≤0.15 server 启动慢),
+        此时 subscribe 失败本身就是旧协议实锤 → 推翻 v16 兜底, 回退 legacy 走
+        原有轮询降级, 而非硬判 v16 报错把整个 server 判死 (实锤 v16 门禁见 PM4)。
+        """
+        # 先真跑一次超时探测, 拿到真实的超时兜底判定 (mode=v16, confirmed=False)
+        probe_backend = self._detect_backend(None)
+        real_time = time.time
+        clock = [real_time()]
+        try:
+            time.time = lambda: (clock.__setitem__(0, clock[0] + 10), clock[0])[1]
+            probe_backend._detect_protocol()
+        finally:
+            time.time = real_time
+        self.assertEqual(probe_backend.protocol_mode, "v16")
+        self.assertIs(probe_backend.protocol_confirmed, False)
+
+        # 同一判定喂给 bridge: subscribe 失败 → 不得硬报错, 应回退轮询降级
+        bridge, fake = self._new_bridge({
+            "session/subscribe": {"response": {"error": {
+                "code": -32602, "message": "deliveryKind required"}}},
+            "session/send": {"response": {"result": {"accepted": True,
+                                                     "stateRevision": 1}}},
+            "session/read": {"response": [
+                {"result": {"projection": {"status": "running", "totalTokenCount": 10,
+                                            "contextWindow": 1000000}}},
+                {"result": {"projection": {"status": "idle", "totalTokenCount": 20,
+                                            "contextWindow": 1000000}}},
+            ]},
+            "session/messages": {"response": {"result": {"messages": [
+                # 无 info.id: 与 PF3 同款 — 带 id 会被 prompt 前置 baseline
+                # mark_seen 标为已见, diff 不再产出, 轮询收尾误判「无输出」
+                {"info": {"role": "assistant"},
+                 "parts": [{"type": "text", "text": "降级轮询的答案"}]},
+            ], "todos": []}}},
+        })
+        fake.protocol_mode = probe_backend.protocol_mode            # "v16" (超时兜底)
+        fake.protocol_confirmed = probe_backend.protocol_confirmed  # False (未确认)
+        bridge.session_map["acp_pm7"] = "sess_pm7"
+        resp = _run_with_guard(lambda: self._call(
+            bridge, "session/prompt", {"sessionId": "acp_pm7", "prompt": "hi"}))
+        self._assert_ok(resp, "超时兜底 v16 的 subscribe 失败应回退轮询, 不得硬报错")
+        self.assertEqual(resp["result"]["stopReason"], "end_turn")
+        called = [c["method"] for c in fake.calls]
+        self.assertIn("session/send", called, "回退后轮询分支照常发 session/send")
+        self.assertIn("session/read", called, "回退后应走 session/read 轮询降级")
+        # 探测判定被推翻: 回退 legacy 且转为已确认 (subscribe 失败即旧协议实锤)
+        self.assertEqual(fake.protocol_mode, "legacy",
+                         "subscribe 失败应推翻超时兜底的 v16 判定")
+        self.assertIs(fake.protocol_confirmed, True,
+                      "推翻后回退 legacy 转为实锤确认")
+
 
     def test_pm5_state_updated_projection_merge(self):
         """PM5: state.updated 的 patch 合并进状态投影 (供事件流停滞检查)"""
@@ -554,6 +654,100 @@ class TestAppServerMethods(unittest.TestCase):
         backend._merge_state_patch({"sessionId": "sess_pm5", "patch": "not-a-dict"})
         backend._merge_state_patch({"patch": {"status": "running"}})  # 无 sessionId
         self.assertEqual(backend.get_projection("sess_pm5")["status"], "idle")
+
+    def test_pm8a_reset_projection_clears_stale(self):
+        """PM8a: reset_projection 清空会话投影 (prompt 入口重置语义; zcode review P1-1)
+
+        核实背景: 0.16.1 turn 期间 state.updated 实测只有 {status:running}
+        (prompt_started) 与 {mode,model,...} (prompt_completed) 两种 patch,
+        从不发 status:idle (Wave 2 reviewer-1) — 跨 turn 残留最多卡在 running,
+        陈旧 idle 短路停滞检查的竞态在 0.16.1 不可达。reset 是零成本防御:
+        未来版本若补发 idle patch, 也读不到上一 turn 的旧值。PM5 合并语义不变。
+        """
+        backend = self._bare_backend()
+        backend._merge_state_patch({"sessionId": "sess_pm8a", "revision": 7,
+                                    "patch": {"status": "idle", "mode": "build"}})
+        self.assertEqual(backend.get_projection("sess_pm8a"),
+                         {"status": "idle", "mode": "build"})
+        backend.reset_projection("sess_pm8a")
+        self.assertIsNone(backend.get_projection("sess_pm8a"),
+                          "重置后陈旧投影不得再被停滞检查读到")
+        # 未知 sid 重置不炸; 重置后本 turn 的新 patch 照常累积 (投影继续服务停滞检查)
+        backend.reset_projection("sess_unknown")
+        backend._merge_state_patch({"sessionId": "sess_pm8a", "revision": 8,
+                                    "patch": {"status": "running"}})
+        self.assertEqual(backend.get_projection("sess_pm8a"), {"status": "running"},
+                         "重置后本 turn 的新 patch 照常合并 (prompt_started 实测形态)")
+
+    def test_pm8_prompt_entry_resets_stale_projection(self):
+        """PM8: session/prompt 入口重置该会话状态投影 (P1-1 桥侧契约)
+
+        同一 sessionId 先形成含 status:idle 的陈旧投影; 新 turn 开始时入口
+        必须清掉它 (先于 subscribe/send), 否则 _run_event_turn 停滞检查会把
+        陈旧 idle 当成本 turn 完成的证据提前收尾。FakeBackend 默认无投影 seam
+        (getattr 兜底不调用), 本用例用带投影 seam 的桩钉住入口重置行为。
+        """
+        mod = self.mod
+
+        class _ProjFakeBackend(FakeBackend):
+            """带状态投影 seam 的 FakeBackend (对齐 ZCodeBackend.reset_projection 语义)"""
+
+            def __init__(self, script=None, projections=None):
+                super().__init__(script)
+                self._projections = dict(projections or {})
+                self.sequence = []  # [("reset", sid) | ("request", method)] 时序记录
+
+            def get_projection(self, sid):
+                proj = self._projections.get(sid)
+                return dict(proj) if proj else None
+
+            def reset_projection(self, sid):
+                self.sequence.append(("reset", sid))
+                self._projections.pop(sid, None)
+
+            def request(self, msg_id, method, params=None, timeout=30):
+                self.sequence.append(("request", method))
+                return super().request(msg_id, method, params, timeout)
+
+        fake = _ProjFakeBackend(
+            script={
+                "session/subscribe": {"response": {"result": {"subscribed": True}}},
+                "session/send": {
+                    "response": {"result": {"accepted": True, "stateRevision": 2}},
+                    "events": [
+                        _session_event("turn.started", {"turnNumber": 1, "input": "hi",
+                                                        "messageId": "msg_1"}, seq=1),
+                        _session_event("model.streaming", {"kind": "text_delta",
+                                                           "delta": "你好",
+                                                           "assistantMessageId": "am_1"}, seq=2),
+                        _session_event("turn.completed", {
+                            "response": "你好",
+                            "usage": {"inputTokens": 10, "outputTokens": 5,
+                                      "totalTokens": 15, "contextWindow": 200000}}, seq=3),
+                    ],
+                },
+            },
+            # 上一 turn 残留的陈旧投影 (含 status:idle)
+            projections={"sess_pm8": {"status": "idle", "mode": "build"}},
+        )
+        bridge = mod.ACPBridge()
+        bridge.backend = fake
+        bridge.session_map["acp_pm8"] = "sess_pm8"
+        resp = _run_with_guard(lambda: self._call(
+            bridge, "session/prompt", {"sessionId": "acp_pm8", "prompt": "hi"}))
+        self._assert_ok(resp)
+        reset_entries = [e for e in fake.sequence if e[0] == "reset"]
+        self.assertEqual(reset_entries, [("reset", "sess_pm8")],
+                         "prompt 入口应恰好重置一次该会话投影")
+        req_methods = [m for kind, m in fake.sequence if kind == "request"]
+        reset_pos = fake.sequence.index(("reset", "sess_pm8"))
+        self.assertLess(reset_pos, fake.sequence.index(("request", "session/subscribe")),
+                        "投影重置必须先于 subscribe (入口即清, 不等停滞检查)")
+        self.assertLess(reset_pos, fake.sequence.index(("request", "session/send")),
+                        "投影重置必须先于 session/send")
+        self.assertIsNone(fake.get_projection("sess_pm8"),
+                          "陈旧 idle 不得活到新 turn (停滞检查只认本 turn 新 patch)")
+        self.assertIn("session/send", req_methods)
 
     def test_pm6_reader_routes_id_and_method_to_server_request(self):
         """PM6: reader 对 id+method 双有帧路由到 _handle_server_request 并应答"""
@@ -599,6 +793,45 @@ class TestAppServerMethods(unittest.TestCase):
         resp = self._call(bridge, "session/setThoughtLevel",
                           {"sessionId": "sess_x", "thoughtLevel": "high"})
         self._assert_error_code(resp, -32603)
+
+    def test_m2_update_runtime_model_config_with_revision(self):
+        """M2: updateRuntimeModelConfig 透传含 revision 的 runtimeModel (保真)
+
+        commander 0.16.1 实测: 该方法仍存活, 但 schema 新要求
+        runtimeModel.revision (string) 必填; bridge 为透传不校验,
+        缺字段由后端报错。F7-r 残留修正: 旧注释「不在存活清单、状态未证实」
+        作废, 本用例钉住带 revision 的完整透传。
+        """
+        bridge, fake = self._new_bridge()
+        runtime_model = {
+            "revision": "rev-2026-08-06-1",
+            "generatedAt": 1754460000000,
+            "model": {"providerId": "zai", "modelId": "GLM-5.2"},
+            "provider": {"providerId": "zai", "kind": "anthropic",
+                         "baseURL": "https://api.z.ai/api/anthropic"},
+            "thoughtLevel": "high",
+        }
+        resp = self._call(bridge, "session/updateRuntimeModelConfig", {
+            "sessionId": "sess_x", "runtimeModel": runtime_model,
+            "applyModelSelection": True,
+        })
+        self._assert_ok(resp)
+        self.assertEqual(fake.calls[0]["method"], "session/updateRuntimeModelConfig")
+        p = fake.calls[0]["params"]
+        self.assertEqual(p["sessionId"], "sess_x")
+        self.assertEqual(p["runtimeModel"], runtime_model,
+                         "runtimeModel 整体原样透传 (含 revision, 不篡改不裁剪)")
+        self.assertEqual(p["runtimeModel"].get("revision"), "rev-2026-08-06-1",
+                         "0.16.1 schema 新必填的 revision 必须随透传到达后端")
+        self.assertEqual(p["applyModelSelection"], True,
+                         "可选 applyModelSelection 亦透传")
+
+    def test_m2_update_runtime_model_config_missing(self):
+        """M2a: 缺 runtimeModel → -32602 (桥本地校验; revision 缺省由后端报错)"""
+        bridge, _ = self._new_bridge()
+        resp = self._call(bridge, "session/updateRuntimeModelConfig",
+                          {"sessionId": "sess_x"})
+        self._assert_error_code(resp, -32602)
 
     def test_m3_cancel_background_task_passthrough(self):
         """M3: cancelBackgroundTask 透传 taskId"""

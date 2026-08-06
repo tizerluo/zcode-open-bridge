@@ -32,6 +32,9 @@ _translate_streaming / _translate_tool / _translate_turn_done)。
   N10 完整 turn 序列 (started → 2×text_delta → completed)
   N11 未消费 payload 类型 (rewind.triggered / 未知类型) → 无事件不炸
   N12 顶层无 type 时 payload.type 兜底判别 (旧形态兼容分支)
+  N13 usage 缺 contextWindow → size 取快照缓存兜底 (G1 遗留补测; 0.16.1
+      turn.completed.usage 只有 token 明细, 无 contextWindow 字段)
+  N13b subscribe 快照 projection.contextWindow 缓存进 listener (兜底链上半段)
 
   T1  tool.updated scheduled → ToolCallNew (tool 名 → ACP ToolKind 映射)
   T2  scheduled 去重 (同 toolCallId 不重复发 ToolCallNew)
@@ -312,6 +315,81 @@ class TestEventTranslator(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["kind"], "TextDelta")
         self.assertEqual(events[0]["text"], "兜底形态")
+
+    # ---------- N13: usage size 快照缓存兜底 (G1 遗留补测) ----------
+    def test_n13_turn_completed_usage_size_fallback_to_cache(self):
+        """N13: usage 缺 contextWindow → size 取 translator.context_window 快照缓存
+
+        G1 遗留 (reviewer-2): 0.16.1 实测 turn.completed.usage 只有 token 明细
+        (input/output/total/cache*/reasoning/web*), 无 contextWindow 字段;
+        实现用 subscribe 成功时缓存的快照 projection.contextWindow 兜底 size
+        (_translate_turn_done: usage.get("contextWindow", 0) or self.context_window),
+        此前该兜底分支无测。
+        """
+        t = self._new_translator()
+        t.context_window = 1000000  # subscribe 快照缓存 (0.16.1 实测值)
+        events = t.translate(_session_event("turn.completed", {
+            "response": "完整回复",
+            "usage": {"inputTokens": 120, "outputTokens": 80, "totalTokens": 200},
+            # 注意: 无 contextWindow 键
+        }))
+        usage_events = [e for e in events if e["kind"] == "UsageDelta"]
+        self.assertEqual(len(usage_events), 1, "used>0 仍应产出 UsageDelta")
+        self.assertEqual(usage_events[0]["used"], 200)
+        self.assertEqual(usage_events[0]["size"], 1000000,
+                         "usage 缺 contextWindow → size 应取快照缓存兜底")
+        # usage 显式带 contextWindow 时优先用 usage 值 (缓存不抢位)
+        t2 = self._new_translator()
+        t2.context_window = 1000000
+        events2 = t2.translate(_session_event("turn.completed", {
+            "response": "r", "usage": {"totalTokens": 10, "contextWindow": 200000}}))
+        ue2 = [e for e in events2 if e["kind"] == "UsageDelta"]
+        self.assertEqual(ue2[0]["size"], 200000, "usage 自带 contextWindow 优先")
+        # 无缓存 + usage 无 contextWindow → size 保持 0 (不编造), used>0 仍发
+        t3 = self._new_translator()
+        events3 = t3.translate(_session_event("turn.completed", {
+            "response": "r", "usage": {"totalTokens": 50}}))
+        ue3 = [e for e in events3 if e["kind"] == "UsageDelta"]
+        self.assertEqual(len(ue3), 1)
+        self.assertEqual(ue3[0]["size"], 0, "无缓存兜底时 size 保持 0 (不编造)")
+
+    def test_n13b_subscribe_snapshot_caches_context_window(self):
+        """N13b: subscribe 快照 projection.contextWindow → 缓存进 listener (兜底链上半段)
+
+        _run_event_turn 把 listener.context_window 交给 translator 兜底 usage size;
+        本用例钉住缓存来源: subscribe result.snapshot.projection.contextWindow。
+        """
+        mod = self.mod
+
+        class _SnapBackend:
+            """最小桩: subscribe 返回带快照 projection 的 result"""
+
+            def request(self, msg_id, method, params=None, timeout=30):
+                return {"result": {"eventSeq": 7, "snapshot": {
+                    "projection": {"status": "idle", "contextWindow": 1000000}}}}, []
+
+            def send(self, msg):
+                pass
+
+        listener = mod.EventStreamListener(_SnapBackend(), "sess_g1")
+        result = listener.subscribe(1)
+        self.assertIsNotNone(result, "subscribe 成功应返回 result dict")
+        self.assertEqual(listener.context_window, 1000000,
+                         "快照 projection.contextWindow 应缓存进 listener")
+        self.assertEqual(listener.last_seq, 7, "eventSeq 水位线照常记录")
+
+        class _NoSnapBackend:
+            """最小桩: subscribe 成功但无快照 (服务端可不附)"""
+
+            def request(self, msg_id, method, params=None, timeout=30):
+                return {"result": {"eventSeq": 3}}, []
+
+            def send(self, msg):
+                pass
+
+        l2 = mod.EventStreamListener(_NoSnapBackend(), "sess_g1b")
+        self.assertIsNotNone(l2.subscribe(2), "无快照不代表 subscribe 失败")
+        self.assertEqual(l2.context_window, 0, "无快照 → 缓存保持 0 (兜底链不编造)")
 
     # ---------- T: tool.updated (0.16.1 实测恢复覆盖) ----------
     def test_t1_tool_scheduled_new(self):
