@@ -4,11 +4,13 @@
 调研人：Kimi（Mac mini）
 仓库：<https://github.com/tizerluo/zcode-open-bridge>
 
+> **勘误导读（Wave 2 复审后补）**：§1/§2 的协议事实（信封去 `jsonrpc`、方法 rename/删除、`deliveryKind` 必填、事件模型新 payload）全部实测有效，对新接入者仍是必读；但「信封与 rename 导致桥全断」的归因不准确——桥在 main 上对内本就用这套调用面。真正断点与准确史实见文末「勘误（Wave 2 复审实测）」节；「结论先行」已按勘误修订。
+
 ## 结论先行
 
 - 桥上次适配到 **CLI 0.15.0 / App 3.3.0**；当前最新 **App 3.6.5（2026-08-03 发布）/ CLI 0.16.1**。
 - macOS（本机 `/Applications/ZCode.app`）与 Linux（contabo、GC-8G，`/opt/ZCode/app`，AppImage 解压安装）**同为 3.6.5 + CLI 0.16.1，协议面完全一致**，一份适配两平台通用。
-- **MCP server / agent-help 路径基本不受影响**（headless CLI 实测仍工作）；**ACP bridge 全断**，app-server 协议三层（信封、方法名、事件模型）全部变更，需要重写适配层。
+- **MCP server / agent-help 路径基本不受影响**（headless CLI 实测仍工作）；**ACP bridge 全断**，需要重写适配层。真正断点（见文末勘误）：0.16 新增 `session/requestRuntimePreferences` 反向调用必须应答（旧桥无应答代码路径）、事件模型调整、`steer`/`rewind*`/`prompt/enhance*` 移除。信封去 `jsonrpc` 与方法 rename 是 0.16 的真实协议变更（新接入者必读，§1/§2），但桥在 main 上对内本就用无 `jsonrpc` 信封 + `session/create`/`send`/`stop`（0.15 服务端兼容这套调用面），并非本桥全断的原因。
 
 ## 实证环境
 
@@ -30,15 +32,17 @@
 
 ## ❌ ACP bridge 全断：0.15.0 → 0.16.1 协议变更清单（全部实测）
 
-### 1. 消息信封（第一层就过不去）
+### 1. 消息信封（不再接受 `jsonrpc` 字段）
 
 - 不再接受 `{"jsonrpc":"2.0"}` 字段：发标准 JSON-RPC 直接 `-32600 invalid_union`（zod 校验，`jsonrpc` 是 unrecognized key）。
 - 新信封 = 去掉 `jsonrpc` 的 JSON-RPC：请求 `{id, method, params}`，通知 `{method, params}`，响应 `{id, result}` / `{id, error}`。
 - bridge 的 JSON-RPC 帧层要删掉 `jsonrpc` 字段。
 
+> 注：本节是 0.16 的真实协议变更（新接入者必遵），但对本桥**不是断点**——main 上的 bridge 对内本就发无 `jsonrpc` 信封（见文末勘误）。
+
 ### 2. 方法名重命名 / 删除
 
-| 旧（0.15.0，bridge 现用） | 0.16.1 状态 | 替代 |
+| 旧方法名（0.16.1 已删） | 0.16.1 状态 | 替代 |
 | --- | --- | --- |
 | `initialize` | ❌ -32601 | 无握手方法，`session/create` 直接返回 `protocol:{name:"ZCode Protocol",version:1}`（可做版本探测） |
 | `session/new` | ❌ -32601 | `session/create`，参数从 `cwd` 改为 `workspace:{workspacePath, workspaceKey}`（本地场景 `workspaceKey = workspacePath`，已从 bundle 函数证实） |
@@ -49,6 +53,8 @@
 | `prompt/enhance`（3 个） | ❌ 消失 | 无 |
 
 存活且实测仍在 bundle 的方法：`session/fork`、`session/goal`、`session/compact`、`session/setModel`、`session/setMode`、`session/setThoughtLevel`、`session/cancelBackgroundTask`、`session/list`、`session/resume`、`session/read`、`workspace/readState|generateText|setDefault*|upsertModelProvider|removeModelProvider|updateProviderRegistry`。
+
+> 注：表中「旧方法名」与 ACP 标准方法同名；本桥对内（zcode 侧）在 main 上本就用 `session/create`/`send`/`stop`（0.15 服务端兼容这套调用面），故 rename 对本桥不构成断点，但对新接入者仍是必要信息（见文末勘误）。
 
 ### 3. 新增 server→client 反向调用（旧 bridge 没有的概念）
 

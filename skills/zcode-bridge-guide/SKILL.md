@@ -296,7 +296,7 @@ MCP server 暴露两个标准 MCP tool，供 Claude Code / Cursor 等 MCP client
 
 ### 注册到 MCP client
 
-在 MCP client 的配置（如 `~/.zcode/cli/config.json` 的 `mcp.servers`）中添加：
+在 MCP client 的配置（如 `~/.zcode/cli/config.json` 的 `mcpServers`）中添加：
 
 ```json
 {
@@ -379,7 +379,9 @@ npm test     # 全量，看实际数字
 | ZCode CLI 版本 | 支持情况 | 差异 |
 |:--------------:|:--------:|------|
 | **0.16.1** (App 3.6.5) | ✅ 完整 | ACP bridge 真流式；session/* + workspace/* 可用（steer/rewind*/prompt/enhance* 已于 0.16 移除；updateRuntimeModelConfig 存活但 `runtimeModel.revision` 必填） |
-| **0.15.0** (App 3.3.0 ~ 3.5.x) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel、**prompt/enhance**） |
+| **0.15.x** (App 3.5.x) | ✅ 完整 | ACP bridge 真流式；扩展方法同 0.15.0 行（App 功能面：3.5.2 内置网页应用、PDF 预览，见规格书 changelog） |
+| **0.15.x** (App 3.4.x) | ✅ 完整 | ACP bridge 真流式；扩展方法同 0.15.0 行（App 功能面：3.4.2 定时任务 cron、Kimi K3，见规格书 changelog） |
+| **0.15.0** (App 3.3.x) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel、**prompt/enhance**） |
 | **0.15.0** (App 3.2.0 ~ 3.2.5) | ✅ 完整 | 同上，但无 prompt/enhance（3.3.0 引入） |
 | **0.14.8** (App 3.1.4) | ✅ 完整 | ACP bridge 真流式；fork/rewind/goal/compact/steer 可用；workspace/* 与 setThoughtLevel 返回 -32603 |
 | **0.14.5 ~ 0.14.7** | ✅ 兼容 | ACP bridge 自动降级伪流式；扩展方法不可用（协议未实现） |
@@ -389,8 +391,9 @@ npm test     # 全量，看实际数字
 
 **降级行为**：
 - 轮询降级**仅限 legacy（< 0.16）协议模式**：旧版下 `session/subscribe` 不可用时自动切换到轮询 `session/read`（伪流式）。**0.16+ 不再自动降级**——新协议模式下 subscribe 失败直接报错 `-32603`（"0.16+ 必须走事件订阅；轮询降级仅限旧协议模式"）
+- 轮询（legacy）路径收不到 `turn.failed` 事件（projection/messages 无失败标志），turn 失败只能靠「idle 但本轮无实质输出（text/tool/patch）」的启发式检测，可能误报（成功但无实质输出的 turn 被判失败）/漏报（失败前已吐出部分内容的 turn 被当成功）；0.16+ 事件路径无此局限（`turn.failed` 终止帧已能正确判失败）
 - 扩展方法（fork/rewind/goal/compact/steer）在旧版 ZCode 上会透传后端错误（`-32603 zcode <method> failed: ...`），不影响标准 ACP 方法
-- 调用 0.16 已删除的方法（`session/steer`、`session/rewind*`、`prompt/enhance*`）会收到 `-32601 Method not found`，bridge 映射为明确错误文案（"ZCode 0.16 已移除该能力 (<方法名>); 该 ZCode 版本不支持此能力"）
+- 调用 0.16 已删除的方法（`session/steer`、`session/rewind*`、`prompt/enhance*`）会收到 `-32601 Method not found`，bridge 映射为明确错误文案（"当前 ZCode 版本已移除该能力 (<方法名>); 该 ZCode 版本不支持此能力"）
 
 ---
 
