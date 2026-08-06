@@ -1,22 +1,29 @@
 """
-test_app_server_methods.py — app-server 新协议方法 (0.15.0+) 单测
+test_app_server_methods.py — app-server 0.16.1 新协议方法单测
 
-用 FakeBackend 替换真实 zcode 子进程, 验证 ACPBridge.handle_acp() 能把
-新协议方法 (session 级 0.15.0+ 与 workspace/* 0.15.0+) 正确路由、转换参数、
-透传复杂对象、回显错误, 并覆盖旧 handler (fork/rewind/goal 等) 此前的测试盲区。
+0.15.0 → 0.16.1 协议三层全变 (规格书 docs/upgrade-0.16.1-spec.md, 全部实测):
+信封去 jsonrpc 键 (§1)、方法重命名/删除 (§2)、新增 server→client 反向调用
+session/requestRuntimePreferences (§3)、subscribe 必传 deliveryKind + 新事件
+模型 (§4)。用 FakeBackend 替换真实 zcode 子进程, 验证 ACPBridge.handle_acp()
+的路由、参数转换与降级行为; prompt 全流程用线程限时兜底 (接口未对齐时快速
+失败, 不让套件卡在 120s 等待上)。
 
-  M0  FakeBackend 基建 (路由 + 默认响应)
-  M1  session/setThoughtLevel (参数透传 + 缺参错误 + 错误回显)
-  M2  session/updateRuntimeModelConfig (复杂嵌套对象原样透传)
-  M3  session/cancelBackgroundTask (taskId 透传)
-  M4  session/rewindCascade (target/scope 构造, 与 rewind 对比)
-  M5  session/setModel + session/setMode (0.14.8 旧方法补齐)
-  M6  workspace/_resolve_workspace 选择器 (workspace dict / workspacePath / cwd / 默认)
-  M7  workspace/readState + workspace/generateText (含 timeout 60s)
-  M8  workspace/setDefault* 三件套 (乐观锁透传)
-  M9  workspace Provider 管理 (apiKey 嵌套对象透传保真 + 日志/错误回显双脱敏)
-  M10 旧 handler 回归 (fork/rewind/goal/compact/steer 路由, 补盲区)
-  PE  prompt/enhance 同步 + cancel (3.3.0+, 透传 + 缺参 + 错误回显)
+  V   信封: ACP 侧保留 jsonrpc (ACP 协议不变), zcode 侧新信封无 jsonrpc 键
+  C   session/new → session/create (cwd → workspace{workspacePath,workspaceKey})
+  DM  双模探测事件分支: subscribe 必传 deliveryKind → 事件模式 (不轮询);
+      轮询降级分支见 test_polling_failure.py PF3
+  S   session/prompt → session/send ({sessionId,content} → {accepted,stateRevision})
+  X   session/cancel → session/stop
+  R   server→client 反向调用 session/requestRuntimePreferences 应答
+      (两个 scope: create=runtime-materialization, send=user-execution)
+  M   存活方法回归 (规格书 §2 存活清单: setThoughtLevel/setModel/setMode/
+      cancelBackgroundTask/fork/goal/compact + workspace/*)
+  D   已删方法降级: steer/rewind/rewindCascade → -32601「该版本不支持」文案
+      (prompt/enhance* 的降级见 test_prompt_enhance.py)
+  Z   未知方法仍 -32601 (bridge 自身文案, 与降级文案区分)
+
+假设 (规格书未明示, 待复审对齐): payload 判别字段为 "type"; server 反向调用的
+消息分发入口名 (_dispatch_message 等) 未冻结, R 系列按常见命名探测。
 
 运行: python3 tests/test_app_server_methods.py
 依赖: 仅 Python 标准库 + 本项目的 acp-bridge 模块
@@ -25,6 +32,8 @@ test_app_server_methods.py — app-server 新协议方法 (0.15.0+) 单测
 import contextlib
 import io
 import os
+import queue
+import threading
 import types
 import unittest
 
@@ -44,59 +53,123 @@ def _load_bridge_module():
     return mod
 
 
-class FakeBackend:
-    """替代真实 ZCodeBackend, 记录所有 request() 调用, 按预设返回响应。
+# 规格书 §3: server→client 反向调用 session/requestRuntimePreferences 的应答
+# schema (bundle zod 实证)。create (runtime-materialization) 与 send
+# (user-execution) 两个 scope 用同一份应答。
+RUNTIME_PREFS_RESULT = {
+    "nativeSearchEnhancementsEnabled": False,
+    "memoryEnabled": False,
+    "askUserQuestionAutoResolutionEnabled": False,
+}
 
-    - self.calls: 每次调用的 {"id", "method", "params", "timeout"} 列表
-    - self.next_response: 下一次 request() 返回的响应 dict (默认成功空结果)
+# 规格书 §4: session/subscribe 必填 deliveryKind 的取值枚举 (实测 desktop-continuous 可用)
+DELIVERY_KINDS = ("desktop-continuous", "web-remote-replayable")
+
+# 规格书 §2: 0.16.1 已从 bundle 删除的方法 (steer/rewind 系; prompt/enhance* 见另一文件)
+DELETED_SESSION_METHODS = ("session/steer", "session/rewind", "session/rewindCascade")
+
+# 规格书 §2 存活且实测仍在 bundle 的扩展方法 (回归锚, updateRuntimeModelConfig
+# 不在存活清单内, 状态未证实, 不再纳入回归)
+SURVIVING_EXTENSION_METHODS = [
+    "session/setThoughtLevel", "session/cancelBackgroundTask",
+    "session/setModel", "session/setMode",
+    "workspace/readState", "workspace/generateText",
+    "workspace/setDefaultModel", "workspace/setDefaultMode",
+    "workspace/setDefaultThoughtLevel",
+    "workspace/upsertModelProvider", "workspace/removeModelProvider",
+    "workspace/updateProviderRegistry",
+]
+
+
+def _contains_key(obj, key):
+    """递归检查嵌套 dict/list 里是否出现某个键 (信封净身用)。"""
+    if isinstance(obj, dict):
+        if key in obj:
+            return True
+        return any(_contains_key(v, key) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_contains_key(v, key) for v in obj)
+    return False
+
+
+def _session_event(payload, seq=1):
+    """构造一条 0.16.1 session/event 通知的 params (规格书 §4 信封)。"""
+    return {"seq": seq, "eventId": f"evt_{seq}", "timestamp": 1754460000000,
+            "traceId": "trace_test", "payload": payload}
+
+
+def _run_with_guard(fn, timeout=15):
+    """在线程中执行 fn 并限时取结果; 超时/异常都显式失败。
+
+    prompt 全流程用: bridge 与实现的接口未对齐时宁可快速失败, 不让套件
+    卡在 turn 等待 (旧实现最长 120s) 上。
+    """
+    box = {}
+
+    def _run():
+        try:
+            box["result"] = fn()
+        except Exception as exc:
+            box["exc"] = exc
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise AssertionError(f"调用 {timeout}s 内未完成 (实现未对齐或流程卡住)")
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("result")
+
+
+class FakeBackend:
+    """替代真实 ZCodeBackend: 按方法脚本化响应, 记录所有调用与 send 帧。
+
+    - script: {method: {"response": resp 或 [resp 序列], "events": [params, ...]}}
+      response 缺省 {"result": {"ok": True}}; events 是 request() 第二返回值
+      (turn 等待期间从 reader 收到的事件, 与旧版 seam 一致)。
+    - calls: 每次调用的 {"id", "method", "params", "timeout"} 列表
+    - sent: 经 send() 发出的帧 (bridge 应答 server 反向调用预期走这条路)
     """
 
-    def __init__(self):
+    def __init__(self, script=None):
+        self.script = script or {}
         self.calls = []
-        self.next_response = {"result": {"ok": True}}
+        self.sent = []
 
     def request(self, msg_id, method, params=None, timeout=30):
         self.calls.append({
             "id": msg_id, "method": method,
             "params": params or {}, "timeout": timeout,
         })
-        return self.next_response, []
+        entry = self.script.get(method, {})
+        resp = entry.get("response", {"result": {"ok": True}})
+        if isinstance(resp, list):  # 序列: 同一方法第 N 次调用取第 N 个 (末尾驻留)
+            seen = sum(1 for c in self.calls[:-1] if c["method"] == method)
+            resp = resp[min(seen, len(resp) - 1)]
+        return resp, entry.get("events", [])
 
     def send(self, msg):
-        # 仅用于兼容 (本次测试不覆盖 fire-and-forget 路径)
-        pass
-
-    # prompt/enhance/start 的 listener 桩 (M10 注册完整性测试会调到 start handler;
-    # 真正的异步等待逻辑测试在 test_prompt_enhance.py)。这里立即塞一条 cancelled
-    # 结果, 让 start handler 快速返回, 避免 M10 阻塞在 120s 等待上。
-    # 返回元组 (q, error) 与真实 ZCodeBackend.register_enhance_listener 签名一致。
-    def register_enhance_listener(self, request_id):
-        import queue as _q
-        q = _q.Queue()
-        q.put({"requestId": request_id, "status": "cancelled"})
-        return q, None
-
-    def unregister_enhance_listener(self, request_id):
-        pass
+        self.sent.append(msg)
 
 
 class TestAppServerMethods(unittest.TestCase):
-    """app-server 新协议方法 (0.15.0+) 的路由/参数转换/透传/错误 单测"""
+    """app-server 0.16.1 新协议的路由/参数转换/透传/降级 单测"""
 
     @classmethod
     def setUpClass(cls):
         cls.mod = _load_bridge_module()
         cls.Bridge = cls.mod.ACPBridge
 
-    def _new_bridge(self):
+    def _new_bridge(self, script=None):
         """构造一个注入了 FakeBackend 的 bridge (跳过真实子进程)。"""
         b = self.Bridge()
-        fake = FakeBackend()
+        fake = FakeBackend(script)
         b.backend = fake
         return b, fake
 
     def _call(self, bridge, method, params=None, msg_id=1):
-        """封装一次 handle_acp 调用。"""
+        """封装一次 handle_acp 调用 (ACP 侧信封, 保留 jsonrpc 键)。"""
         req = {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params or {}}
         return bridge.handle_acp(req)
 
@@ -109,15 +182,231 @@ class TestAppServerMethods(unittest.TestCase):
         self.assertEqual(resp.get("error", {}).get("code"), code,
                          f"期望错误码 {code}, 实际: {resp} ({msg})")
 
-    # ---------- M0: FakeBackend 基建 ----------
-    def test_m0_basic_routing(self):
-        """M0: 已有方法 (initialize) 正常路由, 证明 FakeBackend 注入生效"""
+    # ---------- V: 信封 ----------
+    def test_v0_acp_side_keeps_jsonrpc(self):
+        """V0: ACP 侧信封不变 (ACP 协议自身是标准 JSON-RPC), 响应仍带 jsonrpc"""
         bridge, fake = self._new_bridge()
         resp = self._call(bridge, "initialize")
         self._assert_ok(resp)
-        self.assertEqual(fake.calls, [], "initialize 不应调 backend")
+        self.assertEqual(resp.get("jsonrpc"), "2.0",
+                         "ACP 侧响应应保留 jsonrpc 键 (变的是 zcode 侧)")
+        self.assertEqual(fake.calls, [], "initialize 由 bridge 本地应答, 不调 backend")
 
-    # ---------- M1: session/setThoughtLevel ----------
+    def test_v1_new_envelope_fixtures(self):
+        """V1: 规格书 §1 实证的新信封形态 (请求/通知/响应/反向请求均无 jsonrpc 键)"""
+        frames = {
+            "request": {"id": 1, "method": "session/list", "params": {}},
+            "notification": {"method": "session/event",
+                             "params": {"seq": 1, "payload": {}}},
+            "response_ok": {"id": 1, "result": {}},
+            "response_err": {"id": 1,
+                             "error": {"code": -32601, "message": "Method not found"}},
+            "server_request": {
+                "id": "server-1", "method": "session/requestRuntimePreferences",
+                "params": {"sessionId": "sess_1", "scope": "runtime-materialization"}},
+        }
+        for name, frame in frames.items():
+            self.assertNotIn("jsonrpc", frame, f"{name} 不得带 jsonrpc 键")
+        # 形态校验: 请求 {id,method,params}; 通知 {method,params} 无 id;
+        # 响应 {id,result|error} 无 method
+        self.assertEqual(set(frames["request"]), {"id", "method", "params"})
+        self.assertNotIn("id", frames["notification"])
+        self.assertNotIn("method", frames["response_ok"])
+        self.assertNotIn("method", frames["response_err"])
+        self.assertEqual(set(frames["server_request"]), {"id", "method", "params"})
+
+    def test_v2_outbound_params_no_jsonrpc(self):
+        """V2: bridge 发往 zcode 的参数里不得混入 jsonrpc 键 (净身检查)"""
+        bridge, fake = self._new_bridge()
+        self._call(bridge, "session/new", {"cwd": "/p"})
+        self._call(bridge, "workspace/readState", {"workspacePath": "/p"})
+        for c in fake.calls:
+            self.assertFalse(_contains_key(c["params"], "jsonrpc"),
+                             f"{c['method']} 的 params 混入 jsonrpc 键: {c['params']}")
+
+    # ---------- C: session/new → session/create ----------
+    def test_c1_create_maps_cwd_to_workspace(self):
+        """C1: ACP session/new {cwd} → session/create {workspace:{path,key}}, key=path"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": {
+                "sessionId": "sess_new",
+                "protocol": {"name": "ZCode Protocol", "version": 1},
+            }}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p/work"})
+        self._assert_ok(resp)
+        create = [c for c in fake.calls if c["method"] == "session/create"]
+        self.assertEqual(len(create), 1, "应调一次 session/create (0.15.0 的 session/new 已删)")
+        ws = create[0]["params"].get("workspace")
+        self.assertEqual(ws, {"workspacePath": "/p/work", "workspaceKey": "/p/work"},
+                         "本地场景 workspaceKey = workspacePath (规格书 §2)")
+        self.assertNotIn("cwd", create[0]["params"], "0.15.0 的 cwd 参数不得再发")
+        self.assertTrue(resp["result"].get("sessionId"), "ACP 响应应带回 sessionId")
+
+    def test_c2_create_protocol_block_tolerated(self):
+        """C2: create 响应含 protocol:{name,version} 版本探测块 (§2) → 正常完成"""
+        bridge, _ = self._new_bridge({
+            "session/create": {"response": {"result": {
+                "sessionId": "sess_p",
+                "protocol": {"name": "ZCode Protocol", "version": 1},
+            }}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p"})
+        self._assert_ok(resp, "protocol 版本探测块不应让 create 失败")
+
+    def test_c3_create_mode_passthrough(self):
+        """C3: 显式 mode 透传到 session/create (实证记录: create 参数含 mode)"""
+        bridge, fake = self._new_bridge()
+        self._call(bridge, "session/new", {"cwd": "/p", "mode": "plan"})
+        create = [c for c in fake.calls if c["method"] == "session/create"]
+        self.assertEqual(len(create), 1)
+        self.assertEqual(create[0]["params"].get("mode"), "plan")
+
+    # ---------- DM: 双模探测 · 事件分支 ----------
+    def test_dm1_event_branch_subscribe_deliverykind(self):
+        """DM1: subscribe 带 deliveryKind 成功 → 事件模式 (不触发轮询); 轮询分支见 PF3"""
+        bridge, fake = self._new_bridge({
+            "session/subscribe": {"response": {"result": {"subscribed": True}}},
+            "session/send": {
+                "response": {"result": {"accepted": True, "stateRevision": 3}},
+                "events": [
+                    _session_event({"type": "turn.started", "turnNumber": 1,
+                                    "input": "hi", "messageId": "msg_1"}, seq=1),
+                    _session_event({"type": "model.streaming", "kind": "text_delta",
+                                    "delta": "你好", "assistantMessageId": "am_1"}, seq=2),
+                    _session_event({"type": "turn.completed", "response": "你好",
+                                    "usage": {"inputTokens": 10, "outputTokens": 5,
+                                              "totalTokens": 15,
+                                              "contextWindow": 200000}}, seq=3),
+                ],
+            },
+        })
+        bridge.session_map["acp_dm1"] = "sess_dm1"
+        # ACP 侧 prompt 参数名未冻结, prompt/content 两个键都带上 (实现对齐后收敛)
+        resp = _run_with_guard(lambda: self._call(
+            bridge, "session/prompt",
+            {"sessionId": "acp_dm1", "prompt": "hi", "content": "hi"}))
+        self._assert_ok(resp)
+
+        sub = [c for c in fake.calls if c["method"] == "session/subscribe"]
+        self.assertEqual(len(sub), 1, "事件分支应先调 session/subscribe")
+        self.assertEqual(sub[0]["params"].get("deliveryKind"), "desktop-continuous",
+                         f"subscribe 必传 deliveryKind (枚举 {DELIVERY_KINDS}, 规格书 §4)")
+        self.assertEqual(sub[0]["params"].get("sessionId"), "sess_dm1")
+
+        send = [c for c in fake.calls if c["method"] == "session/send"]
+        self.assertEqual(len(send), 1, "session/prompt 已重命名为 session/send (§2)")
+        self.assertEqual(send[0]["params"].get("sessionId"), "sess_dm1")
+        self.assertIn("content", send[0]["params"], "send 参数为 {sessionId, content}")
+
+        self.assertFalse(any(c["method"] == "session/read" for c in fake.calls),
+                         "事件分支不应出现 session/read 轮询调用")
+
+    # ---------- S: session/send 边界 ----------
+    def test_s1_send_not_accepted_is_error(self):
+        """S1: send 返回 accepted:false (§2 应答含 accepted/stateRevision) → 判失败
+
+        派生边界: 规格书只给出应答结构, accepted=false 的语义按"发送未被接受"
+        处理, 不得静默空等 turn (待复审对齐)。
+        """
+        bridge, fake = self._new_bridge({
+            "session/subscribe": {"response": {"result": {"subscribed": True}}},
+            "session/send": {"response": {"result": {"accepted": False,
+                                                     "stateRevision": 0}}},
+        })
+        bridge.session_map["acp_s1"] = "sess_s1"
+        resp = _run_with_guard(lambda: self._call(
+            bridge, "session/prompt",
+            {"sessionId": "acp_s1", "prompt": "hi", "content": "hi"}))
+        self.assertIn("error", resp, "accepted:false 应返回错误而非静默等待")
+        self.assertTrue(any(c["method"] == "session/send" for c in fake.calls))
+
+    # ---------- X: session/cancel → session/stop ----------
+    def test_x1_cancel_routes_to_stop(self):
+        """X1: ACP session/cancel → session/stop (§2 rename; 另有 session/close)"""
+        bridge, fake = self._new_bridge()
+        bridge.session_map["acp_x1"] = "sess_x1"
+        self._call(bridge, "session/cancel", {"sessionId": "acp_x1"})
+        stop = [c for c in fake.calls if c["method"] == "session/stop"]
+        self.assertEqual(len(stop), 1, "session/cancel 已重命名为 session/stop (§2)")
+        self.assertEqual(stop[0]["params"].get("sessionId"), "sess_x1")
+
+    # ---------- R: server→client 反向调用应答 ----------
+    def _bare_backend(self):
+        """绕过 __init__ 构造裸 ZCodeBackend (不起子进程), 注入分发所需最小状态。
+
+        属性集沿用旧测试 (PE12 时代) 已揭示的内部 seam; send 被实例级替换为
+        帧记录器, 捕获对 server 反向调用的应答。
+        """
+        mod = self.mod
+        backend = mod.ZCodeBackend.__new__(mod.ZCodeBackend)
+        backend._response_queues = {}
+        backend._resp_lock = threading.Lock()
+        backend._notification_queue = queue.Queue()
+        backend._event_listeners = {}
+        backend._listeners_lock = threading.Lock()
+        backend._reader_dead = False
+        backend._reader_stop = False
+        backend.sent_frames = []
+        backend.send = backend.sent_frames.append
+        return backend
+
+    def _feed_server_request(self, backend, msg):
+        """把一条 server→client 请求喂进 backend 的消息分发路径。
+
+        0.16.1 的反向调用应答逻辑由 coder-1 实现, 入口名未冻结; 按常见命名
+        探测, 全部缺失则显式失败 (本用例依赖实现落地)。
+        """
+        for name in ("_dispatch_message", "_handle_message", "_route_message",
+                     "_on_message", "_dispatch", "_handle_server_request"):
+            fn = getattr(backend, name, None)
+            if callable(fn):
+                return fn(msg)
+        raise AssertionError(
+            "ZCodeBackend 没有可调用的消息分发入口 (_dispatch_message/"
+            "_handle_message/_route_message/_on_message/_dispatch/"
+            "_handle_server_request), 需与实现对齐")
+
+    def _assert_runtime_prefs_answer(self, backend, server_id):
+        """断言 backend.sent_frames 里有且仅有一帧合规的 runtime-preferences 应答。"""
+        answers = [f for f in backend.sent_frames
+                   if isinstance(f, dict) and f.get("id") == server_id]
+        self.assertEqual(len(answers), 1,
+                         f"应应答一次 {server_id}, 实际 sent={backend.sent_frames}")
+        ans = answers[0]
+        self.assertNotIn("jsonrpc", ans, "应答帧不得带 jsonrpc 键 (0.16.1 新信封)")
+        self.assertNotIn("method", ans, "应答是 response 不是 request")
+        self.assertEqual(ans.get("result"), RUNTIME_PREFS_RESULT,
+                         "应答 schema 必须逐项匹配规格书 §3 (bundle zod 实证)")
+
+    def test_r1_answer_runtime_materialization(self):
+        """R1: create 触发的反向调用 (scope=runtime-materialization) → 按 schema 应答"""
+        backend = self._bare_backend()
+        self._feed_server_request(backend, {
+            "id": "server-1", "method": "session/requestRuntimePreferences",
+            "params": {"sessionId": "sess_1", "scope": "runtime-materialization"}})
+        self._assert_runtime_prefs_answer(backend, "server-1")
+
+    def test_r2_answer_user_execution(self):
+        """R2: send 触发的反向调用 (scope=user-execution) → 同一应答, id 回显"""
+        backend = self._bare_backend()
+        self._feed_server_request(backend, {
+            "id": "server-2", "method": "session/requestRuntimePreferences",
+            "params": {"sessionId": "sess_2", "scope": "user-execution"}})
+        self._assert_runtime_prefs_answer(backend, "server-2")
+
+    def test_r3_unknown_server_request_not_result_answered(self):
+        """R3: 不认识的 server 反向调用 → 不得用 result 应答 (防误答), 且不得炸"""
+        backend = self._bare_backend()
+        self._feed_server_request(backend, {
+            "id": "server-9", "method": "workspace/someFutureCall", "params": {}})
+        result_answers = [f for f in backend.sent_frames
+                          if isinstance(f, dict) and f.get("id") == "server-9"
+                          and "result" in f]
+        self.assertEqual(result_answers, [],
+                         "未知 server 请求不应用 result 应答 (可沉默或 -32601)")
+
+    # ---------- M: 存活方法回归 (规格书 §2 存活清单) ----------
     def test_m1_set_thought_level_passthrough(self):
         """M1: setThoughtLevel 透传 thoughtLevel (动态值, 不做 enum 硬校验)"""
         bridge, fake = self._new_bridge()
@@ -135,39 +424,15 @@ class TestAppServerMethods(unittest.TestCase):
         self._assert_error_code(resp, -32602)
 
     def test_m1_set_thought_level_backend_error(self):
-        """M1b: backend 返回 error → -32603"""
-        bridge, fake = self._new_bridge()
-        fake.next_response = {"error": {"message": "model has no reasoning levels"}}
+        """M1b: backend 返回 error (非 -32601) → -32603"""
+        bridge, fake = self._new_bridge({
+            "session/setThoughtLevel": {"response": {
+                "error": {"message": "model has no reasoning levels"}}},
+        })
         resp = self._call(bridge, "session/setThoughtLevel",
                           {"sessionId": "sess_x", "thoughtLevel": "high"})
         self._assert_error_code(resp, -32603)
 
-    # ---------- M2: session/updateRuntimeModelConfig ----------
-    def test_m2_update_runtime_model_config_passthrough(self):
-        """M2: 复杂嵌套 runtimeModel 原样透传不被篡改"""
-        bridge, fake = self._new_bridge()
-        runtime_model = {
-            "revision": "r1", "generatedAt": 1700000000000,
-            "model": {"providerId": "zai", "modelId": "glm-5.2", "variant": "v1"},
-            "provider": {"providerId": "zai", "kind": "openai-compatible",
-                         "providerOptions": {"baseURL": "https://x", "temperature": 0.7}},
-            "thoughtLevel": "standard",
-        }
-        resp = self._call(bridge, "session/updateRuntimeModelConfig",
-                          {"sessionId": "sess_x", "runtimeModel": runtime_model,
-                           "applyModelSelection": False})
-        self._assert_ok(resp)
-        self.assertEqual(fake.calls[0]["params"]["runtimeModel"], runtime_model,
-                         "runtimeModel 必须原样透传")
-        self.assertEqual(fake.calls[0]["params"]["applyModelSelection"], False)
-
-    def test_m2_update_runtime_model_config_missing(self):
-        """M2a: 缺 runtimeModel → -32602"""
-        bridge, _ = self._new_bridge()
-        resp = self._call(bridge, "session/updateRuntimeModelConfig", {"sessionId": "sess_x"})
-        self._assert_error_code(resp, -32602)
-
-    # ---------- M3: session/cancelBackgroundTask ----------
     def test_m3_cancel_background_task_passthrough(self):
         """M3: cancelBackgroundTask 透传 taskId"""
         bridge, fake = self._new_bridge()
@@ -183,35 +448,6 @@ class TestAppServerMethods(unittest.TestCase):
         resp = self._call(bridge, "session/cancelBackgroundTask", {"sessionId": "sess_x"})
         self._assert_error_code(resp, -32602)
 
-    # ---------- M4: session/rewindCascade ----------
-    def test_m4_rewind_cascade_default_target(self):
-        """M4: rewindCascade 默认 target = {kind: latestCheckpoint}"""
-        bridge, fake = self._new_bridge()
-        resp = self._call(bridge, "session/rewindCascade", {"sessionId": "sess_x"})
-        self._assert_ok(resp)
-        self.assertEqual(fake.calls[0]["method"], "session/rewindCascade")
-        self.assertEqual(fake.calls[0]["params"]["target"], {"kind": "latestCheckpoint"})
-
-    def test_m4_rewind_cascade_checkpoint_and_scope(self):
-        """M4a: rewindCascade 显式 checkpointId → {kind: checkpoint}, 且 scope 透传"""
-        bridge, fake = self._new_bridge()
-        resp = self._call(bridge, "session/rewindCascade",
-                          {"sessionId": "sess_x", "checkpointId": "cp1", "scope": "both"})
-        self._assert_ok(resp)
-        self.assertEqual(fake.calls[0]["params"]["target"],
-                         {"kind": "checkpoint", "checkpointId": "cp1"})
-        self.assertEqual(fake.calls[0]["params"]["scope"], "both")
-
-    def test_m4_rewind_cascade_differs_from_rewind(self):
-        """M4b: rewindCascade 与 rewind 调用不同 method 名 (确认 dispatch 不混淆)"""
-        bridge1, fake1 = self._new_bridge()
-        bridge2, fake2 = self._new_bridge()
-        self._call(bridge1, "session/rewindCascade", {"sessionId": "sess_x"})
-        self._call(bridge2, "session/rewind", {"sessionId": "sess_x"})
-        self.assertEqual(fake1.calls[0]["method"], "session/rewindCascade")
-        self.assertEqual(fake2.calls[0]["method"], "session/rewind")
-
-    # ---------- M5: session/setModel + session/setMode (补齐) ----------
     def test_m5_set_model_passthrough(self):
         """M5: setModel 透传 modelId"""
         bridge, fake = self._new_bridge()
@@ -242,7 +478,7 @@ class TestAppServerMethods(unittest.TestCase):
         resp = self._call(bridge, "session/setMode", {"sessionId": "sess_x"})
         self._assert_error_code(resp, -32602)
 
-    # ---------- M6: _resolve_workspace 选择器 ----------
+    # ---------- M6: _resolve_workspace 选择器 (与 session/create 同一构造) ----------
     def test_m6_workspace_from_dict(self):
         """M6: params["workspace"] 是合法 dict → 直接透传"""
         bridge, fake = self._new_bridge()
@@ -258,7 +494,7 @@ class TestAppServerMethods(unittest.TestCase):
                          {"workspacePath": "/p/b", "workspaceKey": "/p/b"})
 
     def test_m6_workspace_from_cwd(self):
-        """M6b: params["cwd"] → 构造选择器 (与 session/new 一致的 key)"""
+        """M6b: params["cwd"] → 构造选择器 (与 session/create 一致的 key)"""
         bridge, fake = self._new_bridge()
         self._call(bridge, "workspace/readState", {"cwd": "/p/c"})
         self.assertEqual(fake.calls[0]["params"]["workspace"],
@@ -273,7 +509,7 @@ class TestAppServerMethods(unittest.TestCase):
         self.assertEqual(ws["workspaceKey"], os.getcwd())
 
     def test_m6_workspace_dict_without_path_falls_back(self):
-        """M6d: workspace dict 但缺 workspacePath → 回退到 cwd 解析"""
+        """M6d: workspace dict 但缺 workspacePath → 回退到路径构造"""
         bridge, fake = self._new_bridge()
         self._call(bridge, "workspace/readState", {"workspace": {"foo": "bar"}})
         ws = fake.calls[0]["params"]["workspace"]
@@ -421,8 +657,6 @@ class TestAppServerMethods(unittest.TestCase):
 
     def test_m9_upsert_provider_log_no_apikey(self):
         """M9b: upsertModelProvider 的 log 不得包含 apiKey 明文 (脱敏验证)"""
-        bridge, fake = self._new_bridge()
-        # 捕获 stderr 日志 (模块级 log() 写 sys.stderr)
         captured = io.StringIO()
         provider = {
             "providerId": "custom",
@@ -430,11 +664,10 @@ class TestAppServerMethods(unittest.TestCase):
             "models": [{"modelId": "m1"}],
         }
         with contextlib.redirect_stderr(captured):
-            bridge2 = self.Bridge()
-            bridge2.backend = FakeBackend()
-            bridge2.handle_acp({"jsonrpc": "2.0", "id": 1,
-                                "method": "workspace/upsertModelProvider",
-                                "params": {"workspacePath": "/p", "provider": provider}})
+            bridge, _ = self._new_bridge()
+            bridge.handle_acp({"jsonrpc": "2.0", "id": 1,
+                               "method": "workspace/upsertModelProvider",
+                               "params": {"workspacePath": "/p", "provider": provider}})
         log_out = captured.getvalue()
         self.assertNotIn("sk-LEAK-MARKER-xyz", log_out,
                          "log 不得泄露 apiKey 明文")
@@ -484,11 +717,11 @@ class TestAppServerMethods(unittest.TestCase):
         self._assert_error_code(resp, -32602)
 
     def test_m9_upsert_provider_error_no_apikey(self):
-        """M9g: upsertModelProvider 后端 error 回显脱敏 (Codex P1: error 路径不能泄露 apiKey)"""
-        bridge, fake = self._new_bridge()
-        # 后端错误消息里夹带了入参的 inline apiKey 明文
-        fake.next_response = {"error": {"message":
-            "validation failed: apiKey invalid sk-LEAK-IN-ERR-9876 in provider custom"}}
+        """M9g: upsertModelProvider 后端 error 回显脱敏 (error 路径不能泄露 apiKey)"""
+        bridge, fake = self._new_bridge({
+            "workspace/upsertModelProvider": {"response": {"error": {"message":
+                "validation failed: apiKey invalid sk-LEAK-IN-ERR-9876 in provider custom"}}},
+        })
         resp = self._call(bridge, "workspace/upsertModelProvider",
                           {"workspacePath": "/p",
                            "provider": {"providerId": "custom",
@@ -503,9 +736,10 @@ class TestAppServerMethods(unittest.TestCase):
 
     def test_m9_update_registry_error_no_apikey(self):
         """M9h: updateProviderRegistry 后端 error 回显脱敏 (registry 含多个 provider apiKey)"""
-        bridge, fake = self._new_bridge()
-        fake.next_response = {"error": {"message":
-            'provider[1] invalid: {"value":"sk-REG-ERR-5555"} rejected'}}
+        bridge, fake = self._new_bridge({
+            "workspace/updateProviderRegistry": {"response": {"error": {"message":
+                'provider[1] invalid: {"value":"sk-REG-ERR-5555"} rejected'}}},
+        })
         resp = self._call(bridge, "workspace/updateProviderRegistry",
                           {"workspacePath": "/p",
                            "registry": {"providers": [
@@ -520,146 +754,96 @@ class TestAppServerMethods(unittest.TestCase):
 
     def test_m9_remove_provider_error_not_redacted(self):
         """M9i: removeModelProvider error 不需脱敏 (入参无 apiKey, 保留原文利于排查)"""
-        bridge, fake = self._new_bridge()
-        fake.next_response = {"error": {"message": "provider old not found"}}
+        bridge, fake = self._new_bridge({
+            "workspace/removeModelProvider": {"response": {
+                "error": {"message": "provider old not found"}}},
+        })
         resp = self._call(bridge, "workspace/removeModelProvider",
                           {"workspacePath": "/p", "providerId": "old"})
         self._assert_error_code(resp, -32603)
-        # remove 入参不含 apiKey, 后端错误原样回显 (便于排查)
         self.assertIn("not found", resp["error"]["message"])
 
-    # ---------- M10: 旧 handler 回归 (补盲区) ----------
+    # ---------- M10: 存活的旧 handler 回归 ----------
     def test_m10_fork_routes(self):
-        """M10: session/fork 仍正确路由到 session/fork"""
+        """M10: session/fork 仍正确路由 (§2 存活清单)"""
         bridge, fake = self._new_bridge()
         resp = self._call(bridge, "session/fork", {"sessionId": "sess_x"})
         self._assert_ok(resp)
         self.assertEqual(fake.calls[0]["method"], "session/fork")
 
-    def test_m10_rewind_routes(self):
-        """M10a: session/rewind 路由"""
-        bridge, fake = self._new_bridge()
-        self._call(bridge, "session/rewind", {"sessionId": "sess_x"})
-        self.assertEqual(fake.calls[0]["method"], "session/rewind")
-
     def test_m10_goal_show_routes(self):
-        """M10b: session/goal show 路由 (不触发 turn 等待)"""
+        """M10a: session/goal show 路由 (不触发 turn 等待)"""
         bridge, fake = self._new_bridge()
         self._call(bridge, "session/goal", {"sessionId": "sess_x", "action": "show"})
         self.assertEqual(fake.calls[0]["method"], "session/goal")
         self.assertEqual(fake.calls[0]["params"]["action"], "show")
 
     def test_m10_compact_routes(self):
-        """M10c: session/compact 路由"""
+        """M10b: session/compact 路由"""
         bridge, fake = self._new_bridge()
         self._call(bridge, "session/compact", {"sessionId": "sess_x"})
         self.assertEqual(fake.calls[0]["method"], "session/compact")
 
-    def test_m10_steer_routes(self):
-        """M10d: session/steer 路由 + content 透传"""
-        bridge, fake = self._new_bridge()
-        self._call(bridge, "session/steer", {"sessionId": "sess_x", "content": "hi"})
-        self.assertEqual(fake.calls[0]["method"], "session/steer")
-        self.assertEqual(fake.calls[0]["params"]["content"], "hi")
-
-    def test_m10_unknown_method_32601(self):
-        """M10e: 未知方法 → -32601 (dispatch 兜底未受新方法影响)"""
-        bridge, _ = self._new_bridge()
-        resp = self._call(bridge, "session/nonexistent", {"sessionId": "sess_x"})
-        self._assert_error_code(resp, -32601)
-
     def test_m10_dispatch_registry_complete(self):
-        """M10f: 所有 14 个新方法名都已在 dispatch 注册 (无遗漏)"""
+        """M10c: §2 存活的 12 个扩展方法都已在 dispatch 注册 (无遗漏)"""
         bridge, _ = self._new_bridge()
-        new_methods = [
-            "session/setThoughtLevel", "session/updateRuntimeModelConfig",
-            "session/cancelBackgroundTask", "session/rewindCascade",
-            "session/setModel", "session/setMode",
-            "workspace/readState", "workspace/generateText",
-            "workspace/setDefaultModel", "workspace/setDefaultMode",
-            "workspace/setDefaultThoughtLevel",
-            "workspace/upsertModelProvider", "workspace/removeModelProvider",
-            "workspace/updateProviderRegistry",
-            # App 3.3.0+ prompt/* (client 可调; result 是 server 推送, 不在此列)
-            "prompt/enhance", "prompt/enhance/start", "prompt/enhance/cancel",
-        ]
-        for m in new_methods:
+        for m in SURVIVING_EXTENSION_METHODS:
             resp = self._call(bridge, m, {"sessionId": "sess_x", "workspacePath": "/p",
                                           "thoughtLevel": "x", "modelId": "m",
                                           "model": {"modelId": "m"}, "mode": "yolo",
-                                          "taskId": "t", "provider": {"models": [{"modelId": "m"}]},
-                                          "providerId": "p", "registry": {"providers": []},
-                                          "prompt": "x", "modelRef": {"modelId": "m"},
-                                          "requestId": "r1"})
+                                          "taskId": "t",
+                                          "provider": {"models": [{"modelId": "m"}]},
+                                          "providerId": "p",
+                                          "registry": {"providers": []},
+                                          "prompt": "x", "modelRef": {"modelId": "m"}})
             # 关键: 不能是 -32601 (未注册)。各方法要么成功, 要么因缺参报 -32602,
             # 但绝不应该是 "Method not supported"
             if "error" in resp:
                 self.assertNotEqual(resp["error"]["code"], -32601,
                                     f"{m} 未注册到 dispatch (返回 -32601)")
 
-    # ---------- PE: prompt/enhance 同步 + cancel (App 3.3.0+) ----------
-    def test_pe_sync_passthrough(self):
-        """PE1: prompt/enhance 透传 workspace + prompt + 可选 sessionId/context"""
-        bridge, fake = self._new_bridge()
-        fake.next_response = {"result": {"enhanced": "更好的提示词"}}
-        resp = self._call(bridge, "prompt/enhance", {
-            "workspacePath": "/p", "prompt": "写个函数",
-            "sessionId": "sess_x", "context": [{"role": "user", "content": "hi"}],
-        })
-        self._assert_ok(resp)
-        self.assertEqual(fake.calls[0]["method"], "prompt/enhance")
-        p = fake.calls[0]["params"]
-        self.assertEqual(p["prompt"], "写个函数")
-        self.assertEqual(p["sessionId"], "sess_x")
-        self.assertEqual(p["context"], [{"role": "user", "content": "hi"}])
-        self.assertEqual(p["workspace"], {"workspacePath": "/p", "workspaceKey": "/p"})
-        self.assertEqual(resp["result"], {"enhanced": "更好的提示词"})
+    # ---------- D: 已删方法 -32601 降级 (规格书 §7) ----------
+    def test_d1_deleted_methods_friendly_32601(self):
+        """D1: steer/rewind/rewindCascade 已删 → -32601 + 「不支持此能力」文案
 
-    def test_pe_sync_missing_prompt(self):
-        """PE2: 缺 prompt → -32602"""
+        规格书 §7: 调已删除方法收到 -32601 Method not found, bridge 应映射为
+        「该 ZCode 版本不支持此能力」。短路与透传映射两条实现路径都接受,
+        只断言最终 ACP 响应。
+        """
+        for m in DELETED_SESSION_METHODS:
+            with self.subTest(method=m):
+                bridge, _ = self._new_bridge({m: {"response": {
+                    "error": {"code": -32601, "message": "Method not found"}}}})
+                resp = self._call(bridge, m,
+                                  {"sessionId": "sess_x", "content": "hi"})
+                self._assert_error_code(resp, -32601)
+                self.assertIn("不支持", resp["error"]["message"],
+                              f"{m} 的 -32601 应映射为版本不支持文案 (§7)")
+
+    def test_d2_deleted_method_not_32603(self):
+        """D2: 已删方法不得再透传为 -32603 (README 旧描述作废, §7)"""
+        for m in DELETED_SESSION_METHODS:
+            with self.subTest(method=m):
+                bridge, _ = self._new_bridge({m: {"response": {
+                    "error": {"code": -32601, "message": "Method not found"}}}})
+                resp = self._call(bridge, m, {"sessionId": "sess_x"})
+                code = resp.get("error", {}).get("code")
+                self.assertNotEqual(code, -32603,
+                                    f"{m} 的 -32601 不得被吞成 -32603")
+
+    def test_d3_deleted_method_missing_params_still_32601(self):
+        """D3: 已删方法缺参调用也报能力缺失 (-32601), 不退化成 -32602 参数错误"""
+        bridge, _ = self._new_bridge({"session/steer": {"response": {
+            "error": {"code": -32601, "message": "Method not found"}}}})
+        resp = self._call(bridge, "session/steer", {})
+        self._assert_error_code(resp, -32601)
+
+    # ---------- Z: 未知方法 ----------
+    def test_z1_unknown_method_32601(self):
+        """Z1: 真正未知的方法 → -32601 (bridge 自身文案, 与 D 系列降级文案区分)"""
         bridge, _ = self._new_bridge()
-        resp = self._call(bridge, "prompt/enhance", {"workspacePath": "/p"})
-        self._assert_error_code(resp, -32602)
-
-    def test_pe_sync_backend_error(self):
-        """PE3: 后端错误 → -32603"""
-        bridge, fake = self._new_bridge()
-        fake.next_response = {"error": {"message": "model unavailable"}}
-        resp = self._call(bridge, "prompt/enhance",
-                          {"workspacePath": "/p", "prompt": "x"})
-        self._assert_error_code(resp, -32603)
-
-    def test_pe_sync_timeout_90(self):
-        """PE4: prompt/enhance timeout=90 (模型调用, 比 generateText 的 60 宽裕)"""
-        bridge, fake = self._new_bridge()
-        self._call(bridge, "prompt/enhance",
-                   {"workspacePath": "/p", "prompt": "x"})
-        self.assertEqual(fake.calls[0]["timeout"], 90)
-
-    def test_pe_sync_context_omitted(self):
-        """PE5: 不传 sessionId/context → zc_params 不含这俩键"""
-        bridge, fake = self._new_bridge()
-        self._call(bridge, "prompt/enhance",
-                   {"workspacePath": "/p", "prompt": "x"})
-        p = fake.calls[0]["params"]
-        self.assertNotIn("sessionId", p)
-        self.assertNotIn("context", p)
-
-    def test_pe_cancel_passthrough(self):
-        """PE6: prompt/enhance/cancel 透传 requestId, 返回 cancelled"""
-        bridge, fake = self._new_bridge()
-        fake.next_response = {"result": {"requestId": "r1", "cancelled": True}}
-        resp = self._call(bridge, "prompt/enhance/cancel", {"requestId": "r1"})
-        self._assert_ok(resp)
-        self.assertEqual(fake.calls[0]["method"], "prompt/enhance/cancel")
-        self.assertEqual(fake.calls[0]["params"], {"requestId": "r1"})
-        self.assertEqual(resp["result"], {"requestId": "r1", "cancelled": True})
-
-    def test_pe_cancel_missing_requestid(self):
-        """PE7: cancel 缺 requestId → -32602"""
-        bridge, _ = self._new_bridge()
-        resp = self._call(bridge, "prompt/enhance/cancel", {})
-        self._assert_error_code(resp, -32602)
+        resp = self._call(bridge, "session/nonexistent", {"sessionId": "sess_x"})
+        self._assert_error_code(resp, -32601)
 
 
 if __name__ == "__main__":
