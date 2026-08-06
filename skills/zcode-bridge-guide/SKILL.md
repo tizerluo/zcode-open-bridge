@@ -1,20 +1,21 @@
 ---
 name: zcode-bridge-guide
-version: 1.2.0
-description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级 + prompt 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.15.0+（App 3.3.0+）。
+version: 1.3.0
+description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级 + prompt 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.16.1（App 3.6.5）。
 user-invocable: true
 ---
 
 # 驱动 ZCode（三模式通用说明书）
 
 > 本 skill 是 [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) 项目的配套说明书。
-> 兼容 ZCode CLI **0.14.5 ~ 0.15.0+**（App 3.3.0+，实测含 3.2.1~3.3.0）。新版功能（事件驱动真流式、fork/rewind/goal/compact/steer、workspace/*、setThoughtLevel 思考强度控制、prompt/enhance 提示词增强）在旧版上自动降级或返回 `-32603`。
+> 兼容 ZCode CLI **0.14.5 ~ 0.16.1**（App 3.6.5，实测含 3.2.1~3.6.5）。新版功能（事件驱动真流式、fork/goal/compact、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`；`session/steer`、`session/rewind*`、`prompt/enhance*` 已于 0.16 移除，调用返回 `-32601`。
 
 ## 前置条件
 
 1. 已安装 [ZCode](https://zcode.z.ai) 桌面 App（含 CLI）
-2. 已通过 ZCode 登录（凭证存在 `~/.zcode/v2/config.json`）
-3. （可选）已 clone zcode-open-bridge 仓库
+2. Node.js ≥ 18（`zcode.cjs` 的 shebang 是 `#!/usr/bin/env node`，CLI 由 node 执行）
+3. 已通过 ZCode 登录（凭证存在 `~/.zcode/v2/config.json`）
+4. （可选）已 clone zcode-open-bridge 仓库
 
 ## 入口与认证
 
@@ -25,6 +26,9 @@ ZCode 的 CLI 藏在 App 内部，默认不在 PATH：
 ```bash
 # macOS
 ln -s /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs ~/.local/bin/zcode
+
+# Linux（AppImage 解压安装到 /opt/ZCode 时）
+ln -s /opt/ZCode/app/resources/glm/zcode.cjs ~/.local/bin/zcode
 ```
 
 ### 凭证配置（⚠️ `--prompt` 模式必读）
@@ -163,6 +167,8 @@ ZCODE_BIN=/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs \
 7. session/cancel     → 取消正在执行的 turn
 ```
 
+> 注：0.16.1 的 ZCode app-server 已把核心方法改名（`session/new`→`session/create`、`session/prompt`→`session/send`、`session/cancel`→`session/stop`）并去掉消息信封的 `jsonrpc` 字段。以上是 ACP 面标准流程，**保持不变**，rename 由 bridge 内部翻译。
+
 ### 从脚本驱动 ACP bridge（Python 示例）
 
 ```python
@@ -237,15 +243,17 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 | 方法 | 作用 | 引入版本 | params |
 |------|------|:--------:|--------|
 | `session/fork` | 从 checkpoint 分叉新会话 | 0.14.8 | `{sessionId, target?}` |
-| `session/rewind` | 回退工作区文件到 checkpoint | 0.14.8 | `{sessionId, target?, expectedRevision?}` |
+| `session/rewind` ❌ | 回退工作区文件到 checkpoint（**0.16 已移除**） | 0.14.8 | `{sessionId, target?, expectedRevision?}` |
 | `session/goal` | 读取/设置 session 目标 | 0.14.8 | `{sessionId, action: show\|set\|replace\|clear, objective?}` |
 | `session/compact` | 压缩对话上下文 | 0.14.8 | `{sessionId}` |
-| `session/steer` | turn 进行中追加指令 | 0.14.8 | `{sessionId, content}` |
+| `session/steer` ❌ | turn 进行中追加指令（**0.16 已移除**，语义并入 `session/send`） | 0.14.8 | `{sessionId, content}` |
 | `session/setThoughtLevel` | ⭐ 设置思考强度 | 0.15.0 | `{sessionId, thoughtLevel}` |
 | `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, modelId}` / `{sessionId, mode}` |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
-| `session/rewindCascade` | 级联回退（同 rewind schema） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
+| `session/rewindCascade` ❌ | 级联回退（同 rewind schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
 | `session/updateRuntimeModelConfig` | 运行时覆盖模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}` |
+
+> ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除（steer 并入 `session/send`——turn 进行中发送即 steer；rewind 仅剩 slash 命令 `/rewind`），0.16.1 上调用会收到 `-32601`。
 
 **workspace 级扩展方法**（0.15.0+）：
 
@@ -256,15 +264,15 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 | `workspace/setDefaultModel` / `setDefaultMode` / `setDefaultThoughtLevel` | 设工作区默认值（持久化） | `{workspace, model\|mode\|thoughtLevel, expectedWorkspaceRevision?}` |
 | `workspace/upsertModelProvider` / `removeModelProvider` / `updateProviderRegistry` | 管理模型供应商（含 apiKey，敏感） | `{workspace, provider\|providerId\|registry, ...}` |
 
-**prompt 级扩展方法**（App 3.3.0+，提示词增强）：
+**prompt 级扩展方法**（App 3.3.0 引入；❌ **0.16 已全部移除**，无替代）：
 
 | 方法 | 作用 | params |
 |------|------|--------|
-| `prompt/enhance` | 同步增强提示词（阻塞返回增强后文本） | `{workspace, prompt, sessionId?, context?}` |
-| `prompt/enhance/start` | 异步启动增强 job（阻塞等待结果通知） | `{workspace, prompt, requestId, sessionId?, context?}` |
-| `prompt/enhance/cancel` | 取消进行中的增强 job | `{requestId}` |
+| `prompt/enhance` ❌ | 同步增强提示词（阻塞返回增强后文本） | `{workspace, prompt, sessionId?, context?}` |
+| `prompt/enhance/start` ❌ | 异步启动增强 job（阻塞等待结果通知） | `{workspace, prompt, requestId, sessionId?, context?}` |
+| `prompt/enhance/cancel` ❌ | 取消进行中的增强 job | `{requestId}` |
 
-> 💡 `prompt/enhance` 让外部调用方复用 ZCode 内置的"提示词增强"能力（模型把简短 prompt 扩展成精确、结构化的指令）。同步版（`prompt/enhance`）直接阻塞返回 `{enhanced}`；异步版（`start`）转成阻塞语义——start 后内部等待 server 推送的 `result` 通知，期间收到的 `cancel` 会被转发给后端。`prompt/enhance/result` 本身是 server 推送通知，非 client 可调。App < 3.3.0 调用会返回 `-32603`。
+> 💡 `prompt/enhance` 让外部调用方复用 ZCode 内置的"提示词增强"能力（模型把简短 prompt 扩展成精确、结构化的指令）。同步版（`prompt/enhance`）直接阻塞返回 `{enhanced}`；异步版（`start`）转成阻塞语义——start 后内部等待 server 推送的 `result` 通知，期间收到的 `cancel` 会被转发给后端。`prompt/enhance/result` 本身是 server 推送通知，非 client 可调。App < 3.3.0 调用会返回 `-32603`；CLI ≥ 0.16 调用会返回 `-32601`（方法已删除），bridge 映射为明确错误文案。
 
 > ⚠️ `session/goal action=set` 会启动内部 AI turn（异步），耗时 10~45s。bridge 会自动等待 prompt lock 释放后返回，但调用方需预期较长延迟。
 >
@@ -298,6 +306,8 @@ MCP server 暴露两个标准 MCP tool，供 Claude Code / Cursor 等 MCP client
   }
 }
 ```
+
+> ✅ `~/.zcode/cli/config.json` 的 `mcp.servers` 键位在 CLI 0.16.1 实测仍受支持。
 
 ### 可用 tools
 
@@ -366,17 +376,19 @@ npm test     # 全量，看实际数字
 
 | ZCode CLI 版本 | 支持情况 | 差异 |
 |:--------------:|:--------:|------|
-| **0.15.0+** (App 3.3.0+) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel、**prompt/enhance**） |
+| **0.16.1** (App 3.6.5) | ✅ 完整 | ACP bridge 真流式；session/* + workspace/* 可用（steer/rewind*/prompt/enhance* 已于 0.16 移除） |
+| **0.15.0** (App 3.3.0 ~ 3.5.x) | ✅ 完整 | ACP bridge 真流式；全部扩展方法可用（含 workspace/*、setThoughtLevel、**prompt/enhance**） |
 | **0.15.0** (App 3.2.0 ~ 3.2.5) | ✅ 完整 | 同上，但无 prompt/enhance（3.3.0 引入） |
 | **0.14.8** (App 3.1.4) | ✅ 完整 | ACP bridge 真流式；fork/rewind/goal/compact/steer 可用；workspace/* 与 setThoughtLevel 返回 -32603 |
 | **0.14.5 ~ 0.14.7** | ✅ 兼容 | ACP bridge 自动降级伪流式；扩展方法不可用（协议未实现） |
 | **< 0.14.5** | ⚠️ 未测 | CLI `--prompt` 基本可用；ACP bridge 未验证 |
 
-> 注：CLI 版本自 0.15.0 起未再升，但 App 持续更新。`prompt/enhance` 是 App 3.3.0 引入的——CLI 仍是 0.15.0，仅 App 3.3.0+ 的 app-server 才支持。判断 prompt/* 可用性以 App ≥ 3.3.0 为准。
+> 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。
 
 **降级行为**：
 - ACP bridge 检测到 `session/subscribe` 不可用时，自动切换到轮询 `session/read`（伪流式）
 - 扩展方法（fork/rewind/goal/compact/steer）在旧版 ZCode 上会透传后端错误（`-32603 zcode <method> failed: ...`），不影响标准 ACP 方法
+- 调用 0.16 已删除的方法（`session/steer`、`session/rewind*`、`prompt/enhance*`）会收到 `-32601 Method not found`，bridge 映射为明确错误文案（"该 ZCode 版本不支持此能力"）
 
 ---
 

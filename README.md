@@ -38,6 +38,7 @@ ZCode 是智谱 Z.AI 出品的 AI 编程 Agent，由 GLM 系列模型驱动。�
 ### 前置条件
 
 - 已安装 [ZCode](https://zcode.z.ai)（需含 CLI，App 内自带）
+- Node.js ≥ 18（`zcode.cjs` 的 shebang 是 `#!/usr/bin/env node`，CLI 由 node 执行）
 - Python 3.8+（仅用标准库，零第三方依赖）
 - 已通过 ZCode 登录（凭证存在 `~/.zcode/v2/config.json`）
 
@@ -48,6 +49,9 @@ ZCode 的 CLI 藏在 App 内部，默认不在 PATH：
 ```bash
 # macOS
 ln -s /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs ~/.local/bin/zcode
+
+# Linux（AppImage 解压安装到 /opt/ZCode 时）
+ln -s /opt/ZCode/app/resources/glm/zcode.cjs ~/.local/bin/zcode
 ```
 
 并在 shell 配置（`~/.zshrc`）里配置凭证（动态读取，不明文存 key）：
@@ -123,6 +127,8 @@ zcode --prompt "继续" --resume sess_xxxx
 | plan（任务清单）| ⚠️ 代码就位，数据驱动 |
 | diff（文件变更）| ⚠️ 仅文件名，无 diff 内容 |
 
+> **0.16.1 协议 rename（bridge 内部适配，ACP 面不变）**：ZCode app-server 在 0.16 把核心方法改名——`session/new`→`session/create`（参数从 `cwd` 改为 `workspace`）、`session/prompt`→`session/send`、`session/cancel`→`session/stop`，同时消息信封去掉了 `jsonrpc` 字段。上表是编辑器侧看到的标准 ACP 方法名，**不变**；rename 由 bridge 内部翻译。
+
 #### 双模式自动降级
 
 ACP bridge 支持**事件驱动**（真流式）和**轮询**（伪流式）两种模式，自动选择：
@@ -139,16 +145,18 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | 扩展方法 | 作用 | 引入版本 | params |
 |----------|------|:--------:|--------|
 | `session/fork` | 从 checkpoint 分叉新会话 | 0.14.8 | `{sessionId, target?}` |
-| `session/rewind` | 回退工作区文件到 checkpoint | 0.14.8 | `{sessionId, target?, expectedRevision?}` |
+| `session/rewind` ❌ | 回退工作区文件到 checkpoint（**0.16 已移除**） | 0.14.8 | `{sessionId, target?, expectedRevision?}` |
 | `session/goal` | 读取/设置 session 目标 | 0.14.8 | `{sessionId, action: show\|set\|replace\|clear, objective?}` |
 | `session/compact` | 压缩对话上下文 | 0.14.8 | `{sessionId}` |
-| `session/steer` | turn 进行中追加指令 | 0.14.8 | `{sessionId, content}` |
+| `session/steer` ❌ | turn 进行中追加指令（**0.16 已移除**） | 0.14.8 | `{sessionId, content}` |
 | `session/setThoughtLevel` | ⭐ 设置思考强度（实测 GLM-5.2: max/high/nothink，按模型不同） | 0.15.0 | `{sessionId, thoughtLevel}` |
 | `session/updateRuntimeModelConfig` | 运行时覆盖会话模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}` |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
-| `session/rewindCascade` | 级联回退（与 rewind 同 schema） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
+| `session/rewindCascade` ❌ | 级联回退（与 rewind 同 schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
 | `session/setModel` | 切换会话模型 | 0.14.8 | `{sessionId, modelId}` |
 | `session/setMode` | 切换会话权限模式 | 0.14.8 | `{sessionId, mode}` |
+
+> ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除。steer 语义并入 `session/send`（turn 进行中发送即 steer）；rewind 无协议替代，仅剩 slash 命令 `/rewind` 与 `rewind.triggered` 事件。0.16.1 上调用这些方法会收到 `-32601`。
 
 **workspace 级**（按工作区 `{workspacePath, workspaceKey}` 定位，不依赖 sessionId）：
 
@@ -163,14 +171,16 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | `workspace/removeModelProvider` | 移除模型供应商 | `{workspace, providerId, expectedWorkspaceRevision?}` |
 | `workspace/updateProviderRegistry` | 批量更新供应商注册表 | `{workspace, registry, includeWorkspaceState?}` |
 
-**prompt 级**（提示词增强，App 3.3.0+）：
+**prompt 级**（提示词增强，App 3.3.0 引入；❌ **0.16 已全部移除**，无替代）：
 
 | 扩展方法 | 作用 | params |
 |----------|------|--------|
-| `prompt/enhance` | 同步增强提示词（阻塞返回增强后文本） | `{workspace, prompt, sessionId?, context?}` |
-| `prompt/enhance/start` | 异步启动增强 job（阻塞等待结果） | `{workspace, prompt, requestId, sessionId?, context?}` |
-| `prompt/enhance/cancel` | 取消进行中的增强 job | `{requestId}` |
+| `prompt/enhance` ❌ | 同步增强提示词（阻塞返回增强后文本） | `{workspace, prompt, sessionId?, context?}` |
+| `prompt/enhance/start` ❌ | 异步启动增强 job（阻塞等待结果） | `{workspace, prompt, requestId, sessionId?, context?}` |
+| `prompt/enhance/cancel` ❌ | 取消进行中的增强 job | `{requestId}` |
 
+> ⚠️ **0.16 已移除**：整个 `prompt/enhance*` 方法族已从 app-server 删除且无替代，以下语义说明仅适用于 0.15.0 + App ≥ 3.3.0；0.16.1 上调用会收到 `-32601`，bridge 映射为明确错误文案。
+>
 > `prompt/enhance/start` 是异步 job 模式：start 立即返回 `{requestId, accepted}`，结果由 ZCode 推送 `prompt/enhance/result` 通知。bridge 把它转成阻塞语义——start 后内部等待结果通知（总超时 120s），收到后一次性返回 `{enhanced}`（completed）/ `{status:"cancelled"}`（cancelled）或 `-32603`（failed/超时）。`prompt/enhance/result` 本身是 server 推送通知，不是 client 可调方法。
 
 > workspace 参数可三种方式传入：`workspace`（完整 dict）、`workspacePath`/`cwd`（路径字符串），或缺省时用 bridge 进程的 `cwd`。
@@ -239,17 +249,19 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 | ZCode CLI 版本 | 支持情况 | ACP bridge 流式 | 扩展方法 |
 |:--------------:|:--------:|:---------------:|:--------:|
-| **0.15.0+**（App 3.3.0+） | ✅ 完整 | **真流式**（事件驱动） | ✅ 全部（含 workspace/*、setThoughtLevel、**prompt/enhance** 等） |
+| **0.16.1**（App 3.6.5） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（`steer`/`rewind*`/`prompt/enhance*` 已于 0.16 移除） |
+| **0.15.0**（App 3.3.0 ~ 3.5.x） | ✅ 完整 | **真流式**（事件驱动） | ✅ 全部（含 workspace/*、setThoughtLevel、**prompt/enhance** 等） |
 | **0.15.0**（App 3.2.0 ~ 3.2.5） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（无 prompt/enhance） |
 | **0.14.8**（App 3.1.4） | ✅ 完整 | **真流式**（事件驱动） | ✅ fork/rewind/goal/compact/steer |
 | **0.14.5 ~ 0.14.7** | ✅ 兼容 | 伪流式（自动降级轮询） | ❌（旧版协议未实现） |
 | **< 0.14.5** | ⚠️ 未测 | — | — |
 
-> 注：CLI 版本自 0.15.0 起未再升，但 App 持续更新。`prompt/enhance` 是 App 3.3.0 引入的新协议方法——CLI 仍是 0.15.0，仅 App 3.3.0+ 的 app-server 才支持。CLI 版本号相同不代表协议面相同，判断 prompt/* 可用性以 App ≥ 3.3.0 为准。
+> 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改（信封去 `jsonrpc`、核心方法 rename、删除 steer/rewind/enhance），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)。
 
 **降级行为**（自动，无需手动配置）：
 - ACP bridge 检测到 `session/subscribe` 不可用时，自动切换到轮询 `session/read`（伪流式）
 - 扩展方法在旧版 ZCode 上会透传后端错误（`-32603 zcode <method> failed: ...`），不影响标准 ACP 方法（new/prompt/cancel/list/resume）。例如在 App 3.2.x 上调用 `prompt/enhance`（3.3.0 新增）会得到 `-32603`，调用方应据此做版本判断。
+- 调用 0.16 已删除的方法（`session/steer`、`session/rewind*`、`prompt/enhance*` 等）时，后端返回 `-32601 Method not found`，bridge 会映射为明确错误文案（"该 ZCode 版本不支持此能力"），而非原始透传，调用方可据此做版本判断。
 
 ### MCP 规范兼容性说明
 
@@ -285,7 +297,7 @@ cp -r skills/zcode-bridge-guide ~/.zcode/skills/
 3. **流式输出**：ZCode CLI ≥ 0.14.8 支持事件推送（`session/subscribe`），ACP bridge 在此版本下实现**真流式**（逐段推送）；旧版自动降级为伪流式（turn 完成后整段发）。
 4. **diff 无内容**：ZCode 协议层不暴露 oldText/newText，只能列文件名。
 5. **GLM-5.2 无推理输出**：思考过程（agent_thought_chunk）在 GLM-5.2 下不触发，需 GLM-5-Turbo。
-6. **TUI 不可用**：`zcode` 无参数直接运行（TUI 模式）在独立终端报错（缺 `@zcode/tui` 模块），仅 headless 模式可用。
+6. **TUI 不可用**：0.16.1 起 CLI 帮助虽列出 `tui` 命令（无参数即进入 TUI），但独立终端实测仍报错（`Cannot find package '@zcode/tui'`），仅 headless 模式可用。
 7. **⚠️ ACP bridge 默认 `mode=yolo`（权限风险）**：为避免工具调用 turn 卡在权限确认，ACP bridge 的 `session/new` 强制以 `mode=yolo` 创建会话（见 `zcode-acp-bridge` 的 `_on_session_new`）。这意味着任意 prompt 都可能触发**无确认的文件修改和命令执行**。作为编辑器集成时请知悉此风险；如需更安全的 `build` 模式（带权限确认），需自行修改并实现 ACP↔ZCode 的 permission 转发（本项目 P4b 未实现）。
 8. **⚠️ Provider 管理方法涉及 apiKey**：`workspace/upsertModelProvider`、`workspace/updateProviderRegistry` 的 `provider`/`registry` 参数会携带 `apiKey`（可能为 `{source:"inline", value:"sk-..."}` 明文）。ACP bridge 仅整体透传给 ZCode 后端、不读取也不在日志打印其明文；但调用方应自行确保传输通道（stdio）可信，并避免在日志中回显原始参数。
 
