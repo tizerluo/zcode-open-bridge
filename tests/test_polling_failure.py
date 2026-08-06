@@ -1,21 +1,24 @@
 """
 test_polling_failure.py — 轮询降级分支的 turn 失败检测单测 (0.16.1)
 
-0.16.1 双模探测: 事件驱动 (session/subscribe + 必传 deliveryKind) 优先,
+0.16.1 事件/轮询两模式: 事件驱动 (session/subscribe + 必传 deliveryKind) 优先,
 失败自动降级轮询 (session/read + session/messages 均在 0.16.1 存活, 规格书
-§2 存活清单)。轮询路径不感知 turn 失败: 0.16.1 实测事件 payload 里没有
-turn.failed (规格书 §4), projection/messages 同样无失败标志, 故沿用 0.15.0
+§2 存活清单; 降级仅限 ≤0.15 旧协议, v16 subscribe 门禁见
+test_app_server_methods.py PM4)。轮询路径不感知 turn 失败: turn.failed 只在
+事件通道推送 (reviewer-1 0.16.1 真机捕获, 事件分支的判定见
+test_event_translator.py F1/F2), 轮询降级路径收不到事件,
+projection/messages 又无失败标志, 故沿用 0.15.0
 的修复 (PR#2 遗留 issue #3 子项3d): turn "完成"(idle) 但无任何有效输出
 (text/tool/patch) 时判疑似失败, 返回 -32603 而非静默 end_turn。
 
 用增强 FakeBackend (按方法路由响应) + patch time.sleep 模拟 turn 流程, 不真跑
-zcode; prompt 全流程用线程限时兜底 (接口未对齐时快速失败)。
+zcode; prompt 全流程用线程限时兜底 (流程卡住时快速失败)。
 
   PF0 轮询: turn 完成(idle)有正常输出 → end_turn (原有行为不破坏)
   PF1 轮询: turn 完成(idle)但无输出 (疑似失败) → -32603
   PF2 轮询: turn 从未启动 → -32603 "未启动"
-  PF3 双模探测轮询分支: subscribe 失败 → 自动降级走 session/read 轮询
-      (事件分支见 test_app_server_methods.py DM1)
+  PF3 事件/轮询模式选择 · 轮询分支: subscribe 失败 → 自动降级走
+      session/read 轮询 (事件分支见 test_app_server_methods.py EV1)
 
 运行: python3 tests/test_polling_failure.py
 依赖: 仅 Python 标准库 + acp-bridge 模块
@@ -134,7 +137,7 @@ class TestPollingFailureDetection(unittest.TestCase):
         return b
 
     def _run_polling(self, bridge, zcode_sid="sess_test"):
-        """直接调 _run_polling_turn (跳过 prompt 前置, 接口名待实现对齐)。"""
+        """直接调 _run_polling_turn (跳过 prompt 前置; seam 已按冻结实现核对)。"""
         acp_sid = zcode_sid
         bridge.session_map[acp_sid] = zcode_sid
         msg_id = 1
@@ -182,9 +185,10 @@ class TestPollingFailureDetection(unittest.TestCase):
         self.assertIn("未启动", resp["error"]["message"])
 
     def test_pf3_subscribe_failure_falls_back_to_polling(self):
-        """PF3: 双模探测轮询分支 — subscribe 失败 → 自动降级走 session/read 轮询
+        """PF3: 事件/轮询模式选择 · 轮询分支 — subscribe 失败 → 降级 session/read 轮询
 
-        事件分支 (subscribe 带 deliveryKind 成功) 见 test_app_server_methods.py DM1。
+        事件分支 (subscribe 带 deliveryKind 成功) 见 test_app_server_methods.py EV1;
+        v16 模式下 subscribe 失败不降级 (直接报错) 见同文件 PM4。
         """
         bridge = self._new_bridge({
             # subscribe 被拒 (如旧 server 不认识 deliveryKind) → 降级轮询
@@ -195,9 +199,8 @@ class TestPollingFailureDetection(unittest.TestCase):
             "session/messages": _messages_with_text("降级轮询的答案"),
         })
         bridge.session_map["acp_pf3"] = "sess_pf3"
-        # ACP 侧 prompt 参数名未冻结, prompt/content 两个键都带上 (实现对齐后收敛)
         req = {"jsonrpc": "2.0", "id": 1, "method": "session/prompt",
-               "params": {"sessionId": "acp_pf3", "prompt": "hi", "content": "hi"}}
+               "params": {"sessionId": "acp_pf3", "prompt": "hi"}}
         resp = _run_with_guard(lambda: bridge.handle_acp(req))
         self.assertNotIn("error", resp, "降级轮询成功应正常 end_turn")
         self.assertEqual(resp["result"]["stopReason"], "end_turn")

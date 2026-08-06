@@ -9,9 +9,12 @@ session/requestRuntimePreferences (§3)、subscribe 必传 deliveryKind + 新事
 失败, 不让套件卡在 120s 等待上)。
 
   V   信封: ACP 侧保留 jsonrpc (ACP 协议不变), zcode 侧新信封无 jsonrpc 键
+      (V2 params 净身 / V3 真实 request() 帧构造断言)
   C   session/new → session/create (cwd → workspace{workspacePath,workspaceKey})
-  DM  双模探测事件分支: subscribe 必传 deliveryKind → 事件模式 (不轮询);
-      轮询降级分支见 test_polling_failure.py PF3
+  EV  事件/轮询模式选择 · 事件分支: subscribe 必传 deliveryKind → 事件模式
+      (不轮询); 轮询降级分支见 test_polling_failure.py PF3
+  PM  协议模式 (legacy/v16): _detect_protocol 三分支探测 / v16 subscribe
+      门禁 / state.updated 投影合并 / reader 反向调用路由
   S   session/prompt → session/send ({sessionId,content} → {accepted,stateRevision})
   X   session/cancel → session/stop
   R   server→client 反向调用 session/requestRuntimePreferences 应答
@@ -22,8 +25,9 @@ session/requestRuntimePreferences (§3)、subscribe 必传 deliveryKind + 新事
       (prompt/enhance* 的降级见 test_prompt_enhance.py)
   Z   未知方法仍 -32601 (bridge 自身文案, 与降级文案区分)
 
-假设 (规格书未明示, 待复审对齐): payload 判别字段为 "type"; server 反向调用的
-消息分发入口名 (_dispatch_message 等) 未冻结, R 系列按常见命名探测。
+事实注记 (reviewer-1 0.16.1 真机抓帧, 对规格书 §4 信封描述的勘误): 事件判别
+字段 type 在 params 顶层 (payload 内不含), 通知带 deliveryKind; server 反向
+调用的分发入口为 ZCodeBackend._handle_server_request (实现已冻结)。
 
 运行: python3 tests/test_app_server_methods.py
 依赖: 仅 Python 标准库 + 本项目的 acp-bridge 模块
@@ -31,9 +35,11 @@ session/requestRuntimePreferences (§3)、subscribe 必传 deliveryKind + 新事
 
 import contextlib
 import io
+import json
 import os
 import queue
 import threading
+import time
 import types
 import unittest
 
@@ -92,10 +98,15 @@ def _contains_key(obj, key):
     return False
 
 
-def _session_event(payload, seq=1):
-    """构造一条 0.16.1 session/event 通知的 params (规格书 §4 信封)。"""
-    return {"seq": seq, "eventId": f"evt_{seq}", "timestamp": 1754460000000,
-            "traceId": "trace_test", "payload": payload}
+def _session_event(etype, payload, seq=1):
+    """构造一条 0.16.1 session/event 通知的 params (reviewer-1 实测线缆形态)。
+
+    判别字段 type 在 params 顶层 (payload 内不含), 带 deliveryKind 字段
+    (对规格书 §4 信封描述的勘误)。
+    """
+    return {"type": etype, "deliveryKind": "desktop-continuous",
+            "seq": seq, "eventId": f"evt_{seq}", "timestamp": 1754460000000,
+            "traceId": "trace_test", "sessionId": "sess_test", "payload": payload}
 
 
 def _run_with_guard(fn, timeout=15):
@@ -224,6 +235,35 @@ class TestAppServerMethods(unittest.TestCase):
             self.assertFalse(_contains_key(c["params"], "jsonrpc"),
                              f"{c['method']} 的 params 混入 jsonrpc 键: {c['params']}")
 
+    def test_v3_outbound_request_frame_no_jsonrpc(self):
+        """V3: 真实 ZCodeBackend.request() 构造的帧顶层恰为 {id,method,params}
+
+        V2 只查 params 净身 (FakeBackend 整体替换 request(), 帧构造触达不到);
+        这里用裸 backend + send 捕获 (R 系列手法), 断言真实 request() 发出去
+        的帧符合 0.16.1 新信封 (规格书 §1: 顶层无 jsonrpc 键)。
+        """
+        backend = self._bare_backend()
+
+        def _send_reply(msg):
+            backend.sent_frames.append(msg)
+            # 模拟 reader: 回显响应, 让 request() 正常返回
+            with backend._resp_lock:
+                q = backend._response_queues.get(msg.get("id"))
+            if q is not None:
+                q.put({"id": msg["id"], "result": {"ok": True}})
+
+        backend.send = _send_reply
+        resp, _ = backend.request(424242, "session/list", {"workspacePath": "/p"})
+        self.assertEqual(resp.get("result"), {"ok": True}, "回显响应应原样返回")
+        self.assertEqual(len(backend.sent_frames), 1)
+        frame = backend.sent_frames[0]
+        self.assertEqual(set(frame), {"id", "method", "params"},
+                         f"出站请求帧顶层应恰为 id/method/params: {frame}")
+        self.assertNotIn("jsonrpc", frame, "0.16.1 新信封无 jsonrpc 键 (规格书 §1)")
+        self.assertEqual(frame["id"], 424242)
+        self.assertEqual(frame["method"], "session/list")
+        self.assertEqual(frame["params"], {"workspacePath": "/p"})
+
     # ---------- C: session/new → session/create ----------
     def test_c1_create_maps_cwd_to_workspace(self):
         """C1: ACP session/new {cwd} → session/create {workspace:{path,key}}, key=path"""
@@ -262,41 +302,40 @@ class TestAppServerMethods(unittest.TestCase):
         self.assertEqual(len(create), 1)
         self.assertEqual(create[0]["params"].get("mode"), "plan")
 
-    # ---------- DM: 双模探测 · 事件分支 ----------
-    def test_dm1_event_branch_subscribe_deliverykind(self):
-        """DM1: subscribe 带 deliveryKind 成功 → 事件模式 (不触发轮询); 轮询分支见 PF3"""
+    # ---------- EV: 事件/轮询模式选择 · 事件分支 ----------
+    def test_ev1_event_branch_subscribe_deliverykind(self):
+        """EV1: subscribe 带 deliveryKind 成功 → 事件模式 (不触发轮询); 轮询分支见 PF3"""
         bridge, fake = self._new_bridge({
             "session/subscribe": {"response": {"result": {"subscribed": True}}},
             "session/send": {
                 "response": {"result": {"accepted": True, "stateRevision": 3}},
                 "events": [
-                    _session_event({"type": "turn.started", "turnNumber": 1,
-                                    "input": "hi", "messageId": "msg_1"}, seq=1),
-                    _session_event({"type": "model.streaming", "kind": "text_delta",
-                                    "delta": "你好", "assistantMessageId": "am_1"}, seq=2),
-                    _session_event({"type": "turn.completed", "response": "你好",
-                                    "usage": {"inputTokens": 10, "outputTokens": 5,
-                                              "totalTokens": 15,
-                                              "contextWindow": 200000}}, seq=3),
+                    _session_event("turn.started", {"turnNumber": 1, "input": "hi",
+                                                    "messageId": "msg_1"}, seq=1),
+                    _session_event("model.streaming", {"kind": "text_delta",
+                                                       "delta": "你好",
+                                                       "assistantMessageId": "am_1"}, seq=2),
+                    _session_event("turn.completed", {
+                        "response": "你好",
+                        "usage": {"inputTokens": 10, "outputTokens": 5,
+                                  "totalTokens": 15, "contextWindow": 200000}}, seq=3),
                 ],
             },
         })
-        bridge.session_map["acp_dm1"] = "sess_dm1"
-        # ACP 侧 prompt 参数名未冻结, prompt/content 两个键都带上 (实现对齐后收敛)
+        bridge.session_map["acp_ev1"] = "sess_ev1"
         resp = _run_with_guard(lambda: self._call(
-            bridge, "session/prompt",
-            {"sessionId": "acp_dm1", "prompt": "hi", "content": "hi"}))
+            bridge, "session/prompt", {"sessionId": "acp_ev1", "prompt": "hi"}))
         self._assert_ok(resp)
 
         sub = [c for c in fake.calls if c["method"] == "session/subscribe"]
         self.assertEqual(len(sub), 1, "事件分支应先调 session/subscribe")
         self.assertEqual(sub[0]["params"].get("deliveryKind"), "desktop-continuous",
                          f"subscribe 必传 deliveryKind (枚举 {DELIVERY_KINDS}, 规格书 §4)")
-        self.assertEqual(sub[0]["params"].get("sessionId"), "sess_dm1")
+        self.assertEqual(sub[0]["params"].get("sessionId"), "sess_ev1")
 
         send = [c for c in fake.calls if c["method"] == "session/send"]
         self.assertEqual(len(send), 1, "session/prompt 已重命名为 session/send (§2)")
-        self.assertEqual(send[0]["params"].get("sessionId"), "sess_dm1")
+        self.assertEqual(send[0]["params"].get("sessionId"), "sess_ev1")
         self.assertIn("content", send[0]["params"], "send 参数为 {sessionId, content}")
 
         self.assertFalse(any(c["method"] == "session/read" for c in fake.calls),
@@ -307,7 +346,7 @@ class TestAppServerMethods(unittest.TestCase):
         """S1: send 返回 accepted:false (§2 应答含 accepted/stateRevision) → 判失败
 
         派生边界: 规格书只给出应答结构, accepted=false 的语义按"发送未被接受"
-        处理, 不得静默空等 turn (待复审对齐)。
+        处理, 不得静默空等 turn (实现已冻结此行为)。
         """
         bridge, fake = self._new_bridge({
             "session/subscribe": {"response": {"result": {"subscribed": True}}},
@@ -336,7 +375,8 @@ class TestAppServerMethods(unittest.TestCase):
         """绕过 __init__ 构造裸 ZCodeBackend (不起子进程), 注入分发所需最小状态。
 
         属性集沿用旧测试 (PE12 时代) 已揭示的内部 seam; send 被实例级替换为
-        帧记录器, 捕获对 server 反向调用的应答。
+        帧记录器, 捕获对 server 反向调用的应答。协议探测/reader 循环/状态投影
+        测试也复用本桩 (探测锁/投影锁/enhance 队列一并备齐)。
         """
         mod = self.mod
         backend = mod.ZCodeBackend.__new__(mod.ZCodeBackend)
@@ -347,25 +387,25 @@ class TestAppServerMethods(unittest.TestCase):
         backend._listeners_lock = threading.Lock()
         backend._reader_dead = False
         backend._reader_stop = False
+        # 协议探测 / reader 退出清理 / 状态投影 所需的其余内部状态
+        backend._enhance_result_queues = {}
+        backend._enhance_lock = threading.Lock()
+        backend.protocol_mode = None
+        backend._probe_lock = threading.Lock()
+        backend._protocol_error_queue = queue.Queue()
+        backend._state_projections = {}
+        backend._state_lock = threading.Lock()
         backend.sent_frames = []
         backend.send = backend.sent_frames.append
         return backend
 
     def _feed_server_request(self, backend, msg):
-        """把一条 server→client 请求喂进 backend 的消息分发路径。
+        """把一条 server→client 请求喂进 backend 的反向调用分发入口。
 
-        0.16.1 的反向调用应答逻辑由 coder-1 实现, 入口名未冻结; 按常见命名
-        探测, 全部缺失则显式失败 (本用例依赖实现落地)。
+        实现已冻结: reader 对 id+method 双有帧调 _handle_server_request
+        (reader 路由本身见 PM6), 这里直接调分发入口。
         """
-        for name in ("_dispatch_message", "_handle_message", "_route_message",
-                     "_on_message", "_dispatch", "_handle_server_request"):
-            fn = getattr(backend, name, None)
-            if callable(fn):
-                return fn(msg)
-        raise AssertionError(
-            "ZCodeBackend 没有可调用的消息分发入口 (_dispatch_message/"
-            "_handle_message/_route_message/_on_message/_dispatch/"
-            "_handle_server_request), 需与实现对齐")
+        return backend._handle_server_request(msg)
 
     def _assert_runtime_prefs_answer(self, backend, server_id):
         """断言 backend.sent_frames 里有且仅有一帧合规的 runtime-preferences 应答。"""
@@ -395,16 +435,143 @@ class TestAppServerMethods(unittest.TestCase):
             "params": {"sessionId": "sess_2", "scope": "user-execution"}})
         self._assert_runtime_prefs_answer(backend, "server-2")
 
-    def test_r3_unknown_server_request_not_result_answered(self):
-        """R3: 不认识的 server 反向调用 → 不得用 result 应答 (防误答), 且不得炸"""
+    def test_r3_unknown_server_request_32601(self):
+        """R3: 不认识的 server 反向调用 → 显式 -32601 错误应答 (不沉默, 不用 result 误答)"""
         backend = self._bare_backend()
         self._feed_server_request(backend, {
             "id": "server-9", "method": "workspace/someFutureCall", "params": {}})
-        result_answers = [f for f in backend.sent_frames
-                          if isinstance(f, dict) and f.get("id") == "server-9"
-                          and "result" in f]
-        self.assertEqual(result_answers, [],
-                         "未知 server 请求不应用 result 应答 (可沉默或 -32601)")
+        answers = [f for f in backend.sent_frames
+                   if isinstance(f, dict) and f.get("id") == "server-9"]
+        self.assertEqual(len(answers), 1,
+                         f"未知 server 请求也应显式应答一次 (防 server 空等挂起), "
+                         f"实际 sent={backend.sent_frames}")
+        ans = answers[0]
+        self.assertNotIn("result", ans, "未知 server 请求不得用 result 应答 (防误答)")
+        self.assertEqual(ans.get("error", {}).get("code"), -32601,
+                         "未知 server 请求应收 -32601 错误应答")
+        self.assertNotIn("jsonrpc", ans, "应答帧不得带 jsonrpc 键 (0.16.1 新信封)")
+
+    # ---------- PM: 协议模式 (legacy/v16) 探测 / 门禁 / 投影 / reader 路由 ----------
+    def _detect_backend(self, responder):
+        """构造探测专用的裸 ZCodeBackend: send 捕获探测帧并由 responder 模拟应答。
+
+        responder(frame, backend) 把模拟的 server 应答写进对应响应队列
+        (真实实现里这是 reader 线程的活); None 则不应答 (模拟超时)。
+        """
+        backend = self._bare_backend()
+
+        def _send(msg):
+            backend.sent_frames.append(msg)
+            if responder is not None:
+                responder(msg, backend)
+
+        backend.send = _send
+        return backend
+
+    @staticmethod
+    def _feed_response(backend, frame_id, msg):
+        """模拟 reader: 按 id 把帧写进已注册的响应队列。"""
+        with backend._resp_lock:
+            q = backend._response_queues.get(frame_id)
+        if q is not None:
+            q.put(msg)
+
+    def test_pm1_detect_v16_envelope_reject(self):
+        """PM1: 探测帧被 0.16+ zod 拒收 (-32600, id 固定占位 invalid-message) → v16"""
+        backend = self._detect_backend(
+            lambda frame, b: self._feed_response(b, "invalid-message", {
+                "id": "invalid-message",
+                "error": {"code": -32600, "message": "invalid request",
+                          "data": {"issues": [{"code": "invalid_union",
+                                               "path": ["jsonrpc"]}]}}}))
+        backend._detect_protocol()
+        self.assertEqual(backend.protocol_mode, "v16")
+        probe = backend.sent_frames[0]
+        self.assertEqual(probe["id"], "bridge-probe-1")
+        self.assertEqual(probe["method"], "workspace/readState")
+        self.assertIn("jsonrpc", probe, "探测故意用含 jsonrpc 的旧信封试探")
+
+    def test_pm2_detect_legacy_probe_echo(self):
+        """PM2: ≤0.15 理解旧信封 → 回显 probe id 的正常响应 (-32601/-32602) → legacy"""
+        for code in (-32601, -32602):
+            with self.subTest(code=code):
+                backend = self._detect_backend(
+                    lambda frame, b, c=code: self._feed_response(b, frame["id"], {
+                        "id": frame["id"],
+                        "error": {"code": c, "message": "Invalid params"}}))
+                backend._detect_protocol()
+                self.assertEqual(backend.protocol_mode, "legacy")
+
+    def test_pm3_detect_timeout_defaults_v16(self):
+        """PM3: 探测超时 (无响应) → 按 v16 处理 (当前发行版默认)"""
+        backend = self._detect_backend(None)  # send 只捕获, 不应答
+        # time.time 快进, 让 8s 探测窗口立即耗尽 (防套件真等 8s)
+        real_time = time.time
+        clock = [real_time()]
+        try:
+            time.time = lambda: (clock.__setitem__(0, clock[0] + 10), clock[0])[1]
+            backend._detect_protocol()
+        finally:
+            time.time = real_time
+        self.assertEqual(backend.protocol_mode, "v16")
+        self.assertEqual(len(backend.sent_frames), 1, "超时前仍发出了一次探测帧")
+
+    def test_pm4_v16_subscribe_failure_no_polling(self):
+        """PM4: v16 模式 subscribe 失败 → 直接报错, 不降级轮询 (0.16+ 必须事件订阅)"""
+        bridge, fake = self._new_bridge({
+            "session/subscribe": {"response": {"error": {
+                "code": -32602, "message": "deliveryKind required"}}},
+        })
+        # 真机启动时 _detect_protocol 缓存的判定; FakeBackend 无该属性按 legacy
+        fake.protocol_mode = "v16"
+        bridge.session_map["acp_pm4"] = "sess_pm4"
+        resp = _run_with_guard(lambda: self._call(
+            bridge, "session/prompt", {"sessionId": "acp_pm4", "prompt": "hi"}))
+        self.assertIn("error", resp, "v16 模式 subscribe 失败必须报错 (不允许轮询降级)")
+        self.assertIn("subscribe", resp["error"]["message"])
+        self.assertFalse(any(c["method"] == "session/read" for c in fake.calls),
+                         "v16 门禁: 不得出现 session/read 轮询调用")
+        self.assertFalse(any(c["method"] == "session/send" for c in fake.calls),
+                         "subscribe 失败即返回, send 不应发出")
+
+    def test_pm5_state_updated_projection_merge(self):
+        """PM5: state.updated 的 patch 合并进状态投影 (供事件流停滞检查)"""
+        backend = self._bare_backend()
+        # 实测形态: {patch:{status,...}, reason, revision, scope, sessionId}
+        backend._merge_state_patch({"sessionId": "sess_pm5", "reason": "turn.started",
+                                    "revision": 4, "scope": "session",
+                                    "patch": {"status": "running"}})
+        backend._merge_state_patch({"sessionId": "sess_pm5", "revision": 7,
+                                    "patch": {"status": "idle", "mode": "build"}})
+        proj = backend.get_projection("sess_pm5")
+        self.assertEqual(proj, {"status": "idle", "mode": "build"},
+                         "patch 按 update 语义合并 (后到覆盖同名字段, 其余保留)")
+        # 返回的是副本: 改副本不污染内部投影
+        proj["status"] = "hacked"
+        self.assertEqual(backend.get_projection("sess_pm5")["status"], "idle")
+        # 未知 session / 畸形 patch 不炸不污染
+        self.assertIsNone(backend.get_projection("sess_unknown"))
+        backend._merge_state_patch({"sessionId": "sess_pm5", "patch": "not-a-dict"})
+        backend._merge_state_patch({"patch": {"status": "running"}})  # 无 sessionId
+        self.assertEqual(backend.get_projection("sess_pm5")["status"], "idle")
+
+    def test_pm6_reader_routes_id_and_method_to_server_request(self):
+        """PM6: reader 对 id+method 双有帧路由到 _handle_server_request 并应答"""
+        backend = self._bare_backend()
+        frames = [
+            {"id": "server-1", "method": "session/requestRuntimePreferences",
+             "params": {"sessionId": "sess_pm6", "scope": "user-execution"}},
+            {"id": "server-2", "method": "workspace/someFutureCall", "params": {}},
+        ]
+        backend.proc = types.SimpleNamespace(stdout=io.StringIO(
+            "".join(json.dumps(f) + "\n" for f in frames)))
+        backend._reader_loop()
+        by_id = {f.get("id"): f for f in backend.sent_frames if isinstance(f, dict)}
+        self.assertEqual(by_id["server-1"].get("result"), RUNTIME_PREFS_RESULT,
+                         "已知反向调用应路由到 runtime-preferences 应答")
+        self.assertEqual(by_id["server-2"].get("error", {}).get("code"), -32601,
+                         "未知反向调用应路由到 -32601 应答 (而非进响应队列/丢弃)")
+        self.assertTrue(backend._reader_dead, "stdout EOF 后 reader 正常退出并标记 dead")
 
     # ---------- M: 存活方法回归 (规格书 §2 存活清单) ----------
     def test_m1_set_thought_level_passthrough(self):
