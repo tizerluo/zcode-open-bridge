@@ -273,7 +273,8 @@ def _find_mimosa_root():
     home = Path.home()
     for pat in (".local/share/mimosa/*",
                 ".zcode/cli/plugins/cache/*/mimosa/*"):
-        # 按版本号数值排序 (非字符串序, 防 1.10.0 < 1.9.0 误判; 狗食 review P2-1)
+        # 按版本号数值排序 (非字符串序, 防 1.10.0 < 1.9.0 误判; 狗食 review P2-1。
+        # 仅支持纯数字语义版本; 预发布版 (1.0.3-beta) 等非数字段按 0 处理)
         candidates.extend(
             str(p) for p in sorted(
                 home.glob(pat), reverse=True,
@@ -396,8 +397,14 @@ def _mimosa_quick_scan(root, scan_path):
             scan_dir = Path(m.group(1)).resolve()
             resolved_root = scan_root.resolve()
             if scan_dir == resolved_root or resolved_root in scan_dir.parents:
-                with open(scan_dir / "findings.json") as f:
-                    findings = json.load(f).get("findings", [])
+                # 复审 P1-A: findings.json 本身 resolve 后也须在根下,
+                # 防"目录合法但 findings.json 是指向外部的 symlink"绕过
+                real_file = (scan_dir / "findings.json").resolve()
+                if resolved_root in real_file.parents or real_file.parent == resolved_root:
+                    with open(real_file) as f:
+                        findings = json.load(f).get("findings", [])
+                else:
+                    log(f"⚠ findings.json 解析后越界 (疑似 symlink), 跳过回读: {real_file}")
             else:
                 log(f"⚠ scanDir 越界 (不在 {resolved_root} 下), 跳过回读: {m.group(1)}")
         except Exception as e:

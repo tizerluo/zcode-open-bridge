@@ -344,6 +344,27 @@ class TestMimosaQuickScan(_EnvGuard):
         body, findings = self._run_scan(EvilClient)
         self.assertEqual(findings, [], "越界 scanDir 不应回读任何 findings")
 
+    def test_ms2c_symlink_findings_rejected(self):
+        """MS2c: scanDir 合法但 findings.json 是指向根外的 symlink → 拒绝 (复审 P1-A/B)"""
+        import tempfile
+        scan_root = tempfile.mkdtemp(prefix="mimosa-scans-")
+        outside = tempfile.mkdtemp(prefix="mimosa-outside-")
+        for d in (scan_root, outside):
+            self.addCleanup(lambda d=d: __import__("shutil").rmtree(d, ignore_errors=True))
+        secret = os.path.join(outside, "secret.json")
+        with open(secret, "w") as f:
+            json.dump({"findings": [{"severity": "high", "title": "不该被读到"}]}, f)
+        scan_dir = os.path.join(scan_root, "project-x", "scan-1")
+        os.makedirs(scan_dir)
+        os.symlink(secret, os.path.join(scan_dir, "findings.json"))
+        os.environ["ZCODE_BRIDGE_MIMOSA_SCAN_ROOT"] = scan_root
+
+        class SymlinkClient(_StubMimosaClient):
+            response_text = f"**Mimosa**\n- scanDir: `{scan_dir}`\n- findings: 1"
+
+        body, findings = self._run_scan(SymlinkClient)
+        self.assertEqual(findings, [], "symlink 指向根外的 findings.json 不应被读")
+
     def test_ms3_compact_projection(self):
         """MS3: _compact_findings 投影保留复核所需字段"""
         findings = [{
@@ -426,7 +447,7 @@ class TestSecurityReviewTool(_EnvGuard):
 
         mod.subprocess.run = fake_run
         try:
-            result = mod.tool_zcode_security_review({"path": "/tmp"})
+            result = mod.tool_zcode_security_review({"path": proj})
         finally:
             self._restore_common(mod, saved)
         self.assertTrue(result.get("isError"))
