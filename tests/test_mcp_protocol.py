@@ -106,9 +106,10 @@ class TestMainLoopRejection(_MainLoopCase):
         self.assertEqual(responses[0]["error"]["code"], -32600)
 
     def test_mr2_unknown_method_32601(self):
-        """MR2: 未知 method → -32601 (zcode auto 探测的 legacy 回落信号, 勿改)"""
+        """MR2: 未知 method → -32601 (zcode auto 探测的 legacy 回落信号, 勿改。
+        注: server/discover 自 1.4.0 起正常应答, 不再属于'未知 method')"""
         responses = self._run_main([
-            json.dumps({"jsonrpc": "2.0", "id": 9, "method": "server/discover"}),
+            json.dumps({"jsonrpc": "2.0", "id": 9, "method": "bogus/method"}),
         ])
         self.assertEqual(responses[0]["error"]["code"], -32601)
 
@@ -165,6 +166,169 @@ class TestToolsListShape(_MainLoopCase):
         for t in self.mod.TOOLS:
             self.assertRegex(t["name"], r"^[A-Za-z0-9_\-.]{1,128}$",
                              f"{t['name']} 不符合命名规范")
+
+
+def _modern_req(method, rid=1, params=None, version="2026-07-28"):
+    """构造一条 modern 纪元请求 (带 _meta 信封)。"""
+    p = dict(params or {})
+    p["_meta"] = {
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+    return json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": p})
+
+
+class TestModernEra(_MainLoopCase):
+    """2026-07-28 新纪元 (dual-era) 行为"""
+
+    def test_de0_discover_probe(self):
+        """DE0: server/discover 探针 → supportedVersions 含 2026-07-28, 带缓存提示"""
+        responses = self._run_main([_modern_req("server/discover")])
+        result = responses[0]["result"]
+        self.assertIn("2026-07-28", result["supportedVersions"])
+        self.assertIn("2024-11-05", result["supportedVersions"])
+        self.assertEqual(result["resultType"], "complete")
+        self.assertIn("ttlMs", result)
+        self.assertEqual(result["cacheScope"], "public")
+        self.assertIn("io.modelcontextprotocol/serverInfo", result["_meta"])
+
+    def test_de1_modern_tools_list(self):
+        """DE1: modern tools/list → resultType + ttlMs/cacheScope + serverInfo 戳"""
+        responses = self._run_main([_modern_req("tools/list")])
+        result = responses[0]["result"]
+        self.assertEqual(len(result["tools"]), 4)
+        self.assertEqual(result["resultType"], "complete")
+        self.assertIn("ttlMs", result)
+        self.assertIn("cacheScope", result)
+
+    def test_de2_modern_tools_call(self):
+        """DE2: modern tools/call → 结果带 resultType 与 serverInfo 戳"""
+        responses = self._run_main([_modern_req(
+            "tools/call",
+            params={"name": "get_zcode_capabilities", "arguments": {"section": "ecosystem"}})])
+        result = responses[0]["result"]
+        self.assertEqual(result["resultType"], "complete")
+        self.assertIn("zcode-mcp-server", result["content"][0]["text"])
+        self.assertIn("io.modelcontextprotocol/serverInfo", result["_meta"])
+
+    def test_de3_envelope_less_falls_to_legacy(self):
+        """DE3: 逐请求路由 (P0-1 修复): 无信封请求永远走 legacy, 不存在
+        '会话被切到 modern 后无信封请求被 -32602 毒死'"""
+        responses = self._run_main([
+            _modern_req("tools/list", rid=1),        # modern
+            json.dumps({"jsonrpc": "2.0", "id": 2,   # 无信封 → legacy 形状
+                        "method": "tools/list", "params": {}}),
+            _modern_req("tools/list", rid=3),        # 再回 modern, 无横跳问题
+        ])
+        self.assertEqual(responses[0]["result"]["resultType"], "complete")
+        self.assertNotIn("resultType", responses[1]["result"])
+        self.assertEqual(responses[2]["result"]["resultType"], "complete")
+
+    def test_de3b_partial_envelope_32602(self):
+        """DE3b: 信装有 protocolVersion 但缺 clientCapabilities → -32602 精确文案"""
+        bad = json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/list",
+                          "params": {"_meta": {
+                              "io.modelcontextprotocol/protocolVersion": "2026-07-28"}}})
+        responses = self._run_main([bad])
+        self.assertEqual(responses[0]["error"]["code"], -32602)
+        self.assertIn("clientCapabilities", responses[0]["error"]["message"])
+
+    def test_de3c_discover_notification_no_response(self):
+        """DE3c: server/discover 作 notification (无 id) → 不应答 (P0-2)"""
+        responses = self._run_main([
+            json.dumps({"jsonrpc": "2.0", "method": "server/discover"}),
+            _modern_req("server/discover", rid=1),
+        ])
+        self.assertEqual(len(responses), 1, "notification 形式的 discover 不应有响应")
+        self.assertIn("supportedVersions", responses[0]["result"])
+
+    def test_de3d_discover_bogus_version_still_answered(self):
+        """DE3d: discover 带非法版本信封也照答 (中立探针不校验信封, P1-4)"""
+        responses = self._run_main([_modern_req("server/discover", version="bogus")])
+        self.assertIn("supportedVersions", responses[0]["result"])
+
+    def test_de9_sdk_wire_fixtures(self):
+        """DE9: 官方 Python SDK v2.0.0 真实抓包序列的回放契约测试 (P2-4)"""
+        sdk_discover = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "mcp", "version": "0.1.0"},
+                "io.modelcontextprotocol/clientCapabilities": {}}}})
+        sdk_tools_list = json.dumps({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "mcp", "version": "0.1.0"},
+                "io.modelcontextprotocol/clientCapabilities": {}}}})
+        sdk_tools_call = json.dumps({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "get_zcode_capabilities",
+                       "arguments": {"section": "ecosystem"},
+                       "_meta": {
+                           "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                           "io.modelcontextprotocol/clientInfo": {"name": "mcp", "version": "0.1.0"},
+                           "io.modelcontextprotocol/clientCapabilities": {}}}})
+        responses = self._run_main([sdk_discover, sdk_tools_list, sdk_tools_call])
+        # 与 SDK 互操作实测时的期望形状逐点对齐
+        r0 = responses[0]["result"]
+        self.assertIn("2026-07-28", r0["supportedVersions"])
+        self.assertEqual(r0["resultType"], "complete")
+        self.assertEqual(r0["ttlMs"], 3600000)
+        self.assertEqual(r0["cacheScope"], "public")
+        self.assertEqual(r0["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+                         "zcode-mcp-server")
+        self.assertEqual(len(responses[1]["result"]["tools"]), 4)
+        self.assertEqual(responses[2]["result"]["resultType"], "complete")
+        self.assertIn("zcode-mcp-server",
+                      responses[2]["result"]["content"][0]["text"])
+
+    def test_de4_unsupported_version_32022(self):
+        """DE4: modern 信封里版本不认识 → -32022 带 supported/requested"""
+        responses = self._run_main([_modern_req("tools/list", version="2099-01-01")])
+        err = responses[0]["error"]
+        self.assertEqual(err["code"], -32022)
+        self.assertIn("2026-07-28", err["data"]["supported"])
+        self.assertEqual(err["data"]["requested"], "2099-01-01")
+
+    def test_de5_probe_then_legacy_initialize(self):
+        """DE5: 先探 discover 再走 legacy initialize → 两纪元并存 (dual-era 灵活性)"""
+        responses = self._run_main([
+            _modern_req("server/discover"),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25"}}),
+            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+        ])
+        self.assertIn("supportedVersions", responses[0]["result"])
+        self.assertEqual(responses[1]["result"]["protocolVersion"], "2025-11-25")
+        # legacy tools/list 不带 resultType (老 client 预期旧形状)
+        self.assertNotIn("resultType", responses[2]["result"])
+
+    def test_de6_pure_legacy_flow_unaffected(self):
+        """DE6: 纯 legacy 流程 (initialize 开场) 完全不受 modern 影响"""
+        responses = self._run_main([
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2025-06-18"}}),
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        ])
+        self.assertEqual(responses[0]["result"]["protocolVersion"], "2025-06-18")
+        self.assertNotIn("resultType", responses[1]["result"])
+        self.assertNotIn("ttlMs", responses[1]["result"])
+
+    def test_de7_modern_unknown_method_32601(self):
+        """DE7: modern 纪元未知 method → -32601"""
+        responses = self._run_main([_modern_req("resources/list")])
+        self.assertEqual(responses[0]["error"]["code"], -32601)
+
+    def test_de8_modern_notification_silent(self):
+        """DE8: modern notification (cancelled) 静默吞掉不应答"""
+        responses = self._run_main([
+            _modern_req("tools/list"),
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": 1, "reason": "user"}}),
+        ])
+        self.assertEqual(len(responses), 1, "notification 不应有响应")
 
 
 if __name__ == "__main__":
