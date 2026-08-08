@@ -1282,13 +1282,21 @@ def make_error(msg_id, code, message, data=None):
 # 纪元路由在 main() 的读循环里 (initialize → legacy, modern 信封 → modern)。
 # ============================================================
 def _modern_result(payload, cacheable=False):
-    """modern 纪元 result 封装: resultType 必填 + serverInfo 戳 (+缓存提示)。"""
+    """modern 纪元 result 封装: resultType 必填 + serverInfo 戳 (+缓存提示)。
+
+    当前不支持 delta 流式分片, resultType 统一 "complete" (含 isError 的工具
+    执行错误, 那是完整结果不是中间态)。cacheable=True 仅用于静态清单
+    (tools/list、discover); 若未来工具集变动态, 须改 cacheScope=private
+    并调低 ttlMs。
+    """
     result = dict(payload)
+    meta = dict(result.get("_meta") or {})  # 浅拷贝, 不就地改调用方对象 (P1-3)
+    meta[_META_SERVER_INFO] = dict(SERVER_INFO)
+    result["_meta"] = meta
     result["resultType"] = "complete"
-    result.setdefault("_meta", {})[_META_SERVER_INFO] = dict(SERVER_INFO)
     if cacheable:
         result["ttlMs"] = 3_600_000     # 工具集/版本清单静态, 可缓存 1h
-        result["cacheScope"] = "public"  # 无用户特定数据
+        result["cacheScope"] = "public"  # 无用户特定数据 (动态化时改 private)
     return result
 
 
@@ -1309,22 +1317,25 @@ def handle_modern_request(req):
     if msg_id is None:
         return None
 
-    # _meta 信封校验: protocolVersion + clientCapabilities 必填 (缺 → -32602)
+    # _meta 信封校验: 拆分报错, 缺哪个说哪个 (P1-2)
     meta = (req.get("params") or {}).get("_meta") or {}
     pv = meta.get(_META_PV)
     caps = meta.get(_META_CAPS)
-    if not isinstance(pv, str) or not isinstance(caps, dict):
+    if not isinstance(pv, str) or not pv:
         return make_error(
             msg_id, -32602,
-            "Invalid params: modern 请求缺少必需的 _meta 信封 "
-            "(io.modelcontextprotocol/protocolVersion + clientCapabilities)")
+            "Invalid params: _meta 缺 io.modelcontextprotocol/protocolVersion (非空字符串)")
+    if not isinstance(caps, dict):
+        return make_error(
+            msg_id, -32602,
+            "Invalid params: _meta 缺 io.modelcontextprotocol/clientCapabilities (对象)")
     if pv not in MODERN_PROTOCOL_VERSIONS:
         return make_error(
             msg_id, -32022, f"Unsupported protocol version: {pv}",
             data={"supported": ALL_SUPPORTED_VERSIONS, "requested": pv})
 
-    if method == "server/discover":
-        return make_response(msg_id, _discover_result())
+    # 注: server/discover 不走这里 — main 循环把它当中立探针先行应答
+    # (不定纪元、不校验信封), 两条路径行为一致 (P1-4)。
     if method == "tools/list":
         return make_response(msg_id, _modern_result({"tools": TOOLS}, cacheable=True))
     if method == "tools/call":
@@ -1370,6 +1381,11 @@ def handle_request(req):
     if method == "notifications/initialized":
         return None
 
+    # 其他 notification (无 id) 一律静默吞掉 — JSON-RPC 规定 notification
+    # 不应答 (回 id:null 的错误是协议违规, 会污染 client 响应队列)
+    if msg_id is None:
+        return None
+
     # --- 工具发现 ---
     if method == "tools/list":
         return make_response(msg_id, {"tools": TOOLS})
@@ -1402,8 +1418,7 @@ def main():
         f"{MODERN_PROTOCOL_VERSIONS[0]}")
     log(f"暴露 tools: {[t['name'] for t in TOOLS]}")
 
-    era = None  # None=未判定 / "legacy" / "modern" (按 client 开场方式分流)
-    # 按行读取 stdin
+    # 按行读取 stdin (纪元逐请求判定, 无会话状态)
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1424,29 +1439,27 @@ def main():
                 "Invalid Request: 仅接受单个 JSON-RPC 对象"))
             continue
 
-        # ---- 纪元路由 (dual-era, 2026-08-08) ----
-        # initialize → legacy; 带 modern _meta 信封 → modern;
-        # server/discover 任意时刻可答 (modern client 的时代探针, 不定纪元);
-        # 首个无信封的非通知请求 → legacy (zcode auto 探测的回落语义)。
+        # ---- 纪元路由 (dual-era, 逐请求判定, 无会话状态) ----
+        # 狗食 review P0-1: 早期的会话级 era 变量会被"legacy 请求偶发带 _meta"
+        # 毒死整个会话, 且双向覆写会造成 result 形状反复横跳 — 改为逐请求判定:
+        #   server/discover → 中立探针, 直接答 (不定纪元, 不校验信封);
+        #   initialize      → legacy 握手 (新纪元没有它);
+        #   带 io.modelcontextprotocol/protocolVersion 信封 → modern;
+        #   其余 → legacy (zcode auto 探测回落语义)。
+        # 逐请求路由与 2026-07-28 的无状态哲学一致, 天然无互串。
         method = req.get("method")
         meta = (req.get("params") or {}).get("_meta") or {}
         is_notification = "id" not in req
-        if method == "initialize":
-            era = "legacy"
-        elif _META_PV in meta:
-            era = "modern"
-        elif method == "server/discover":
-            pass  # 探针不改纪元
-        elif era is None and not is_notification:
-            era = "legacy"
 
         try:
             if method == "server/discover":
-                resp = make_response(req.get("id"), _discover_result())
-            elif era == "modern":
-                resp = handle_modern_request(req)
+                if is_notification:
+                    continue  # P0-2: notification 不应答 (否则发 id:null 伪响应)
+                resp = make_response(req["id"], _discover_result())
+            elif method == "initialize" or _META_PV not in meta:
+                resp = handle_request(req)          # legacy 路径
             else:
-                resp = handle_request(req)
+                resp = handle_modern_request(req)   # modern 路径 (含信封校验)
             if resp is not None:
                 send_message(resp)
         except Exception as e:
