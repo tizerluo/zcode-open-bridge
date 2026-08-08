@@ -409,7 +409,7 @@ def _mimosa_quick_scan(root, scan_path):
     (schemaVersion: mimosa-security-scan-findings/v1)。depth=normal 跳过
     业务逻辑投研, 秒级; deep 走 _mimosa_deep_scan 异步管线。
     """
-    timeout = max(30, _env_int("ZCODE_BRIDGE_MIMOSA_TIMEOUT", 180))
+    timeout = max(30, _env_int("ZCODE_BRIDGE_MIMOSA_TIMEOUT", 180, maximum=3600))
     client = MimosaMcpClient(root, cwd=scan_path, timeout=timeout)
     try:
         client.initialize()
@@ -462,8 +462,8 @@ def _mimosa_deep_scan(root, scan_path, focus_files=None):
     (实测), 不能当"只扫这些文件"用。
     超时/失败抛异常; 超时会 best-effort cancel 后台 job。
     """
-    timeout = max(60, _env_int("ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT", 900))
-    poll = max(1, _env_int("ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL", 2))
+    timeout = max(60, _env_int("ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT", 900, maximum=7200))
+    poll = max(1, _env_int("ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL", 2, maximum=60))
     client = MimosaMcpClient(root, cwd=scan_path, timeout=120)
     job_id = None
     terminal = False  # 到达终态 (completed/failed/cancelled) 则 finally 不再 cancel
@@ -708,7 +708,7 @@ def _run_zcode_headless(cmd, env, timeout):
     """
     # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数。
     # clamp 到 >=0, 防止 ZCODE_BRIDGE_MAX_RETRIES=-1 导致不执行 zcode (Codex P2)
-    max_retries = max(0, _env_int("ZCODE_BRIDGE_MAX_RETRIES", 3))
+    max_retries = max(0, _env_int("ZCODE_BRIDGE_MAX_RETRIES", 3, maximum=10))
 
     last_err = None
     try:
@@ -759,7 +759,7 @@ def _run_zcode_headless(cmd, env, timeout):
 
 def _review_timeout():
     """review 单次 zcode 调用超时 (秒), ZCODE_BRIDGE_REVIEW_TIMEOUT 可配。"""
-    return max(30, _env_int("ZCODE_BRIDGE_REVIEW_TIMEOUT", 300))
+    return max(30, _env_int("ZCODE_BRIDGE_REVIEW_TIMEOUT", 300, maximum=3600))
 
 
 def _write_temp(text, prefix):
@@ -922,12 +922,16 @@ def tool_zcode_security_review(args):
                 pass
 
 
-def _env_int(name, default):
-    """从环境变量读整数, 失败用默认值。"""
+def _env_int(name, default, maximum=None):
+    """从环境变量读整数, 失败用默认值; maximum 给上界 (复审 R2 P2-5:
+    之前只靠调用点 max() 兜下限, env 误设天文数字没有防线)。"""
     try:
-        return int(os.environ.get(name, str(default)))
+        v = int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
+    if maximum is not None:
+        v = min(v, maximum)
+    return v
 
 
 TOOL_HANDLERS = {

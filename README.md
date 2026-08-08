@@ -261,7 +261,7 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 - `normal`（默认）：同步 `security_scan`，秒级（400 文件项目 ~2s），纯规则匹配
 - `deep`：异步 `security_scan_start` → `security_scan_status` 轮询 → 完成后回读 findings，含业务逻辑投研（threatModel/validation/pathAnalysis 等阶段），400 文件项目 ~13s。与 normal 共用同一条 findings 回读管线。纯 native 引擎、零 LLM、零网络（`evidenceBoundary: static_only_no_runtime_execution`）
-- `focus_files` 参数（仅 deep）：业务逻辑复核的**优先级提示**（如只给本次改动的文件），不是过滤器——静态引擎永远全量扫（实测）
+- `focus_files` 参数（仅 deep）：业务逻辑复核的**优先级提示**（典型用法：调用方自己算出本次改动的文件清单传入——bridge 不做 git diff 集成），不是过滤器，静态引擎永远全量扫（实测）
 
 异步响应解析的两个坑（已在代码里处理）：start/status/cancel/resume 的 `content[0].text` 是**嵌套 JSON 字符串**（`mimosa-mcp-security-scan-job/v1`）而非 Markdown 摘要；完成判定必须 parse JSON 看 `job.status`——running 态也含 `"completedAt":null`，字符串匹配 `completed` 会误判。
 
