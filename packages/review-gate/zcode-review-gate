@@ -22,6 +22,7 @@ zcode-review-gate — PR 自动审查闸门守护进程 (zcode-open-bridge 第 4
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -303,6 +304,18 @@ def post_comment(token, api_base, owner, repo, pr_number, body):
 # ============================================================
 # git 操作 (subprocess; token 只经进程内 header 注入)
 # ============================================================
+def _basic_auth_header(token):
+    """拼 git smart-HTTP 用的 Authorization Basic 头值。
+
+    GC-8G 实测: GitHub 的 git smart-HTTP 拒绝 OAuth token (gho_ 前缀) 的
+    Bearer 形式 (remote: invalid credentials), 必须 Basic — 用户名
+    x-access-token (GitHub 官方约定的占位用户名), 密码为 token。
+    REST API 侧 Bearer 没问题, 不受影响 (见 github_request)。
+    """
+    raw = base64.b64encode(f"x-access-token:{token}".encode())
+    return f"Authorization: Basic {raw.decode('ascii')}"
+
+
 def git(args, token=None, timeout=GIT_TIMEOUT):
     """执行一条 git 命令, 失败抛 GitError, 成功返回 stdout。
 
@@ -317,7 +330,7 @@ def git(args, token=None, timeout=GIT_TIMEOUT):
         env = dict(os.environ)
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
-        env["GIT_CONFIG_VALUE_0"] = f"Authorization: Bearer {token}"
+        env["GIT_CONFIG_VALUE_0"] = _basic_auth_header(token)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout, env=env)

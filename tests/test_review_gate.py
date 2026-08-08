@@ -29,6 +29,7 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
 依赖: 仅 Python 标准库
 """
 
+import base64
 import email.message
 import json
 import os
@@ -521,8 +522,18 @@ class TestGitTokenHeader(_GateCase):
         env = seen["env"]
         self.assertEqual(env["GIT_CONFIG_COUNT"], "1")
         self.assertEqual(env["GIT_CONFIG_KEY_0"], "http.extraHeader")
-        self.assertEqual(env["GIT_CONFIG_VALUE_0"],
-                         "Authorization: Bearer secret-tok")
+        self.assertTrue(
+            env["GIT_CONFIG_VALUE_0"].startswith("Authorization: Basic "))
+
+    def test_basic_header_decodes_to_x_access_token(self):
+        # GC-8G 实测: GitHub git smart-HTTP 拒绝 OAuth token 的 Bearer 形式,
+        # 必须 Basic (x-access-token:<token> 的 base64); REST 侧 Bearer 不受影响
+        seen = self._capture("secret-tok")
+        value = seen["env"]["GIT_CONFIG_VALUE_0"]
+        scheme, b64 = value.split(" ", 2)[1:]
+        self.assertEqual(scheme, "Basic")
+        decoded = base64.b64decode(b64).decode("utf-8")
+        self.assertEqual(decoded, "x-access-token:secret-tok")
 
     def test_no_token_no_env_override(self):
         seen = self._capture(None)
@@ -809,13 +820,14 @@ class TestOnceEndToEnd(_GateCase):
         self.assertIn("同一 head 不重复审", body)
 
         # git: clone URL 与 argv 均无 token; token 只走 GIT_CONFIG_* env
+        # (Basic header, 明文 token 本身也不在 env 值里 — 只有 base64 形态)
         clone_cmd, clone_env = next(
             (c, e) for c, e in self.git_calls if "clone" in c)
         url_arg = next(a for a in clone_cmd if a.startswith("https://"))
         self.assertNotIn("fake-token-123", url_arg)
         self.assertNotIn("fake-token-123", " ".join(clone_cmd))
         self.assertEqual(clone_env["GIT_CONFIG_VALUE_0"],
-                         "Authorization: Bearer fake-token-123")
+                         self.mod._basic_auth_header("fake-token-123"))
 
         # state 落盘: reviewed/pass, report 缓存已清
         entry = self._state_entry()

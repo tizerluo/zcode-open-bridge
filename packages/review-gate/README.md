@@ -171,6 +171,9 @@ zcode。
 - token 不落盘：经 git≥2.31 的 `GIT_CONFIG_COUNT/KEY/VALUE` 环境变量逐
   命令注入 `http.extraHeader`（env 只对本用户可见，优于 argv），
   clone URL / git config / state 文件里都不会有 token。
+  认证形态分两路：git smart-HTTP 走 **Basic** header
+  （`x-access-token:<token>` 的 base64——实测 GitHub 的 git 端点拒绝
+  OAuth token 的 Bearer 形式），REST API 走 **Bearer** header。
 
 ## 测试
 
