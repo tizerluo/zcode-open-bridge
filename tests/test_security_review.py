@@ -71,7 +71,8 @@ class _EnvGuard(unittest.TestCase):
     ENV_KEYS = ("ZCODE_BRIDGE_REVIEW_LOCK", "ZCODE_BRIDGE_MIMOSA_ROOT",
                 "ZCODE_BRIDGE_REVIEW_TIMEOUT", "ZCODE_BRIDGE_MIMOSA_SCAN_ROOT",
                 "ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT",
-                "ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL")
+                "ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL",
+                "ZCODE_BRIDGE_PR_DIFF_MAX")
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in self.ENV_KEYS}
@@ -826,6 +827,138 @@ class TestSecurityReviewDepth(_EnvGuard):
         self.assertEqual(captured["focus_files"], ["a.py"])
         prompt = captured["cmd"][captured["cmd"].index("--prompt") + 1]
         self.assertIn("depth=deep", prompt)
+
+
+class TestPrReview(_EnvGuard):
+    """tool_zcode_pr_review: git diff + mimosa 聚焦 + zcode 复核"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def _patch(self, changed=None, diff_text="diff --git a/app.py b/app.py\n+new line\n"):
+        """patch git/mimosa/zcode 三路。changed=None 表示非 git 仓库。"""
+        import tempfile
+        mod = self.mod
+        proj = tempfile.mkdtemp(prefix="zcode-pr-proj-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(proj, ignore_errors=True))
+        saved = {
+            "find_root": mod._find_mimosa_root,
+            "deep": mod._mimosa_deep_scan,
+            "quick": mod._mimosa_quick_scan,
+            "run": mod.subprocess.run,
+        }
+        captured = {}
+
+        def fake_run(cmd, *a, **kw):
+            if cmd[0] == "git":
+                if changed is None:  # 非 git 仓库
+                    return _FakeCompletedProcess(128, "", "not a git repository")
+                sub = cmd[3]  # ["git", "-C", repo, <sub>, ...]
+                if sub == "rev-parse" or sub == "symbolic-ref":
+                    return _FakeCompletedProcess(0, "ok\n", "")
+                if sub == "diff" and "--name-only" in cmd:
+                    return _FakeCompletedProcess(
+                        0, "".join(f + "\n" for f in changed), "")
+                if sub == "diff":
+                    return _FakeCompletedProcess(0, diff_text, "")
+            captured["cmd"] = cmd  # zcode 调用
+            return _FakeCompletedProcess(
+                0, json.dumps({"response": "PR 报告"}, ensure_ascii=False), "")
+
+        def fake_find_root():
+            return "/fake/mimosa"
+
+        def fake_deep(root, path, focus_files=None):
+            captured["focus_files"] = focus_files
+            return ("deep 摘要", [{"identity": {"publicClass": "sql-injection"},
+                                  "severity": "high", "cwe": ["CWE-89"],
+                                  "location": {"path": "app.py", "line": 11},
+                                  "title": "SQL 注入", "message": "拼接查询"}])
+
+        mod.subprocess.run = fake_run
+        mod._find_mimosa_root = fake_find_root
+        mod._mimosa_deep_scan = fake_deep
+        mod._mimosa_quick_scan = lambda r, p: ("normal 摘要", [])
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        return mod, saved, proj, captured
+
+    def _restore(self, mod, saved):
+        mod._find_mimosa_root = saved["find_root"]
+        mod._mimosa_deep_scan = saved["deep"]
+        mod._mimosa_quick_scan = saved["quick"]
+        mod.subprocess.run = saved["run"]
+
+    def test_pr0_not_a_git_repo(self):
+        """PR0: 非 git 仓库 → 明确报错"""
+        mod, saved, proj, _ = self._patch(changed=None)
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj})
+        finally:
+            self._restore(mod, saved)
+        self.assertTrue(result.get("isError"))
+        self.assertIn("不是 git 仓库", result["content"][0]["text"])
+
+    def test_pr1_no_changes_friendly_exit(self):
+        """PR1: 无改动 → 友好提示, 不调 mimosa/zcode"""
+        mod, saved, proj, captured = self._patch(changed=[])
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+        self.assertNotIn("isError", result)
+        self.assertIn("没有任何改动", result["content"][0]["text"])
+        self.assertNotIn("cmd", captured, "无改动不应调 zcode")
+
+    def test_pr2_happy_path(self):
+        """PR2: 正常管线 — diff 进附件, focus_files=改动文件, 默认 deep"""
+        mod, saved, proj, captured = self._patch(changed=["app.py", "util.py"])
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+        self.assertNotIn("isError", result)
+        self.assertEqual(result["content"][0]["text"], "PR 报告")
+        # focus_files 透传改动清单
+        self.assertEqual(captured["focus_files"], ["app.py", "util.py"])
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[cmd.index("--mode") + 1], "yolo")
+        self.assertIn("--disallowed-tools", cmd)
+        prompt = cmd[cmd.index("--prompt") + 1]
+        self.assertIn("PR 审查", prompt)
+        self.assertIn("P0", prompt)
+        self.assertIn("能否合并", prompt)
+
+    def test_pr3_base_autodetect_used(self):
+        """PR3: 不传 base → 走自动探测 (fake git 的 rev-parse 全通过)"""
+        mod, saved, proj, captured = self._patch(changed=["a.py"])
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj})
+        finally:
+            self._restore(mod, saved)
+        self.assertNotIn("isError", result)
+
+    def test_pr4_bad_depth_rejected(self):
+        """PR4: 非法 depth 在校验 git 之前就被拒"""
+        mod, saved, proj, captured = self._patch(changed=["a.py"])
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "depth": "x"})
+        finally:
+            self._restore(mod, saved)
+        self.assertTrue(result.get("isError"))
+        self.assertNotIn("cmd", captured)
+
+    def test_pr5_diff_truncation(self):
+        """PR5: diff 超 ZCODE_BRIDGE_PR_DIFF_MAX → 截断并标注"""
+        os.environ["ZCODE_BRIDGE_PR_DIFF_MAX"] = "10000"
+        big_diff = "x" * 20000
+        mod, saved, proj, captured = self._patch(changed=["a.py"], diff_text=big_diff)
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+            os.environ.pop("ZCODE_BRIDGE_PR_DIFF_MAX", None)
+        self.assertNotIn("isError", result)
 
 
 if __name__ == "__main__":

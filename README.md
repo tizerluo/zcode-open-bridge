@@ -105,13 +105,14 @@ zcode --prompt "继续" --resume sess_xxxx
 
 ### MCP server（`zcode-mcp-server`）
 
-暴露三个 MCP tool：
+暴露四个 MCP tool：
 
 | Tool | 作用 |
 |------|------|
 | `get_zcode_capabilities` | 返回 ZCode 能力清单（调 agent-help） |
 | `zcode_review` | 调 ZCode 审查代码（yolo + 写/执行工具物理禁用，全程免授权但改不了文件，安全） |
 | `zcode_security_review` | 安全专项审查：mimosa 确定性规则引擎预扫 → ZCode 拿 findings 逐条核实（确认/误报/存疑 + 攻击路径 + 修复建议）。`depth=normal` 秒级快扫（默认），`depth=deep` 含业务逻辑投研（异步任务管线） |
+| `zcode_pr_review` | PR 审查模式：自动算 `git diff base...HEAD`（merge-base 语义，base 可自动探测）→ mimosa 全仓扫描且业务逻辑复核聚焦改动文件（focus_files）→ ZCode 出 PR 复核报告（P0/P1/P2 分级 + findings 核实 + 能否合并结论）。默认 `depth=deep`；diff 超 `ZCODE_BRIDGE_PR_DIFF_MAX`（默认 500KB）截断保清单 |
 
 > **只读原理（2026-08-08 重构，告别 `--mode plan`）**：review 体系不再用 plan 模式——plan 只禁「改文件」，读探索/子代理照样放行（限流超时主因），且 plan→build 的规划惯性容易让 review 变成「边审边修」。新方案用 `--mode yolo`（全程免授权）+ `--disallowed-tools` 把 `Write/Edit/MultiEdit/ApplyPatch/Bash` 连同 Node REPL 一族（`js` / `mcp__node_repl__js*`）一起禁掉：`--disallowed-tools` 是工具集级物理移除、先于权限层，yolo 也绕不过；Node REPL 一族必须同禁，否则可被 `execSync` 打穿 Bash 黑名单（0.16.1 实测复现）。读工具（Read/Grep/Glob）全开，不影响审查能力。prompt 层另有「只审不修」职责约束（不修改文件、不提议帮忙修复）作双保险。
 

@@ -329,6 +329,17 @@ MCP server 暴露三个标准 MCP tool，供 Claude Code / Cursor 等 MCP client
 | `get_zcode_capabilities` | 返回 ZCode 完整能力清单 | 只读 |
 | `zcode_review` | 调用 ZCode 审查代码 | 只读（`--mode yolo` + `--disallowed-tools` 物理禁用写/执行工具，全程免授权但改不了文件） |
 | `zcode_security_review` | 安全专项审查：mimosa 规则引擎全仓预扫 → ZCode 逐条核实 findings | 只读（同上；需本机装有 mimosa 或设 `ZCODE_BRIDGE_MIMOSA_ROOT`） |
+| `zcode_pr_review` | PR 审查：git diff 改动清单 + mimosa 聚焦深扫（focus_files）→ ZCode 出 P0/P1/P2 复核报告 + 能否合并结论 | 只读（同上；base 不传自动探测，默认 depth=deep） |
+
+### `zcode_pr_review` 参数
+- `path`：git 仓库目录（默认当前目录）
+- `base`：PR base 分支/commit，不传自动探测（origin/HEAD → main/master → origin/main|master）
+- `head`：默认 HEAD
+- `depth`：mimosa 扫描深度，PR 审查默认 `deep`
+- `focus`：可选，额外审查重点
+- `cwd`：zcode 工作目录（默认与 path 相同）
+
+> 流程：`git diff base...head`（三点 = merge-base 语义）算改动清单与完整 diff → mimosa 全仓扫描（`focus_files`=改动文件，deep 档业务逻辑投研聚焦）→ diff+findings 作附件喂 zcode，出「P0 阻断/P1 应修/P2 建议 + findings 确认/误报/存疑 + 能否合并」报告。diff 超 `ZCODE_BRIDGE_PR_DIFF_MAX`（默认 500KB）截断但改动文件清单完整。相对 base 无改动时直接返回提示、不消耗 LLM 调用。
 
 ### `zcode_review` 参数
 - `files`：要审查的文件路径列表

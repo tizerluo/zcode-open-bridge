@@ -9,6 +9,7 @@ Claude Code、Cursor 等) 能标准化地发现并调用 headless zcode。
   1. get_zcode_capabilities  — 返回 headless zcode 完整能力清单 (JSON)
   2. zcode_review            — 调 zcode 审查代码 (yolo + 写工具物理禁用, 免授权且只读)
   3. zcode_security_review   — mimosa 规则引擎预扫 + zcode 只读逐条复核 (安全专项)
+  4. zcode_pr_review         — PR 审查: git diff + mimosa 聚焦深扫 + zcode 复核报告
 
 协议: MCP over stdio (JSON-RPC 2.0, 每行一条消息)
 日志: 全部走 stderr (绝不污染 stdout 协议流)
@@ -38,7 +39,7 @@ ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 
 # MCP 协议版本
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "zcode-mcp-server", "version": "1.1.0"}
+SERVER_INFO = {"name": "zcode-mcp-server", "version": "1.2.0"}
 
 
 def log(msg):
@@ -559,6 +560,49 @@ def _compact_findings(findings):
 
 
 # ============================================================
+# PR 审查: git diff 计算 + base 自动探测
+# ============================================================
+def _git(repo, *git_args):
+    """跑 git 子命令, 返回 (returncode, stdout, stderr)。不抛异常, 调用方判。"""
+    try:
+        r = subprocess.run(["git", "-C", repo, *git_args],
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 128, "", str(e)
+
+
+def _resolve_pr_base(repo):
+    """自动探测 PR base 分支: origin/HEAD → main/master (本地) → origin/main|master。"""
+    rc, out, _ = _git(repo, "symbolic-ref", "--quiet", "--short",
+                      "refs/remotes/origin/HEAD")
+    candidates = []
+    if rc == 0 and out.strip():
+        candidates.append(out.strip())  # 形如 origin/main
+    candidates += ["main", "master", "origin/main", "origin/master"]
+    for cand in candidates:
+        rc, _, _ = _git(repo, "rev-parse", "--verify", "--quiet", cand)
+        if rc == 0:
+            return cand
+    return None
+
+
+def _pr_diff(repo, base, head):
+    """计算 base...head 的改动文件清单 + diff 全文 (三点 = merge-base 语义)。
+
+    返回 (changed_files, diff_text); 失败抛 RuntimeError。
+    """
+    rc, files_out, err = _git(repo, "diff", "--name-only", f"{base}...{head}")
+    if rc != 0:
+        raise RuntimeError(f"git diff {base}...{head} 失败: {err.strip()[:200]}")
+    changed = [ln.strip() for ln in files_out.splitlines() if ln.strip()]
+    rc, diff_text, err = _git(repo, "diff", f"{base}...{head}")
+    if rc != 0:
+        raise RuntimeError(f"git diff {base}...{head} 失败: {err.strip()[:200]}")
+    return changed, diff_text
+
+
+# ============================================================
 # Tool 定义
 # ============================================================
 TOOLS = [
@@ -650,6 +694,49 @@ TOOLS = [
                 "focus": {
                     "type": "string",
                     "description": "可选,额外审查重点,如 '重点关注注入与鉴权'",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "zcode 工作目录,默认与 path 相同",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "zcode_pr_review",
+        "description": (
+            "PR 审查模式: 自动算 git diff (base...HEAD, merge-base 语义) 得到改动清单,"
+            "mimosa 全仓扫描 + 业务逻辑复核优先聚焦改动文件 (focus_files),"
+            "ZCode 拿着 diff+findings 出 PR 复核报告 (P0/P1/P2 分级 + 能否合并结论)。"
+            "全程只读: yolo+写工具物理禁用, 免人工授权。需要本机装有 mimosa 插件。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "git 仓库目录,默认当前目录",
+                },
+                "base": {
+                    "type": "string",
+                    "description": "PR base 分支/commit,不传则自动探测 "
+                                   "(origin/HEAD → main/master → origin/main|master)",
+                },
+                "head": {
+                    "type": "string",
+                    "description": "PR head (默认 HEAD)",
+                    "default": "HEAD",
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["normal", "deep"],
+                    "description": "mimosa 扫描深度,PR 审查默认 deep (业务逻辑投研聚焦改动文件)",
+                    "default": "deep",
+                },
+                "focus": {
+                    "type": "string",
+                    "description": "可选,额外审查重点",
                 },
                 "cwd": {
                     "type": "string",
@@ -922,6 +1009,138 @@ def tool_zcode_security_review(args):
                 pass
 
 
+def tool_zcode_pr_review(args):
+    """PR 审查模式: git diff + mimosa 聚焦深扫 + zcode 复核报告。
+
+    ① git diff base...head (merge-base 语义) 算改动清单与完整 diff;
+    ② mimosa 全仓扫描 (focus_files=改动文件, deep 档业务逻辑投研聚焦改动);
+    ③ diff+findings 作附件喂 zcode 出 PR 复核报告 (P0/P1/P2 + 能否合并)。
+    全程只读: 写工具物理禁用; git/mimosa 都是只读调用。
+    """
+    scan_path = args.get("path") or args.get("cwd") or os.getcwd()
+    focus = args.get("focus", "")
+    depth = args.get("depth", "deep")
+    head = args.get("head", "HEAD")
+
+    if depth not in ("normal", "deep"):
+        return {"content": [{"type": "text",
+                             "text": f"非法 depth: {depth!r} (只支持 normal|deep)"}],
+                "isError": True}
+    if not os.path.isdir(scan_path):
+        return {"content": [{"type": "text",
+                             "text": f"仓库目录不存在或不是目录: {scan_path}"}],
+                "isError": True}
+
+    # ① git diff (只读)
+    rc, _, err = _git(scan_path, "rev-parse", "--git-dir")
+    if rc != 0:
+        return {"content": [{"type": "text",
+                             "text": f"{scan_path} 不是 git 仓库: {err.strip()[:200]}"}],
+                "isError": True}
+    base = args.get("base")
+    if not base:
+        base = _resolve_pr_base(scan_path)
+        if not base:
+            return {"content": [{"type": "text", "text": (
+                "无法自动探测 PR base 分支 (试了 origin/HEAD、main/master、"
+                "origin/main|master)。请显式传 base 参数, 如 base='main'。"
+            )}], "isError": True}
+    rc, _, err = _git(scan_path, "rev-parse", "--verify", "--quiet", base)
+    if rc != 0:
+        return {"content": [{"type": "text",
+                             "text": f"base 不存在: {base!r} (git: {err.strip()[:150]})"}],
+                "isError": True}
+    try:
+        changed, diff_text = _pr_diff(scan_path, base, head)
+    except RuntimeError as e:
+        return {"content": [{"type": "text", "text": str(e)}], "isError": True}
+    if not changed:
+        return {"content": [{"type": "text", "text": (
+            f"相对 {base}...{head} 没有任何改动, 无需审查。"
+            "如果改动还在工作区未 commit, 请先提交或调整 base/head。"
+        )}]}
+
+    # diff 体积上限 (附件体积保护, ZCODE_BRIDGE_PR_DIFF_MAX 可配)
+    max_bytes = max(10_000, _env_int("ZCODE_BRIDGE_PR_DIFF_MAX", 500_000,
+                                     maximum=5_000_000))
+    if len(diff_text.encode("utf-8")) > max_bytes:
+        diff_text = diff_text[:max_bytes] + (
+            f"\n\n[... diff 超 {max_bytes} 字节已截断; 改动文件清单完整, "
+            "可用只读工具阅读完整文件 ...]")
+
+    root = _find_mimosa_root()
+    if not root:
+        return {"content": [{"type": "text", "text": (
+            "未找到 mimosa 安全扫描插件。请安装 mimosa,或设 ZCODE_BRIDGE_MIMOSA_ROOT "
+            "指向插件根目录 (含 payload/ 的那层);也可改用 zcode_review 做纯 AI 审查。"
+        )}], "isError": True}
+
+    # ② mimosa 扫描 (focus_files=改动文件; deep 档业务逻辑投研聚焦, 全仓仍全量扫)
+    log(f"mimosa {depth} 扫描 (PR 模式): {scan_path} (root={root}, "
+        f"{len(changed)} 个改动文件)")
+    try:
+        if depth == "deep":
+            summary_text, findings = _mimosa_deep_scan(root, scan_path, changed)
+        else:
+            summary_text, findings = _mimosa_quick_scan(root, scan_path)
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"mimosa 扫描失败: {e}"}],
+                "isError": True}
+
+    # ③ 附件 = PR 元信息 + diff + mimosa 摘要 + findings
+    attachment = (
+        f"# PR 信息\n- base: {base} → head: {head}\n"
+        f"- 改动文件 ({len(changed)} 个):\n"
+        + "".join(f"  - {f}\n" for f in changed)
+        + f"\n# PR diff\n```diff\n{diff_text}\n```\n"
+        + f"\n# mimosa 扫描摘要 (depth={depth})\n{summary_text}\n"
+    )
+    if findings:
+        compact = _compact_findings(findings)
+        attachment += (
+            f"\n# findings 清单 ({len(compact)} 条)\n"
+            + json.dumps(compact, ensure_ascii=False, indent=1)
+        )
+    else:
+        attachment += ("\n# findings 清单\n(未取到结构化 findings, 以摘要为准;"
+                       "如摘要显示 0 发现, 也请按你的判断抽查关键代码)\n")
+
+    tmp_path = None
+    try:
+        tmp_path = _write_temp(attachment, "zcode-pr-review-")
+        prompt = (
+            "你是资深安全审查专家。这是一次 PR 审查: 附件含 ① 本 PR 的完整 diff "
+            f"(base={base} → {head}, 改动 {len(changed)} 个文件) ② mimosa 安全扫描结果"
+            f"(depth={depth}, 业务逻辑复核优先聚焦本次改动文件)。\n"
+            "任务:\n"
+            "1. 审查 diff 中新引入的问题, 按 P0(阻断合并)/P1(应修)/P2(建议) 分级,"
+            "每个问题含文件位置/判定依据/修复建议。重点是'新引入';"
+            "存量老问题不阻断本次合并的, 标为 P2 提示即可。\n"
+            "2. 核实 mimosa findings: 逐条判定【确认漏洞】/【误报】/【存疑】,"
+            "优先核实落在改动文件里的; 每条给出依据 (攻击路径或为何不可利用)。\n"
+            "3. 可以用只读工具 (Read/Grep/Glob) 阅读仓库代码获取上下文。\n"
+            "规则: 绝对不要修改、创建或删除任何文件 (写/执行工具已被物理禁用);"
+            "不要提出\"帮你修复\"的提议; 只输出审查报告。\n"
+            "输出格式: 先给汇总 (P0/P1/P2 各几条 + findings 确认/误报/存疑各几条"
+            " + 能否合并的结论), 再逐条详述。用中文。"
+        )
+        if focus:
+            prompt += f"\n额外审查重点: {focus}。"
+
+        cmd = _build_review_cmd(prompt, args.get("cwd") or scan_path)
+        cmd += ["--attach", tmp_path]
+
+        log(f"调用 zcode PR 复核 (yolo+只读黑名单, {len(changed)} 个改动文件)")
+        env = _merge_env_with_creds(load_zcode_credentials())
+        return _run_zcode_headless(cmd, env, _review_timeout())
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def _env_int(name, default, maximum=None):
     """从环境变量读整数, 失败用默认值; maximum 给上界 (复审 R2 P2-5:
     之前只靠调用点 max() 兜下限, env 误设天文数字没有防线)。"""
@@ -938,6 +1157,7 @@ TOOL_HANDLERS = {
     "get_zcode_capabilities": tool_get_zcode_capabilities,
     "zcode_review": tool_zcode_review,
     "zcode_security_review": tool_zcode_security_review,
+    "zcode_pr_review": tool_zcode_pr_review,
 }
 
 
