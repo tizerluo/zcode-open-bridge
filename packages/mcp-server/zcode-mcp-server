@@ -362,6 +362,13 @@ class MimosaMcpClient:
             pass
 
 
+def _mimosa_result_body(result):
+    """提取 mimosa MCP tool 响应的文本正文 (content 里所有 text 块拼接)。"""
+    return "\n".join(
+        c.get("text", "") for c in result.get("content", [])
+        if isinstance(c, dict) and c.get("type") == "text" and c.get("text"))
+
+
 def _read_mimosa_findings(scan_dir_str):
     """按 scanDir 回读 <scanDir>/findings.json 的 findings list。失败/越界返回 []。
 
@@ -406,9 +413,7 @@ def _mimosa_quick_scan(root, scan_path):
             "security_scan", {"project": scan_path, "depth": "normal"})
     finally:
         client.close()
-    texts = [c.get("text", "") for c in result.get("content", [])
-             if isinstance(c, dict) and c.get("type") == "text"]
-    body = "\n".join(t for t in texts if t)
+    body = _mimosa_result_body(result)
     if result.get("isError"):
         raise RuntimeError(f"security_scan 返回错误: {body[:500]}")
 
@@ -427,9 +432,7 @@ def _parse_scan_job(result):
     响应 content[0].text 是嵌套 JSON 字符串
     (schemaVersion: mimosa-mcp-security-scan-job/v1), 不是 Markdown。
     """
-    texts = [c.get("text", "") for c in result.get("content", [])
-             if isinstance(c, dict) and c.get("type") == "text"]
-    body = "\n".join(t for t in texts if t)
+    body = _mimosa_result_body(result)
     if result.get("isError"):
         raise RuntimeError(f"mimosa 异步扫描返回错误: {body[:500]}")
     if not body:
@@ -458,6 +461,9 @@ def _mimosa_deep_scan(root, scan_path, focus_files=None):
     timeout = max(60, _env_int("ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT", 900))
     poll = max(1, _env_int("ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL", 2))
     client = MimosaMcpClient(root, cwd=scan_path, timeout=120)
+    job_id = None
+    completed = False
+    t0 = time.time()  # 总预算含 start 开销 (狗食 review P0-1)
     try:
         client.initialize()
         start_args = {"project": scan_path, "depth": "deep"}
@@ -469,20 +475,22 @@ def _mimosa_deep_scan(root, scan_path, focus_files=None):
             raise RuntimeError("security_scan_start 未返回 jobId")
         log(f"mimosa deep 扫描已启动: {job_id}")
 
-        t0 = time.time()
         while True:
             if time.time() - t0 > timeout:
-                try:  # best-effort 取消, 不留孤儿 job
-                    client.call_tool("security_scan_cancel", {"jobId": job_id})
-                except Exception:
-                    pass
                 raise TimeoutError(
                     f"mimosa deep 扫描超时 ({timeout}s), jobId={job_id}")
             time.sleep(poll)
-            job = _parse_scan_job(
-                client.call_tool("security_scan_status", {"jobId": job_id}))
+            try:
+                job = _parse_scan_job(
+                    client.call_tool("security_scan_status", {"jobId": job_id}))
+            except TimeoutError as e:
+                # 单次 status 响应超时 (mimosa 偶发卡顿/GC): 视同 running 继续,
+                # 由总预算兜底; 直接冒泡会留孤儿 job (狗食 review P0-2)
+                log(f"⚠ status 轮询单次超时, 视同 running 继续: {e}")
+                continue
             status = job.get("status")
             if status == "completed":
+                completed = True
                 break
             if status in ("failed", "cancelled"):
                 err = job.get("error") or {}
@@ -501,11 +509,19 @@ def _mimosa_deep_scan(root, scan_path, focus_files=None):
             f"- findings: {result.get('findingCount')}\n"
             f"- business-logic hypotheses: {len(result.get('hypotheses') or [])}\n"
             f"- dependency: {dep.get('packagesScanned', 0)} package(s) "
-            f"(completion={dep.get('completion')})"
+            f"(completion={dep.get('completion') or 'unknown'})"
         )
         findings = _read_mimosa_findings(scan_dir) if scan_dir else []
         return summary, findings
     finally:
+        # 狗食 review P0-3: start 之后任何未正常完成的退出路径 (解析异常/
+        # 超时/失败/调用方中断) 统一 best-effort cancel, 不留孤儿 job;
+        # cancel 失败也要留诊断痕迹 (P1-5)
+        if job_id and not completed:
+            try:
+                client.call_tool("security_scan_cancel", {"jobId": job_id})
+            except Exception as e:
+                log(f"⚠ best-effort cancel 失败 (jobId={job_id}): {e}")
         client.close()
 
 
@@ -801,7 +817,6 @@ def tool_zcode_security_review(args):
     """
     scan_path = args.get("path") or args.get("cwd") or os.getcwd()
     focus = args.get("focus", "")
-    cwd = args.get("cwd") or scan_path
     depth = args.get("depth", "normal")
     focus_files = args.get("focus_files") or []
 
@@ -809,6 +824,16 @@ def tool_zcode_security_review(args):
         return {"content": [{"type": "text",
                              "text": f"非法 depth: {depth!r} (只支持 normal|deep)"}],
                 "isError": True}
+    # focus_files 来自 MCP client (信任边界外): 类型校验 + 长度上限
+    # (狗食 review P1-4: list("app.py") 会静默炸成单字符列表)
+    if not isinstance(focus_files, list):
+        return {"content": [{"type": "text",
+                             "text": "focus_files 必须是字符串数组"}],
+                "isError": True}
+    if len(focus_files) > 200:
+        log(f"⚠ focus_files 超上限 ({len(focus_files)} > 200), 截断")
+        focus_files = focus_files[:200]
+    focus_files = [str(f) for f in focus_files]
     if not os.path.isdir(scan_path):  # 狗食 review P2-8: 先校验, 错误信息明确
         return {"content": [{"type": "text",
                              "text": f"扫描目录不存在或不是目录: {scan_path}"}],
@@ -863,7 +888,7 @@ def tool_zcode_security_review(args):
         if focus:
             prompt += f"\n额外审查重点: {focus}。"
 
-        cmd = _build_review_cmd(prompt, cwd)
+        cmd = _build_review_cmd(prompt, args.get("cwd") or scan_path)
         cmd += ["--attach", tmp_path]
 
         log("调用 zcode 复核 mimosa findings (yolo+只读黑名单)")

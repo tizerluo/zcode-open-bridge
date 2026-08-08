@@ -69,7 +69,9 @@ class _EnvGuard(unittest.TestCase):
     """保存/恢复本文件用到的环境变量。"""
 
     ENV_KEYS = ("ZCODE_BRIDGE_REVIEW_LOCK", "ZCODE_BRIDGE_MIMOSA_ROOT",
-                "ZCODE_BRIDGE_REVIEW_TIMEOUT", "ZCODE_BRIDGE_MIMOSA_SCAN_ROOT")
+                "ZCODE_BRIDGE_REVIEW_TIMEOUT", "ZCODE_BRIDGE_MIMOSA_SCAN_ROOT",
+                "ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT",
+                "ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL")
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in self.ENV_KEYS}
@@ -651,7 +653,7 @@ class TestMimosaDeepScan(_EnvGuard):
         self.assertIn("failed", str(ctx.exception))
 
     def test_ds2_timeout_cancels_job(self):
-        """DS2: 一直 running + 超时 → TimeoutError 且 best-effort cancel"""
+        """DS2: 一直 running + 超时 → TimeoutError 且 finally 统一 cancel (P0-3)"""
         mod = self.mod
 
         class RunningClient(_StubDeepClient):
@@ -662,9 +664,11 @@ class TestMimosaDeepScan(_EnvGuard):
         saved_time = mod.time.time
         mod.MimosaMcpClient = RunningClient
         mod.time.sleep = lambda s: None
+        # 单调递增 fake clock (狗食 review P0-1: 两点 iter 之后恒值不健壮):
+        # 每次调用 +5000s → 第一轮循环顶部的超时检查即超 900s 预算
         real_t = saved_time()
-        ticks = iter([real_t, real_t + 10000])  # t0, 首次检查即超 900s 预算
-        mod.time.time = lambda: next(ticks, real_t + 10000)
+        ticks = iter(range(0, 10**9, 5000))
+        mod.time.time = lambda: real_t + next(ticks)
         try:
             with self.assertRaises(TimeoutError):
                 mod._mimosa_deep_scan("/fake/root", "/fake/proj")
@@ -673,10 +677,10 @@ class TestMimosaDeepScan(_EnvGuard):
             mod.time.sleep = saved_sleep
             mod.time.time = saved_time
         names = [n for n, _ in RunningClient.instances[0].calls]
-        self.assertIn("security_scan_cancel", names, "超时应 best-effort cancel")
+        self.assertIn("security_scan_cancel", names, "超时应在 finally 统一 cancel")
 
     def test_ds3_no_jobid_raises(self):
-        """DS3: start 响应缺 jobId → 明确报错"""
+        """DS3: start 响应缺 jobId → 明确报错 (patch sleep 保持与其他用例一致)"""
         mod = self.mod
 
         class NoJobClient(_StubDeepClient):
@@ -687,13 +691,16 @@ class TestMimosaDeepScan(_EnvGuard):
                 return super().call_tool(name, arguments)
 
         saved_client = mod.MimosaMcpClient
+        saved_sleep = mod.time.sleep
         mod.MimosaMcpClient = NoJobClient
+        mod.time.sleep = lambda s: None
         try:
             with self.assertRaises(RuntimeError) as ctx:
                 mod._mimosa_deep_scan("/fake/root", "/fake/proj")
             self.assertIn("jobId", str(ctx.exception))
         finally:
             mod.MimosaMcpClient = saved_client
+            mod.time.sleep = saved_sleep
 
 
 class TestSecurityReviewDepth(_EnvGuard):
@@ -732,16 +739,29 @@ class TestSecurityReviewDepth(_EnvGuard):
         self.assertTrue(result.get("isError"))
         self.assertIn("depth", result["content"][0]["text"])
 
+    def test_dp0b_focus_files_must_be_list(self):
+        """DP0b: focus_files 传字符串 → 明确拒绝 (狗食 review P1-4:
+        list("app.py") 会静默炸成单字符列表)"""
+        mod = self.mod
+        result = mod.tool_zcode_security_review(
+            {"path": "/tmp", "depth": "deep", "focus_files": "app.py"})
+        self.assertTrue(result.get("isError"))
+        self.assertIn("focus_files", result["content"][0]["text"])
+
     def test_dp1_default_is_normal(self):
         """DP1: 不传 depth → 走 normal 快扫, 不碰 deep"""
         mod, saved, proj = self._patch()
         called = {"quick": 0, "deep": 0}
-        mod._mimosa_quick_scan = lambda r, p: (called.update(quick=1), ("摘要", []))[1]
+
+        def fake_quick(r, p):
+            called["quick"] += 1
+            return ("摘要", [])
 
         def deep_should_not_run(r, p, f=None):
             called["deep"] += 1
             return ("", [])
 
+        mod._mimosa_quick_scan = fake_quick
         mod._mimosa_deep_scan = deep_should_not_run
         mod.subprocess.run = lambda *a, **kw: _FakeCompletedProcess(0, "OK", "")
         try:
