@@ -301,14 +301,16 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 ### MCP 规范兼容性说明
 
-本项目的 `zcode-mcp-server` 基于 **stdio 传输 + MCP 协议版本 `2024-11-05`**（最早的稳定规范），纯 Python 标准库手写，零第三方依赖。
+本项目的 `zcode-mcp-server` 基于 **stdio 传输**，纯 Python 标准库手写，零第三方依赖。协议版本走**逐请求协商**（2026-08-08 起）：支持 `2024-11-05` / `2025-03-26` / `2025-06-18` / `2025-11-25` 全段，client 报什么版本我们认什么（在列表内回显，列表外回我们最高的 `2025-11-25`）。
 
-**这是有意识的选择，不是落后**：
-- **stdio 是当前标准传输**。MCP 规范演进（`2025-03-26` → `2025-11-25` → 即将转正的 `2026-07-28` 无状态 RC）的核心红利——协议层无状态化、授权加固、Tasks、Elicitation——全部面向 **HTTP 远程 server / 多租户企业场景**（水平扩展、网关、OAuth）。我们是 **stdio 本地桥**，单连接、生命周期 = client 进程，这些特性的痛点一个都不存在。
-- **官方承诺向后兼容**。MCP 的版本号是**逐请求协商**的，所有 client（ZCode 自身、Claude Code、Cursor）都会降级到我们声明的 `2024-11-05` 正常对话。`2024-11-05` 的 HTTP+SSE 传输虽已弃用，但我们用的 **stdio 不在弃用范围**。
-- **零依赖 = 免疫 SDK breaking changes**。因为我们没用官方 Python/TS SDK（手写 JSON-RPC），SDK v2 beta 的 breaking changes（仍在迭代）对我们零影响。
+**这是有意识的路线选择**：
+- **stdio 是当前标准传输**。MCP 规范演进（`2025-03-26` → `2025-11-25` → `2026-07-28` 无状态改版）的核心红利——协议层无状态化、授权加固、Tasks、Elicitation——全部面向 **HTTP 远程 server / 多租户企业场景**。我们是 **stdio 本地桥**，单连接、生命周期 = client 进程，这些特性的痛点一个都不存在。
+- **生态兼容性已实测**（2026-08-08，本机四 client 二进制验证）：Claude Code / Kimi Code / Cursor 目前都是 legacy-only（最高认 `2025-11-25`），zcode 0.16.1 是双纪元（auto 探测 `server/discover` 失败会回落 legacy——我们对未知方法回 `-32601`，正好触发规范预期的回落路径）。
+- **零依赖 = 免疫 SDK breaking changes**。官方 Python SDK v2.0.0（2026-07-28 发布）虽自带双纪元，但 13 个直接依赖（含 HTTP 全家桶）对纯 stdio 单文件 server 得不偿失，故继续手搓。
 
-**什么时候会评估升级**：等 MCP v2 正式发布 + 官方出 v1→v2 迁移指南后重新评估。最低成本动作是把 `PROTOCOL_VERSION` 从 `2024-11-05` 提到 `2025-03-26`（几乎零代码改动），但这是主动需求驱动，不是被动追赶 Beta。
+**已对齐 2025-11-25 的义务**：拒收 JSON-RPC batch（2025-06-18 起规范移除，回 `-32600`）、tools/list 确定性顺序、tool `title` + `annotations`（`readOnlyHint` 等）元数据、输入校验错误走 `isError: true` 而非协议错误。
+
+**路线图**：2026-07-28 新纪元（无握手无状态、`server/discover` 必实现、`resultType` 必填）将以 **dual-era** 形态评估接入——保留 initialize 旧路径服务存量 client，新增新协议路径（zcode 0.16.1 已是双纪元 client，可立即受益）。等 Claude Code / Kimi / Cursor 跟进新协议后再全面实施。
 
 ## Skill（驱动说明书）
 
