@@ -261,6 +261,10 @@ REVIEW_DISALLOWED_TOOLS = (
     "mcp__node_repl__js mcp__node_repl__js_reset mcp__node_repl__js_add_node_module_dir"
 )
 
+# deep 轮询: status 单次响应超时的最大连续容忍次数 (复审 P1-3:
+# 不设上限时每次容忍最长白等 client 超时 120s, 会显著推迟总预算触发)
+_MAX_STATUS_TIMEOUTS = 5
+
 
 def _find_mimosa_root():
     """定位 mimosa 插件根目录 (含 payload/dist/mcp/server.js 的那层)。
@@ -462,7 +466,8 @@ def _mimosa_deep_scan(root, scan_path, focus_files=None):
     poll = max(1, _env_int("ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL", 2))
     client = MimosaMcpClient(root, cwd=scan_path, timeout=120)
     job_id = None
-    completed = False
+    terminal = False  # 到达终态 (completed/failed/cancelled) 则 finally 不再 cancel
+    status_timeouts = 0
     t0 = time.time()  # 总预算含 start 开销 (狗食 review P0-1)
     try:
         client.initialize()
@@ -481,18 +486,29 @@ def _mimosa_deep_scan(root, scan_path, focus_files=None):
                     f"mimosa deep 扫描超时 ({timeout}s), jobId={job_id}")
             time.sleep(poll)
             try:
-                job = _parse_scan_job(
-                    client.call_tool("security_scan_status", {"jobId": job_id}))
+                # try 只包 call_tool (复审 P1-1: 范围收窄, 防未来 _parse_scan_job
+                # 内部引入 TimeoutError 被误吞成"继续轮询")
+                raw = client.call_tool("security_scan_status", {"jobId": job_id})
             except TimeoutError as e:
                 # 单次 status 响应超时 (mimosa 偶发卡顿/GC): 视同 running 继续,
                 # 由总预算兜底; 直接冒泡会留孤儿 job (狗食 review P0-2)
-                log(f"⚠ status 轮询单次超时, 视同 running 继续: {e}")
+                status_timeouts += 1
+                log(f"⚠ status 轮询单次超时 ({status_timeouts}/"
+                    f"{_MAX_STATUS_TIMEOUTS}), 视同 running 继续: {e}")
+                if status_timeouts >= _MAX_STATUS_TIMEOUTS:
+                    # 复审 P1-3: 连续超时过多会显著推迟总预算触发, 设上限
+                    raise RuntimeError(
+                        f"mimosa deep status 连续 {status_timeouts} 次超时, "
+                        f"放弃轮询 (jobId={job_id})") from e
                 continue
+            status_timeouts = 0
+            job = _parse_scan_job(raw)
             status = job.get("status")
             if status == "completed":
-                completed = True
+                terminal = True
                 break
             if status in ("failed", "cancelled"):
+                terminal = True  # 复审 P1-2: 终态无需再 cancel
                 err = job.get("error") or {}
                 raise RuntimeError(
                     f"mimosa deep 扫描 {status}: "
@@ -514,10 +530,10 @@ def _mimosa_deep_scan(root, scan_path, focus_files=None):
         findings = _read_mimosa_findings(scan_dir) if scan_dir else []
         return summary, findings
     finally:
-        # 狗食 review P0-3: start 之后任何未正常完成的退出路径 (解析异常/
-        # 超时/失败/调用方中断) 统一 best-effort cancel, 不留孤儿 job;
-        # cancel 失败也要留诊断痕迹 (P1-5)
-        if job_id and not completed:
+        # 狗食 review P0-3: start 之后任何未到终态的退出路径 (解析异常/
+        # 超时/调用方中断) 统一 best-effort cancel, 不留孤儿 job;
+        # cancel 失败也要留诊断痕迹 (P1-5); 已到终态不重复 cancel (复审 P1-2)
+        if job_id and not terminal:
             try:
                 client.call_tool("security_scan_cancel", {"jobId": job_id})
             except Exception as e:
@@ -833,7 +849,11 @@ def tool_zcode_security_review(args):
     if len(focus_files) > 200:
         log(f"⚠ focus_files 超上限 ({len(focus_files)} > 200), 截断")
         focus_files = focus_files[:200]
-    focus_files = [str(f) for f in focus_files]
+    # 元素级过滤: 非字符串元素丢弃而非 stringify (复审 P2-1)
+    valid_files = [f for f in focus_files if isinstance(f, str)]
+    if len(valid_files) != len(focus_files):
+        log(f"⚠ focus_files 丢弃 {len(focus_files) - len(valid_files)} 个非字符串元素")
+    focus_files = valid_files
     if not os.path.isdir(scan_path):  # 狗食 review P2-8: 先校验, 错误信息明确
         return {"content": [{"type": "text",
                              "text": f"扫描目录不存在或不是目录: {scan_path}"}],
