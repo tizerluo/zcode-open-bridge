@@ -88,7 +88,7 @@ loginctl enable-linger "$USER"
 | `state_file` | `~/.local/state/zcode-review-gate/state.json` | 状态文件（去重/退避） |
 | `clone_root` | `~/.local/state/zcode-review-gate/clones` | 仓库 clone 存放目录 |
 | `mcp_server` | `zcode-mcp-server` | bridge mcp-server 可执行名/路径（须支持 `--call`） |
-| `github_api` | `https://api.github.com` | GitHub API base（企业版可改） |
+| `github_api` | `https://api.github.com` | GitHub API base（企业版可改）。clone 的 web 宿主按惯例推导：`api.github.com`→`github.com`，`<host>/api/v3`→`<host>`（GHE），其他形态回退 `github.com` |
 | `review.depth` | `deep` | 审查深度：`normal`（快扫）/ `deep`（含业务逻辑投研） |
 | `review.focus` | `""` | 额外审查重点（透传给 zcode prompt） |
 | `retry.base_seconds` | `300` | 退避基数：失败后 `base * 2^(attempts-1)` |
@@ -137,10 +137,18 @@ zcode-review-gate --once --log-level DEBUG
 ```
 
 state 文件（默认 `~/.local/state/zcode-review-gate/state.json`）记录每个 PR 的
-审查状态：`head_sha` / `status`（`reviewed|failed|gave_up`）/ `verdict` /
+审查状态：`head_sha` / `status` / `verdict` / `counts` / `report` /
 `attempts` / `next_retry_at` / `comment_url` / `error`。
+`status ∈ pending|reviewed|failed|comment_failed|gave_up`：`pending` 是
+一轮处理中的瞬态；`comment_failed` 表示审查已成功但评论没发出去——此时
+`report`/`verdict`/`counts` 已缓存，重试时同 head **只补评论不重跑审查**；
+`reviewed` 后 `report` 缓存清空。
 **想强制重审某个 PR：删掉对应条目**（或把 PR 推一个新 commit，head 变化会
 自动复活重审）。
+
+deep 档审查耗时长：gate 起审查子进程时已自动透传
+`ZCODE_BRIDGE_REVIEW_TIMEOUT=3600`（= 自身等子进程的超时），mcp-server
+侧不会以默认 300s 提前掐断 zcode。
 
 ## 限制
 
@@ -153,8 +161,9 @@ state 文件（默认 `~/.local/state/zcode-review-gate/state.json`）记录每�
   跨进程文件锁兜底（多实例同时跑也不会并发打爆 zcode 限流）。
 - **fork PR**：走 `refs/pull/{n}/head` 拉取，无需加 fork 远端；
   审查的是 PR head 快照本身。
-- token 不落盘：只经 `git -c http.extraHeader` 进程内注入，clone URL /
-  git config / state 文件里都不会有 token。
+- token 不落盘：经 git≥2.31 的 `GIT_CONFIG_COUNT/KEY/VALUE` 环境变量逐
+  命令注入 `http.extraHeader`（env 只对本用户可见，优于 argv），
+  clone URL / git config / state 文件里都不会有 token。
 
 ## 测试
 

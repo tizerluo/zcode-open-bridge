@@ -44,6 +44,28 @@ class TestMcpCall(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("未知 tool", p.stderr)
 
+    def test_missing_args_exit_1(self):
+        """--call 只给 tool 名不给 json (或全缺) → 用法错误 exit 1"""
+        p = _run_call("get_zcode_capabilities")
+        self.assertEqual(p.returncode, 1)
+
+    def test_handler_exception_exit_1(self):
+        """handler 抛异常 → exit 1 且 stdout 是 ok:false 的合法 JSON。
+
+        真实异常路径 (非 mock): agent-help 二进制不存在时
+        tool_get_zcode_capabilities 里的 subprocess.run 抛 FileNotFoundError。
+        """
+        env = dict(os.environ)
+        env["ZCODE_AGENT_HELP_BIN"] = "/nonexistent-agent-help-xyz"
+        p = subprocess.run(
+            [sys.executable, MCP_PATH, "--call", "get_zcode_capabilities", "{}"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        self.assertEqual(p.returncode, 1)
+        data = json.loads(p.stdout)
+        self.assertFalse(data["ok"])
+        self.assertIn("error", data)
+
     def test_bad_json_exit_1(self):
         p = _run_call("zcode_pr_review", "not-json{")
         self.assertEqual(p.returncode, 1)

@@ -27,6 +27,10 @@ Type=simple
 ExecStart=%h/.local/bin/zcode-review-gate --config %h/.config/zcode-review-gate/config.json
 Restart=on-failure
 RestartSec=30
+# 长审查中的 stop: SIGTERM 后主循环在本轮边界退出, 给 mcp-server/zcode
+# 子进程留收敛时间; 超时仍 SIGKILL — 万一撞 ReviewFileLock 残锁,
+# mcp-server 侧 300s 锁超时兜底, 不会死锁。
+TimeoutStopSec=120
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

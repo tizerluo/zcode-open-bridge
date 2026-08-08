@@ -202,11 +202,11 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 
 ### Review gate（`zcode-review-gate`）
 
-PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮询配置仓库的 open PR，对每个新 head sha 经 `zcode-mcp-server --call zcode_pr_review` 完成审查（锁/重试/只读护栏全部复用 bridge 同源路径），把带 verdict（✅ pass / ⚠️ concerns）的结果回贴为 PR 评论。同一 head sha 不重复审（state 文件去重），失败按指数退避重试，head 更新自动复活重审。token 不落盘（只经 `git -c http.extraHeader` 进程内注入）。公开、通用，任何 GitHub 仓库可用。
+PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮询配置仓库的 open PR，对每个新 head sha 经 `zcode-mcp-server --call zcode_pr_review` 完成审查（锁/重试/只读护栏全部复用 bridge 同源路径），把带 verdict（✅ pass / ⚠️ concerns）的结果回贴为 PR 评论。同一 head sha 不重复审（state 文件去重），失败按指数退避重试，head 更新自动复活重审。token 不落盘（经 git≥2.31 的 `GIT_CONFIG_*` 环境变量进程内注入，不进 argv）。公开、通用，任何 GitHub 仓库可用。
 
 安装、配置参考、systemd 部署与运维详见 [packages/review-gate/README.md](packages/review-gate/README.md)。
 
-> 配套能力：mcp-server 新增 `--call TOOL '<json>'` 一次性调用模式（脚本化入口，exit 0/1/2 分别对应 成功/用法错误/tool 执行失败），stdio 模式行为不变。
+> 配套能力：mcp-server 新增 `--call TOOL '<json>'` 一次性调用模式（脚本化入口，exit 0/1/2 分别对应 成功 / 用法错误或 handler 异常 / tool 执行失败），stdio 模式行为不变。
 
 ## 会话存储
 
