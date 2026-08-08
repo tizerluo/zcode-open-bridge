@@ -338,10 +338,12 @@ MCP server 暴露三个标准 MCP tool，供 Claude Code / Cursor 等 MCP client
 
 ### `zcode_security_review` 参数
 - `path`：要扫描审查的项目目录（默认当前目录）
+- `depth`：`normal`（默认，同步快扫秒级）/ `deep`（含业务逻辑投研，异步 start/status 管线，400 文件项目 ~13s）
+- `focus_files`：可选，仅 deep：优先复核的项目内文件（如本次改动的文件）。**是优先级提示不是过滤器**，静态引擎仍全量扫
 - `focus`：可选，额外审查重点（如 "重点关注注入与鉴权"）
 - `cwd`：zcode 工作目录（默认与 path 相同）
 
-> 两阶段流程：① mimosa `security_scan`（确定性规则引擎，零 LLM 流量）全仓快扫出 findings；② findings 作 `--attach` 附件喂 zcode 逐条核实（确认漏洞/误报/存疑 + 攻击路径 + 修复建议），并可发现清单之外的问题。mimosa 定位：`ZCODE_BRIDGE_MIMOSA_ROOT` 优先，否则探测 `~/.local/share/mimosa/*` 与 `~/.zcode/cli/plugins/cache/*/mimosa/*`；扫描超时 `ZCODE_BRIDGE_MIMOSA_TIMEOUT`（默认 180s）。
+> 两阶段流程：① mimosa 扫描（确定性规则引擎，零 LLM 流量零网络）出 findings；② findings 作 `--attach` 附件喂 zcode 逐条核实（确认漏洞/误报/存疑 + 攻击路径 + 修复建议），并可发现清单之外的问题。mimosa 定位：`ZCODE_BRIDGE_MIMOSA_ROOT` 优先，否则探测 `~/.local/share/mimosa/*` 与 `~/.zcode/cli/plugins/cache/*/mimosa/*`；超时 env：normal 档 `ZCODE_BRIDGE_MIMOSA_TIMEOUT`（默认 180s），deep 档 `ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT`（默认 900s）+ 轮询间隔 `ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL`（默认 2s）。
 
 ---
 

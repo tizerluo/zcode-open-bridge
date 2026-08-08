@@ -521,7 +521,7 @@ ECOSYSTEM = {
             "tools_exposed": [
                 {"name": "get_zcode_capabilities", "description": "返回 zcode 能力清单 (调 agent-help)"},
                 {"name": "zcode_review", "description": "调 zcode 审查代码 (yolo+写工具物理禁用: 免授权只读)"},
-                {"name": "zcode_security_review", "description": "mimosa 规则引擎预扫 + zcode 只读复核 (安全专项)"},
+                {"name": "zcode_security_review", "description": "mimosa 预扫 (normal 快扫/deep 业务逻辑深扫) + zcode 只读复核 (安全专项)"},
             ],
             "config": "~/.zcode/cli/config.json 的 mcp.servers.zcode-mcp",
             "use_case": "让 MCP client (zcode 自身/Claude Code/Cursor) 标准化调用 zcode",
