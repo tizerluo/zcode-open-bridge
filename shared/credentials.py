@@ -11,8 +11,12 @@ shared/credentials.py — ZCode 凭证动态读取 (单一真相源)
 
 设计说明:
   为了保持"单文件可独立运行"的特性 (用户复制一个文件就能用),
-  mcp-server 和 acp-bridge 各自内嵌了一份本逻辑的副本 (标注"源自此处")。
-  本文件是权威实现; 修改凭证逻辑时, 请同步更新两处副本。
+  mcp-server、acp-bridge 和 agent-help 各自内嵌了一份本逻辑的副本 (标注"源自此处")。
+  本文件是权威实现; 修改凭证逻辑时, 请同步更新三处副本 (整体 review P1-2):
+    packages/mcp-server/zcode-mcp-server  (load_zcode_credentials / _merge_env_with_creds)
+    packages/acp-bridge/zcode-acp-bridge  (load_zcode_credentials / _merge_env_with_creds)
+    packages/agent-help/zcode-agent-help  (_load_creds_internal / _safe_host)
+  tests/test_credentials.py 的 C11/C12 同步测试会断言副本与权威版行为一致。
 
 用法:
   from shared.credentials import load_zcode_credentials, merge_env_with_creds
@@ -194,6 +198,7 @@ if __name__ == "__main__":
         print(f"  ZCODE_MODEL:    {creds.get('ZCODE_MODEL')}")
         print(f"  ZCODE_BASE_URL: {creds.get('ZCODE_BASE_URL')}")
         key = creds.get("ANTHROPIC_API_KEY", "")
-        print(f"  ANTHROPIC_API_KEY: {key[:8]}...{key[-4:]}" if len(key) > 12 else "  (短或空)")
+        # 脱敏位数与 zcode-agent-help._mask_key 对齐 (统一前 4 后 4, 整体 review P2-5)
+        print(f"  ANTHROPIC_API_KEY: {key[:4]}...{key[-4:]}" if len(key) > 12 else "  (短或空)")
     else:
         print(f"❌ 未从 {ZCODE_CREDS_PATH} 读取到凭证")

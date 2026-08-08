@@ -22,10 +22,12 @@ import json
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 # zcode-agent-help 的路径 (能力发现的数据源)
 # 优先解析仓库相邻路径 (../agent-help/zcode-agent-help), 让"从仓库直接运行"读到同版本;
@@ -93,6 +95,22 @@ def load_zcode_credentials():
     return {}
 
 
+def _safe_host(url):
+    """提取 URL 的 host (scheme://host[:port]), 解析失败返回 None。
+
+    与 shared/credentials.py._safe_host 权威版逐字对齐 (整体 review P2-3):
+    有 netloc 但缺 scheme (如 protocol-relative //host/path) 时补 https://,
+    内嵌旧副本此时返回 None, 会让残留检测静默跳过。
+    """
+    try:
+        p = urlparse(url)
+        if not p.hostname:
+            return None
+        return f"{p.scheme}://{p.netloc}" if p.scheme else f"https://{p.netloc}"
+    except Exception:
+        return None
+
+
 def _merge_env_with_creds(creds):
     """合并 config 凭证与环境变量: 显式非空 env 优先, 空串视为未设置;
     且自动检测/自愈 App 注入的残留 baseURL (issue #3)。
@@ -112,23 +130,17 @@ def _merge_env_with_creds(creds):
     if env_bu and config_bu and env_bu != config_bu:
         all_hosts = set()
         try:
-            from urllib.parse import urlparse as _up
             _cfg_path = Path.home() / ".zcode" / "v2" / "config.json"
             with open(_cfg_path) as _f:
                 _cfg = json.load(_f)
             for _p in _cfg.get("provider", {}).values():
                 _bu = _p.get("options", {}).get("baseURL", "")
                 if _bu:
-                    try:
-                        _h = _up(_bu)
-                        if _h.hostname:
-                            all_hosts.add(f"{_h.scheme}://{_h.netloc}" if _h.scheme else _h.netloc)
-                    except Exception:
-                        pass
-            _eh = _up(env_bu)
-            env_host = f"{_eh.scheme}://{_eh.netloc}" if (_eh.scheme and _eh.hostname) else None
-            _ch = _up(config_bu)
-            config_host = f"{_ch.scheme}://{_ch.netloc}" if (_ch.scheme and _ch.hostname) else None
+                    _h = _safe_host(_bu)  # 与权威版同用 _safe_host (P2-3)
+                    if _h:
+                        all_hosts.add(_h)
+            env_host = _safe_host(env_bu)
+            config_host = _safe_host(config_bu)
         except Exception:
             env_host = config_host = None
         if env_host and config_host and env_host != config_host and env_host in all_hosts:
@@ -160,9 +172,11 @@ def _parse_provider_error(text):
 
     # 配额耗尽 (不可短期重试) — 用精确的 quota/credit/配额 词, 不用模糊的 exceeded.*limit
     # (会误吃 "rate limit exceeded")。中文收紧为带限定词。Codex review P1#2。
+    # insufficient 一条与权威版对齐 (整体 review P1-4: 拆成 credit/balance 两条
+    # 漏了 "insufficient quota" 形态, 副本漂移未同步)
     quota_pats = [r"\bquota\b", r"配额(不足|耗尽|用完|超限)",
                   r"额度(不足|耗尽|用完)", r"余额不足",
-                  r"insufficient.*credit", r"insufficient.*balance", r"\bcredit\b.*exhaust"]
+                  r"insufficient.*(quota|credit|balance)", r"\bcredit\b.*exhaust"]
     if any(re.search(p, lower) for p in quota_pats):
         return {"is_rate_limit": False, "is_quota": True, "retry_after_sec": retry_after, "error_kind": "quota"}
 
@@ -321,6 +335,12 @@ class MimosaMcpClient:
         server_js = Path(root) / "payload" / "dist" / "mcp" / "server.js"
         if not server_js.exists():
             raise FileNotFoundError(f"mimosa MCP server 不存在: {server_js}")
+        # 整体 review P2-6: 提前检查 node, 缺则给明确提示 (否则 Popen 抛
+        # 裸 FileNotFoundError, 被上层包成"mimosa 扫描失败", 排查困难)
+        if not shutil.which("node"):
+            raise FileNotFoundError(
+                "未找到 node 可执行文件, 请先安装 Node.js "
+                "(mimosa MCP server 依赖 node 运行)")
         env = dict(os.environ)
         env["ZCODE_PLUGIN_ROOT"] = str(root)
         env.setdefault("MIMOSA_ENGINE", "native")
@@ -333,6 +353,13 @@ class MimosaMcpClient:
         self._id = 0
 
     def _send(self, msg):
+        # 写超时 (整体 review P1-1, 与 _recv 对称): server 卡住不读 stdin 时,
+        # pipe 缓冲写满后裸 write 会永久阻塞, 且无上层超时可打断 → 先 select
+        # 查可写性, 超时抛 TimeoutError
+        fd = self._proc.stdin.fileno()
+        _, writable, _ = select.select([], [fd], [], self.timeout)
+        if not writable:
+            raise TimeoutError(f"mimosa MCP 写入超时 ({self.timeout}s)")
         self._proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
         self._proc.stdin.flush()
 
@@ -414,7 +441,11 @@ def _read_mimosa_findings(scan_dir_str):
         if not (resolved_root in real_file.parents or real_file.parent == resolved_root):
             log(f"⚠ findings.json 解析后越界 (疑似 symlink), 跳过回读: {real_file}")
             return []
-        with open(real_file) as f:
+        # O_NOFOLLOW (整体 review P2-1): 关掉 resolve 与 open 之间的 TOCTOU 窗口
+        # — 检查后目标文件被替换成 symlink 时 open 直接失败; 静态 symlink 仍由
+        # 上面的 resolve 越界检查拦截, 两者互补。
+        fd = os.open(real_file, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
             return json.load(f).get("findings", [])
     except Exception as e:
         log(f"⚠ findings.json 读取失败 ({e}), 仅用摘要文本")
@@ -484,7 +515,10 @@ def _mimosa_deep_scan(root, scan_path, focus_files=None):
     """
     timeout = max(60, _env_int("ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT", 900, maximum=7200))
     poll = max(1, _env_int("ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL", 2, maximum=60))
-    client = MimosaMcpClient(root, cwd=scan_path, timeout=120)
+    # 单次一问一答 (recv/send) 超时独立可配 (整体 review P2-4: 原先硬编码 120,
+    # 大项目 mimosa GC 卡顿偶超 120s 会白累计 status 超时计数)
+    recv_timeout = max(1, _env_int("ZCODE_BRIDGE_MIMOSA_RECV_TIMEOUT", 120, maximum=600))
+    client = MimosaMcpClient(root, cwd=scan_path, timeout=recv_timeout)
     job_id = None
     terminal = False  # 到达终态 (completed/failed/cancelled) 则 finally 不再 cancel
     status_timeouts = 0
@@ -581,11 +615,15 @@ def _compact_findings(findings):
 # ============================================================
 # PR 审查: git diff 计算 + base 自动探测
 # ============================================================
-def _git(repo, *git_args):
-    """跑 git 子命令, 返回 (returncode, stdout, stderr)。不抛异常, 调用方判。"""
+def _git(repo, *git_args, timeout=15):
+    """跑 git 子命令, 返回 (returncode, stdout, stderr)。不抛异常, 调用方判。
+
+    timeout 分档 (整体 review P2-6): 元数据类 (rev-parse/symbolic-ref) 15s 充裕;
+    diff 类在超大仓/慢磁盘下可能超 30s, 由 _pr_diff 传 timeout=60。
+    """
     try:
         r = subprocess.run(["git", "-C", repo, *git_args],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return 128, "", str(e)
@@ -616,11 +654,12 @@ def _pr_diff(repo, base, head):
     """
     range_spec = f"{base}...{head}"
     rc, files_out, err = _git(repo, "diff", "--name-only", "--end-of-options",
-                              range_spec, "--")
+                              range_spec, "--", timeout=60)
     if rc != 0:
         raise RuntimeError(f"git diff {range_spec} 失败: {err.strip()[:200]}")
     changed = [ln.strip() for ln in files_out.splitlines() if ln.strip()]
-    rc, diff_text, err = _git(repo, "diff", "--end-of-options", range_spec, "--")
+    rc, diff_text, err = _git(repo, "diff", "--end-of-options", range_spec, "--",
+                              timeout=60)
     if rc != 0:
         raise RuntimeError(f"git diff {range_spec} 失败: {err.strip()[:200]}")
     return changed, diff_text
@@ -838,14 +877,29 @@ def tool_get_zcode_capabilities(args):
     return {"content": [{"type": "text", "text": result.stdout}]}
 
 
+def _parse_result_json(output):
+    """从 zcode --json stdout 解析结果 JSON, 返回 dict 或 None。
+
+    容忍前置非 JSON 行 (实测 zcode 会先打 "AI SDK Warning System" 等警告
+    再输出 JSON) 与尾随杂项; 逐个 "{" 位置尝试 raw_decode。
+    """
+    text = (output or "").strip()
+    start = text.find("{")
+    decoder = json.JSONDecoder()
+    while start != -1:
+        try:
+            data, _end = decoder.raw_decode(text[start:])
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            start = text.find("{", start + 1)
+    return None
+
+
 def _extract_response(output):
-    """--json 模式下 zcode stdout 是 JSON, 提取 response 字段; 解析失败原样返回。"""
-    try:
-        data = json.loads((output or "").strip())
-        if isinstance(data, dict) and isinstance(data.get("response"), str):
-            return data["response"]
-    except (json.JSONDecodeError, ValueError):
-        pass
+    """--json 模式下提取 zcode stdout 的 response 字段; 无法识别时原样返回。"""
+    data = _parse_result_json(output)
+    if data is not None and isinstance(data.get("response"), str):
+        return data["response"]
     return output
 
 
@@ -884,7 +938,18 @@ def _run_zcode_headless(cmd, env, timeout):
                     # 成限流而白重试, 甚至把成功结果截断成报错)。zcode headless 错误
                     # 常在 stderr (APICallError 堆栈), stdout 是审查结论正文。
                     err_info = _parse_provider_error(result.stderr or "")
-                    has_error = result.returncode != 0 or (result.stderr and err_info["error_kind"] != "unknown")
+                    # has_error 判定 (整体 review P1-1 + 复审 P1-A): stderr 匹配
+                    # 错误关键词时, 仅当 stdout 不是合法 --json 结果才判错误。
+                    # zcode 常往 stderr 打 Node deprecation 警告, 恰好含 "Unauthorized"
+                    # 等词时会误杀成功调用; 但"stdout 非空"也可能是错误回显文本,
+                    # 所以判据是"能否解析出 response 结果"而非"非空"。
+                    stderr_matches = bool(result.stderr) \
+                        and err_info["error_kind"] != "unknown"
+                    has_error = result.returncode != 0 or (
+                        stderr_matches and _parse_result_json(output) is None)
+                    if stderr_matches and not has_error and result.returncode == 0:
+                        log(f"⚠ stderr 含 {err_info['error_kind']} 关键词但 stdout "
+                            "是合法结果, 按成功处理 (便于事后排查边界)")
 
                     if has_error and err_info["is_rate_limit"] and attempt < max_retries:
                         # 限流 → 退避后重试 (优先用 retry-after, 否则指数 + jitter)
@@ -902,8 +967,18 @@ def _run_zcode_headless(cmd, env, timeout):
                         return {"content": [{"type": "text",
                                              "text": f"zcode 调用失败{suffix}: {err_text[:500]}"}],
                                 "isError": True}
-                    # 成功 (--json 输出提取 response; 非 JSON 原样返回)
-                    return {"content": [{"type": "text", "text": _extract_response(output)}]}
+                    # 成功: 先提取 response 再截断 (复审 P2-1: 先截断会破坏
+                    # JSON 结构导致提取失败)。体积上限 ZCODE_BRIDGE_MAX_OUTPUT
+                    # (整体 review P2-1): 超大审查/verbose 输出可达几十 MB。
+                    text = _extract_response(output)
+                    max_output = max(10_000, _env_int(
+                        "ZCODE_BRIDGE_MAX_OUTPUT", 10_000_000, maximum=100_000_000))
+                    if len(text) > max_output:
+                        log(f"⚠ zcode 输出超上限 ({len(text)} > {max_output} 字符), 截断")
+                        text = text[:max_output] + (
+                            f"\n\n[... 输出超 {max_output} 字符已截断; "
+                            "超大审查建议拆分文件分批进行 ...]")
+                    return {"content": [{"type": "text", "text": text}]}
 
                 except subprocess.TimeoutExpired:
                     return {"content": [{"type": "text", "text": f"zcode review 超时 ({timeout}s)"}],
@@ -949,6 +1024,37 @@ def tool_zcode_review(args):
     code = args.get("code")
     focus = _clamp_focus(args.get("focus")) or "全面审查: 安全、正确性、可维护性"
     cwd = args.get("cwd")
+
+    # files 来自 MCP client (信任边界外): 类型校验 + 200 上限 (整体 review P1-2:
+    # 无上限时上万个路径拼 argv 会撞 ARG_MAX; 与 focus_files 的处理对齐)
+    if not isinstance(files, list):
+        return {"content": [{"type": "text",
+                             "text": "files 必须是字符串数组"}],
+                "isError": True}
+    if len(files) > 200:
+        log(f"⚠ files 超上限 ({len(files)} > 200), 截断")
+        files = files[:200]
+    # 元素级过滤: 非字符串元素丢弃 (复审 P2-3: argv 含非 str 会抛 TypeError)
+    valid_files = [f for f in files if isinstance(f, str)]
+    if len(valid_files) != len(files):
+        log(f"⚠ files 丢弃 {len(files) - len(valid_files)} 个非字符串元素")
+    files = valid_files
+
+    # code 体积上限 (整体 review P1-3: 无上限时超大内联代码造成磁盘/内存放大;
+    # 与 PR diff 的 ZCODE_BRIDGE_PR_DIFF_MAX 防护对称)
+    if code:
+        code_max = max(10_000, _env_int("ZCODE_BRIDGE_CODE_MAX", 500_000,
+                                        maximum=5_000_000))
+        code_bytes = code.encode("utf-8")
+        if len(code_bytes) > code_max:
+            log(f"⚠ code 超上限 ({len(code_bytes)} > {code_max} 字节), 截断")
+            cut = code_bytes[:code_max]
+            nl = cut.rfind(b"\n")  # 退到完整行, 防半行误导; 容错解码防多字节切半
+            if nl > 0:
+                cut = cut[:nl]
+            code = cut.decode("utf-8", errors="ignore") + (
+                f"\n\n[... code 超 {code_max} 字节已截断; "
+                "超大代码建议改用 files 传文件路径 ...]")
 
     # 构造 prompt — "只审不修"职责钉死在文本层, 写工具在工具集层物理禁用,
     # 双保险防 "审着审着顺手改了" (plan→build 惯性, 2026-08-08 重构动因)。
@@ -1349,8 +1455,10 @@ def handle_modern_request(req):
             # isError 也是 complete (工具执行错误走 isError, 非协议错误)
             return make_response(msg_id, _modern_result(result))
         except Exception as e:
+            # 整体 review P1-5: str(e) 可能含内部路径/用户名, 不外泄给 client,
+            # 详细错误只走 log (stderr)
             log(f"tool {tool_name} 异常: {e}")
-            return make_error(msg_id, -32603, f"tool 执行异常: {e}")
+            return make_error(msg_id, -32603, "内部错误, 详见服务端日志")
 
     if method is not None:
         return make_error(msg_id, -32601, f"未知 method: {method}")
@@ -1403,8 +1511,10 @@ def handle_request(req):
             result = TOOL_HANDLERS[tool_name](arguments)
             return make_response(msg_id, result)
         except Exception as e:
+            # 整体 review P1-5: str(e) 可能含内部路径/用户名, 不外泄给 client,
+            # 详细错误只走 log (stderr)
             log(f"tool {tool_name} 异常: {e}")
-            return make_error(msg_id, -32603, f"tool 执行异常: {e}")
+            return make_error(msg_id, -32603, "内部错误, 详见服务端日志")
 
     # 未知方法
     if method is not None:
@@ -1434,9 +1544,10 @@ def main():
         # ≥2025-06-18 的 server 必须拒绝) 和其他非 dict 形态, 统一 -32600。
         if not isinstance(req, dict):
             log("收到非 JSON-RPC 对象消息 (batch?), 拒绝")
-            send_message(make_error(
-                None, -32600,
-                "Invalid Request: 仅接受单个 JSON-RPC 对象"))
+            err = make_error(None, -32600, "Invalid Request: 仅接受单个 JSON-RPC 对象")
+            # batch 输入按 JSON-RPC 规范回 batch 数组 (整体 review P2-5);
+            # 其他裸值仍回单个 error 对象
+            send_message([err] if isinstance(req, list) else err)
             continue
 
         # ---- 纪元路由 (dual-era, 逐请求判定, 无会话状态) ----
@@ -1463,8 +1574,9 @@ def main():
             if resp is not None:
                 send_message(resp)
         except Exception as e:
+            # 整体 review P1-5: 同 tools/call 兜底, 不外泄内部细节
             log(f"处理请求异常: {e}")
-            send_message(make_error(req.get("id"), -32603, str(e)))
+            send_message(make_error(req.get("id"), -32603, "内部错误, 详见服务端日志"))
 
     log("stdin 关闭, 退出")
 

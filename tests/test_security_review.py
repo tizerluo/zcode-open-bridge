@@ -72,6 +72,8 @@ class _EnvGuard(unittest.TestCase):
                 "ZCODE_BRIDGE_REVIEW_TIMEOUT", "ZCODE_BRIDGE_MIMOSA_SCAN_ROOT",
                 "ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT",
                 "ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL",
+                "ZCODE_BRIDGE_MIMOSA_RECV_TIMEOUT",
+                "ZCODE_BRIDGE_CODE_MAX", "ZCODE_BRIDGE_MAX_OUTPUT",
                 "ZCODE_BRIDGE_PR_DIFF_MAX")
 
     def setUp(self):
@@ -148,6 +150,63 @@ class TestReviewCmd(_EnvGuard):
         self.assertEqual(mod._review_timeout(), 60)
         os.environ["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = "1"  # clamp 下限 30
         self.assertEqual(mod._review_timeout(), 30)
+
+    def test_rc5_files_capped_at_200(self):
+        """RC5: files 超 200 → 截断 (整体 review P1-2: 防 argv 撞 ARG_MAX)"""
+        cmd, result = self._capture_cmd(
+            files=[f"f{i}.py" for i in range(250)])
+        self.assertNotIn("isError", result)
+        attaches = [cmd[i + 1] for i, v in enumerate(cmd)
+                    if v == "--attach" and i + 1 < len(cmd)]
+        # 200 个 files + 1 个 code 临时文件 (_capture_cmd 默认带 code)
+        self.assertEqual(len(attaches), 201)
+        self.assertIn("f199.py", attaches)
+        self.assertNotIn("f200.py", attaches, "第 201 个起应被截断")
+
+    def test_rc6_files_must_be_list(self):
+        """RC6: files 传字符串 → 明确拒绝 (与 focus_files 对齐;
+        否则 list("app.py") 静默炸成单字符列表)"""
+        mod = self.mod
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        called = {"n": 0}
+        saved = mod.subprocess.run
+
+        def fake_run(*a, **kw):
+            called["n"] += 1
+            return _FakeCompletedProcess(0, "OK", "")
+
+        mod.subprocess.run = fake_run
+        try:
+            result = mod.tool_zcode_review({"files": "app.py"})
+        finally:
+            mod.subprocess.run = saved
+        self.assertTrue(result.get("isError"))
+        self.assertIn("files", result["content"][0]["text"])
+        self.assertEqual(called["n"], 0, "非法 files 不应到达 zcode")
+
+    def test_rc7_code_size_cap_truncated(self):
+        """RC7: code 超 ZCODE_BRIDGE_CODE_MAX → 截断 + 标注 (整体 review P1-3)"""
+        mod = self.mod
+        os.environ["ZCODE_BRIDGE_CODE_MAX"] = "10000"
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        captured = {}
+
+        def fake_run(cmd, *a, **kw):
+            # 临时文件在 finally 才清理, fake_run 内还能读到
+            p = cmd[cmd.index("--attach") + 1]
+            with open(p) as f:
+                captured["content"] = f.read()
+            return _FakeCompletedProcess(0, "OK", "")
+
+        saved = mod.subprocess.run
+        mod.subprocess.run = fake_run
+        try:
+            result = mod.tool_zcode_review({"code": "x" * 20000})
+        finally:
+            mod.subprocess.run = saved
+        self.assertNotIn("isError", result)
+        self.assertIn("已截断", captured["content"])
+        self.assertLess(len(captured["content"]), 11000, "截断后应在上限附近")
 
 
 class TestExtractResponse(unittest.TestCase):
@@ -247,6 +306,86 @@ class TestMimosaMcpClient(_EnvGuard):
         client = self._make_client()
         client.close()
         client.close()
+
+    def test_mc2_send_write_timeout(self):
+        """MC2: stdin 不可写超 select 超时 → TimeoutError (整体 review P1-1:
+        server 卡住不读 stdin 时裸 write 会永久阻塞)"""
+        mod = self.mod
+
+        class _FakeStdin:
+            def fileno(self):
+                return 1
+
+            def write(self, s):
+                raise AssertionError("不可写时不应真的 write")
+
+            def flush(self):
+                pass
+
+        class _FakeProc:
+            stdin = _FakeStdin()
+
+        client = object.__new__(mod.MimosaMcpClient)
+        client._proc = _FakeProc()
+        client.timeout = 5
+        saved = mod.select.select
+        mod.select.select = lambda r, w, x, t: ([], [], [])  # 永不可写
+        try:
+            with self.assertRaises(TimeoutError):
+                client._send({"jsonrpc": "2.0", "id": 1})
+        finally:
+            mod.select.select = saved
+
+    def test_mc3_send_writes_line_when_writable(self):
+        """MC3: 可写时正常写入单行 JSON (写超时不应影响正常路径)"""
+        mod = self.mod
+        buf = []
+
+        class _FakeStdin:
+            def fileno(self):
+                return 1
+
+            def write(self, s):
+                buf.append(s)
+
+            def flush(self):
+                pass
+
+        class _FakeProc:
+            stdin = _FakeStdin()
+
+        client = object.__new__(mod.MimosaMcpClient)
+        client._proc = _FakeProc()
+        client.timeout = 5
+        saved = mod.select.select
+        mod.select.select = lambda r, w, x, t: ([], [1], [])  # 立即可写
+        try:
+            client._send({"method": "ping", "备注": "中文"})
+        finally:
+            mod.select.select = saved
+        self.assertEqual(len(buf), 1)
+        self.assertTrue(buf[0].endswith("\n"))
+        self.assertEqual(json.loads(buf[0])["method"], "ping")
+        self.assertIn("备注", buf[0], "ensure_ascii=False 应保留中文")
+
+    def test_mc4_node_missing_clear_error(self):
+        """MC4: 系统无 node → __init__ 抛带安装提示的 FileNotFoundError
+        (整体 review P2-6: 否则裸 FileNotFoundError 被包成'扫描失败', 排查困难)"""
+        import tempfile
+        mod = self.mod
+        d = tempfile.mkdtemp(prefix="mimosa-root-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        os.makedirs(os.path.join(d, "payload", "dist", "mcp"))
+        open(os.path.join(d, "payload", "dist", "mcp", "server.js"), "w").close()
+        saved = mod.shutil.which
+        mod.shutil.which = lambda name: None
+        try:
+            with self.assertRaises(FileNotFoundError) as ctx:
+                mod.MimosaMcpClient(d, cwd="/tmp")
+        finally:
+            mod.shutil.which = saved
+        self.assertIn("node", str(ctx.exception))
+        self.assertIn("Node.js", str(ctx.exception))
 
 
 class _StubMimosaClient:
@@ -367,6 +506,38 @@ class TestMimosaQuickScan(_EnvGuard):
 
         body, findings = self._run_scan(SymlinkClient)
         self.assertEqual(findings, [], "symlink 指向根外的 findings.json 不应被读")
+
+    def test_ms2d_open_uses_nofollow(self):
+        """MS2d: 回读用 os.open + O_NOFOLLOW (整体 review P2-1: 关掉 resolve 与
+        open 之间的 TOCTOU 窗口 — 检查后目标被换成 symlink 时 open 直接失败)"""
+        import tempfile
+        scan_root = tempfile.mkdtemp(prefix="mimosa-scans-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(scan_root, ignore_errors=True))
+        scan_dir = os.path.join(scan_root, "project-x", "scan-1")
+        os.makedirs(scan_dir)
+        with open(os.path.join(scan_dir, "findings.json"), "w") as f:
+            json.dump({"findings": [{"severity": "high", "title": "t"}]}, f)
+        os.environ["ZCODE_BRIDGE_MIMOSA_SCAN_ROOT"] = scan_root
+
+        mod = self.mod
+        seen = {}
+        real_open = mod.os.open
+
+        def spy_open(path, flags, *a, **kw):
+            seen["flags"] = flags
+            return real_open(path, flags, *a, **kw)
+
+        class ScanDirClient(_StubMimosaClient):
+            response_text = f"**Mimosa**\n- scanDir: `{scan_dir}`\n- findings: 1"
+
+        mod.os.open = spy_open
+        try:
+            body, findings = self._run_scan(ScanDirClient)
+        finally:
+            mod.os.open = real_open
+        self.assertEqual(len(findings), 1, "真实文件仍应正常回读")
+        self.assertTrue(seen.get("flags", 0) & os.O_NOFOLLOW,
+                        "回读 open 应带 O_NOFOLLOW")
 
     def test_ms3_compact_projection(self):
         """MS3: _compact_findings 投影保留复核所需字段"""
@@ -718,6 +889,26 @@ class TestMimosaDeepScan(_EnvGuard):
             mod.MimosaMcpClient = saved_client
             mod.time.sleep = saved_sleep
 
+    def test_ds4_recv_timeout_env(self):
+        """DS4: deep client 单次一问一答超时读 ZCODE_BRIDGE_MIMOSA_RECV_TIMEOUT
+        (整体 review P2-4: 原硬编码 120; env 超 600 被 clamp)"""
+        def run_with(env_val):
+            captured = {}
+            stub, _ = _make_deep_stub(["completed"],
+                                      scan_dir=self._make_scan_dir())
+
+            class RecStub(stub):
+                def __init__(self, root, cwd, timeout=120):
+                    captured["timeout"] = timeout
+                    super().__init__(root, cwd, timeout=timeout)
+
+            os.environ["ZCODE_BRIDGE_MIMOSA_RECV_TIMEOUT"] = env_val
+            self._run_deep(RecStub)
+            return captured["timeout"]
+
+        self.assertEqual(run_with("42"), 42, "env=42 应透传")
+        self.assertEqual(run_with("9999"), 600, "env 超 600 应被 clamp")
+
 
 class TestSecurityReviewDepth(_EnvGuard):
     """tool_zcode_security_review 的 depth/focus_files 参数"""
@@ -1027,6 +1218,83 @@ class TestPrReview(_EnvGuard):
         attach_path = captured["cmd"][captured["cmd"].index("--attach") + 1]
         self.assertIn("zcode-pr-review-", attach_path)
         self.assertFalse(os.path.exists(attach_path), "PR 附件临时文件应被清理")
+
+
+class TestGitTimeouts(_EnvGuard):
+    """_git 超时分档 (整体 review P2-6): 元数据类 15s, diff 类 60s"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def test_gt0_metadata_15s_diff_60s(self):
+        """GT0: rev-parse 用默认 15s; _pr_diff 的两次 diff 都用 60s"""
+        mod = self.mod
+        seen = []
+
+        def fake_run(cmd, *a, **kw):
+            sub = cmd[3]  # ["git", "-C", repo, <sub>, ...]
+            seen.append((sub, kw.get("timeout")))
+            if sub == "diff" and "--name-only" in cmd:
+                return _FakeCompletedProcess(0, "a.py\n", "")
+            return _FakeCompletedProcess(0, "ok", "")
+
+        saved = mod.subprocess.run
+        mod.subprocess.run = fake_run
+        try:
+            mod._git("/r", "rev-parse", "--verify", "main")
+            mod._pr_diff("/r", "main", "HEAD")
+        finally:
+            mod.subprocess.run = saved
+        self.assertEqual(seen[0], ("rev-parse", 15), "元数据类默认 15s")
+        diff_timeouts = [t for sub, t in seen if sub == "diff"]
+        self.assertEqual(diff_timeouts, [60, 60], "diff 类应 60s")
+
+
+class TestEmbeddedCreds(_EnvGuard):
+    """内嵌凭证副本的 host 构造与 shared/credentials.py._safe_host 对齐
+    (整体 review P2-3: 有 netloc 缺 scheme 时补 https://, 旧副本返回 None)"""
+
+    ENV_KEYS = _EnvGuard.ENV_KEYS + ("ZCODE_BASE_URL", "HOME")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def test_sh0_safe_host_parity(self):
+        """SH0: _safe_host 三种形态与权威版一致"""
+        sh = self.mod._safe_host
+        self.assertEqual(sh("https://a.example.com/api"), "https://a.example.com")
+        self.assertEqual(sh("//b.example.com/api"), "https://b.example.com",
+                         "缺 scheme 有 netloc 应补 https://")
+        self.assertIsNone(sh("not-a-url/no-host"))
+        self.assertIsNone(sh(""))
+
+    def test_sh1_stale_env_base_url_healed(self):
+        """SH1: env 残留 baseURL (protocol-relative) → 自愈用 config 值;
+        修复前该形态 host 解析为 None, 残留检测静默跳过"""
+        import tempfile
+        mod = self.mod
+        home = tempfile.mkdtemp(prefix="zcode-home-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        cfg_dir = os.path.join(home, ".zcode", "v2")
+        os.makedirs(cfg_dir)
+        cfg = {"provider": {
+            "p-enabled": {"enabled": True,
+                          "options": {"baseURL": "https://enabled.example.com/api",
+                                      "apiKey": "k"},
+                          "models": {"GLM-5.2": {}}},
+            "p-old": {"enabled": False,
+                      "options": {"baseURL": "https://stale.example.com/api"},
+                      "models": {}},
+        }}
+        with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        os.environ["HOME"] = home  # Path.home() 走 HOME env
+        os.environ["ZCODE_BASE_URL"] = "//stale.example.com/api"  # 残留, 无 scheme
+        merged = mod._merge_env_with_creds(mod.load_zcode_credentials())
+        self.assertEqual(merged["ZCODE_BASE_URL"], "https://enabled.example.com/api",
+                         "残留 env baseURL 应被自愈为 enabled provider 的 config 值")
 
 
 if __name__ == "__main__":

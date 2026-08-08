@@ -60,20 +60,23 @@ ln -s /opt/ZCode/app/resources/glm/zcode.cjs ~/.local/bin/zcode
 zcode() {
   local cfg="$HOME/.zcode/v2/config.json"
   # 从配置文件动态读取凭证注入环境变量
+  # 值一律经 shlex.quote 转义后再交给 eval，防 config 值含 shell 元字符时命令注入
   eval "$(python3 -c "
-import json
+import json, shlex
 c=json.load(open('$cfg'))
 for k,v in c['provider'].items():
     if v.get('enabled'):
         o=v['options']
-        print(f'export ZCODE_MODEL=\"{next(iter(v.get(\"models\",{}))) or \"GLM-5.2\"}\"')
-        print(f'export ZCODE_BASE_URL=\"{o.get(\"baseURL\",\"\")}\"')
-        print(f'export ANTHROPIC_API_KEY=\"{o.get(\"apiKey\",\"\")}\"')
+        print('export ZCODE_MODEL=' + shlex.quote(next(iter(v.get('models',{}))) or 'GLM-5.2'))
+        print('export ZCODE_BASE_URL=' + shlex.quote(o.get('baseURL','')))
+        print('export ANTHROPIC_API_KEY=' + shlex.quote(o.get('apiKey','')))
         break
 ")"
   command zcode "$@"
 }
 ```
+
+> ⚠️ **安全说明**（整体 review 安全新发现 1）：`eval` + 未转义插值是危险模板——若 `config.json` 的值含 `"`、`` ` ``、`$` 等元字符会被 `eval` 执行，所以上面示例对每个值都做了 `shlex.quote`。更稳妥的做法是**不复用这段 shell 函数**，直接用本项目的 `shared/credentials.py`（三个组件已内置，纯 `json.load` 读 config，不走 eval/shell），或参考 `--print-injected-env` 诊断输出手动 export。
 
 ### 使用三个组件
 
@@ -115,6 +118,8 @@ zcode --prompt "继续" --resume sess_xxxx
 | `zcode_pr_review` | PR 审查模式：自动算 `git diff base...HEAD`（merge-base 语义，base 可自动探测）→ mimosa 全仓扫描且业务逻辑复核聚焦改动文件（focus_files）→ ZCode 出 PR 复核报告（P0/P1/P2 分级 + findings 核实 + 能否合并结论）。默认 `depth=deep`；diff 超 `ZCODE_BRIDGE_PR_DIFF_MAX`（默认 500KB）截断保清单 |
 
 > **只读原理（2026-08-08 重构，告别 `--mode plan`）**：review 体系不再用 plan 模式——plan 只禁「改文件」，读探索/子代理照样放行（限流超时主因），且 plan→build 的规划惯性容易让 review 变成「边审边修」。新方案用 `--mode yolo`（全程免授权）+ `--disallowed-tools` 把 `Write/Edit/MultiEdit/ApplyPatch/Bash` 连同 Node REPL 一族（`js` / `mcp__node_repl__js*`）一起禁掉：`--disallowed-tools` 是工具集级物理移除、先于权限层，yolo 也绕不过；Node REPL 一族必须同禁，否则可被 `execSync` 打穿 Bash 黑名单（0.16.1 实测复现）。读工具（Read/Grep/Glob）全开，不影响审查能力。prompt 层另有「只审不修」职责约束（不修改文件、不提议帮忙修复）作双保险。
+
+> **client 可信假设**：`zcode_review` 等 tool 的 `path`/`cwd`/`files` 参数**不做沙箱限制**（可让 ZCode 扫描本机任意目录）。本 server 是本地 stdio 桥，**假设 MCP client 可信**；若要用于远程/多租户部署，需自行在调用侧加路径白名单（整体 review P2 文档项）。
 
 ### ACP bridge（`zcode-acp-bridge`）
 
@@ -245,6 +250,10 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 | **provider 错误解析** | 识别 429 / 1302 / `Too Many Requests` / `请求过于频繁` / `retry-after`，区分限流/配额/其他 | — |
 | **有限重试 + 退避** | 仅对**限流**错误重试（配额/Unauthorized 不重试），退避用 retry-after 或指数退避（`2^n+1`） | `ZCODE_BRIDGE_MAX_RETRIES`（默认 3） |
 | **单次调用超时** | review 单次 zcode 调用超时 | `ZCODE_BRIDGE_REVIEW_TIMEOUT`（默认 300s，下限 30s） |
+| **code 参数体积上限** | `zcode_review` 的 `code` 参数超过上限即截断，防超大内联代码撑爆调用 | `ZCODE_BRIDGE_CODE_MAX`（默认 500KB） |
+| **zcode 输出体积上限** | zcode stdout 输出超过上限即截断 | `ZCODE_BRIDGE_MAX_OUTPUT`（默认 10MB） |
+
+> **内存峰值取舍**（整体 review P2-1）：zcode 子进程用 `capture_output` 全量缓冲输出，`ZCODE_BRIDGE_MAX_OUTPUT` 是**事后截断**——内存峰值仍约为完整输出的一倍（`text=True` 解码再翻一倍），上限（100MB）只是给失控场景兜底，不是流式背压。审查超大项目时建议拆分文件/目录分批调用，而不是把该值调大硬扛。
 
 注意：zcode 内部已有自己的指数退避重试（`_retryWithExponentialBackoff`），MCP 层的重试是补充，默认保守（max 3）。
 
@@ -257,6 +266,9 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 | `ZCODE_BRIDGE_MIMOSA_SCAN_ROOT` | findings 回读的信任根（默认 `~/.mimosa/security-scans`）：从 mimosa 摘要解析出的 scanDir 必须落在其下才回读 `findings.json`，越界降级为仅用摘要（防路径注入导致任意文件回读） |
 | `ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT` | depth=deep 异步扫描的总预算（默认 900s），超时会 best-effort cancel 后台 job |
 | `ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL` | depth=deep 的 status 轮询间隔（默认 2s） |
+| `ZCODE_BRIDGE_MIMOSA_RECV_TIMEOUT` | mimosa stdio 单次响应（一问一答）超时（默认 120s） |
+
+ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_DEFAULT_MODE` —— `session/new` 的默认权限模式，默认 `yolo`，可设 `build` 收紧（详见下方「重要限制」#7）。
 
 **depth 两档**（2026-08-08 接入，mimosa 1.0.3 实测）：
 
@@ -336,8 +348,9 @@ cp -r skills/zcode-bridge-guide ~/.zcode/skills/
 4. **diff 无内容**：ZCode 协议层不暴露 oldText/newText，只能列文件名。
 5. **GLM-5.2 无推理输出**：思考过程（agent_thought_chunk）在 GLM-5.2 下不触发，需 GLM-5-Turbo。
 6. **TUI 不可用**：0.16.1 起 CLI 帮助虽列出 `tui` 命令（无参数即进入 TUI），但独立终端实测仍报错（`Cannot find package '@zcode/tui'`），仅 headless 模式可用。
-7. **⚠️ ACP bridge 默认 `mode=yolo`（权限风险）**：为避免工具调用 turn 卡在权限确认，ACP bridge 的 `session/new` 强制以 `mode=yolo` 创建会话（见 `zcode-acp-bridge` 的 `_on_session_new`）。这意味着任意 prompt 都可能触发**无确认的文件修改和命令执行**。作为编辑器集成时请知悉此风险；如需更安全的 `build` 模式（带权限确认），需自行修改并实现 ACP↔ZCode 的 permission 转发（本项目 P4b 未实现）。
+7. **⚠️ ACP bridge 默认 `mode=yolo`（权限风险）**：为避免工具调用 turn 卡在权限确认，ACP bridge 的 `session/new` 强制以 `mode=yolo` 创建会话（见 `zcode-acp-bridge` 的 `_on_session_new`）。这意味着任意 prompt 都可能触发**无确认的文件修改和命令执行**。作为编辑器集成时请知悉此风险；现可用 `ZCODE_ACP_DEFAULT_MODE=build` 收紧默认值，且 bridge 启动日志（stderr）会对当前默认 mode 打显眼告警。更完整的方案是实现 ACP↔ZCode 的 permission 转发（本项目 P4b 未实现）。
 8. **⚠️ Provider 管理方法涉及 apiKey**：`workspace/upsertModelProvider`、`workspace/updateProviderRegistry` 的 `provider`/`registry` 参数会携带 `apiKey`（可能为 `{source:"inline", value:"sk-..."}` 明文）。ACP bridge 仅整体透传给 ZCode 后端、不读取也不在日志打印其明文；但调用方应自行确保传输通道（stdio）可信，并避免在日志中回显原始参数。
+9. **⚠️ 事件模式 turn 超时契约（2026-08-08 起）**：`session/prompt` 在事件模式下若 turn 已启动但 120s 未收到完成信号，返回 **JSON-RPC 错误 `-32603`（"事件流超时"）**，而**不是**正常 `stopReason=max_turn_requests`——后者只保留给"turn 从未启动"的场景。ACP client 侧应按此区分「卡死」与「真的太长」（整体 review P1 + 复审 P1-B 的契约变更）。
 
 ## 项目结构
 

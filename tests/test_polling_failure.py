@@ -24,6 +24,7 @@ zcode; prompt 全流程用线程限时兜底 (流程卡住时快速失败)。
 依赖: 仅 Python 标准库 + acp-bridge 模块
 """
 
+import json
 import os
 import threading
 import types
@@ -216,6 +217,70 @@ class TestPollingFailureDetection(unittest.TestCase):
                           if c["method"] == "session/subscribe")
         self.assertIn("deliveryKind", sub_params,
                       "subscribe 必传 deliveryKind (规格书 §4), 即使本次降级")
+
+    def test_pf4_dead_backend_poll_converges_early(self):
+        """PF4 (整体 review P1-3): 连续 20 次 poll 无响应且子进程已死 → 立即 -32603
+
+        此前 consecutive_none 只 log 不收敛, 子进程已死这种确定性故障会让调用方
+        空等耗满 120s 预算; 修复后超阈值探测 proc.poll(), 已死立即报错。
+        """
+        bridge = self._new_bridge({
+            # session/read 永远 error → projection 恒 None
+            "session/read": {"error": {"message": "connection reset"}},
+        })
+        # 子进程已退出 (poll() 返回退出码, 非 None)
+        bridge.backend.proc = types.SimpleNamespace(poll=lambda: 1)
+        resp = self._run_polling(bridge)
+        self.assertIn("error", resp)
+        self.assertEqual(resp["error"]["code"], -32603)
+        self.assertIn("已退出", resp["error"]["message"])
+        reads = bridge.backend.methods_called().count("session/read")
+        self.assertEqual(reads, 20,
+                         "应在第 20 次连续失败时探测到进程已死并提前收敛, 不等 120s")
+
+    def test_pf5_live_backend_no_early_converge(self):
+        """PF5 (P1-3 边界): 连续 poll 失败但子进程活着 → 不提前收敛, 走原语义"""
+        bridge = self._new_bridge({
+            "session/read": {"error": {"message": "timeout"}},
+        })
+        # 子进程活着 (poll() 返回 None): hang 而非死, 保持等满超时的原行为
+        bridge.backend.proc = types.SimpleNamespace(poll=lambda: None)
+        resp = self._run_polling(bridge)
+        self.assertIn("error", resp)
+        self.assertIn("未启动", resp["error"]["message"],
+                      "子进程活着时不提前收敛, 耗满 120s 后走「turn 未启动」原语义")
+
+    def test_pf6_fetch_last_reply_drains_inbox_cancel(self):
+        """PF6 (整体 review P1-6): _fetch_last_reply 重试间隙 drain inbox
+
+        兜底取回复最多 4 次重试 (间隔 sleep), 此前这期间不 drain, 到达的
+        session/cancel 会卡住; 修复后重试间隙 drain, cancel 可生效。
+        """
+        bridge = self._new_bridge({
+            # session/messages 始终 error → 走满 4 次重试
+            "session/messages": {"error": {"message": "boom"}},
+        })
+        zcode_sid = "sess_pf6"
+        bridge.session_map[zcode_sid] = zcode_sid
+        turn = {"zcode_sid": zcode_sid, "cancelled": False, "perms_responses": {}}
+        bridge.pending_turns[99] = turn
+        bridge._inbox.put(json.dumps({"method": "session/cancel",
+                                      "params": {"sessionId": zcode_sid}}))
+        out = bridge._fetch_last_reply(zcode_sid)
+        self.assertEqual(out, "", "始终 error → 重试耗尽返回空串")
+        self.assertTrue(turn["cancelled"], "重试间隙应 drain inbox 让 cancel 生效")
+
+    def test_pf7_fetch_last_reply_skips_nondict_message(self):
+        """PF7 (整体 review P2-9): messages 混入非 dict 元素 → 跳过不炸 (isinstance 守卫)"""
+        bridge = self._new_bridge({
+            "session/messages": {"result": {"messages": [
+                "garbage", 42,
+                {"info": {"role": "assistant"},
+                 "parts": [{"type": "text", "text": "最终回复"}]},
+            ]}},
+        })
+        out = bridge._fetch_last_reply("sess_pf7")
+        self.assertEqual(out, "最终回复", "非 dict 元素跳过, 照常取到最后回复")
 
 
 if __name__ == "__main__":

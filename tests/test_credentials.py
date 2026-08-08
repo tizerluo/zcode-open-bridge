@@ -18,14 +18,19 @@ test_credentials.py — 凭证读取与 env 优先级单测
 依赖: 仅 Python 标准库 + shared/credentials.py
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 from credentials import (  # noqa: E402
+    _safe_host,
     is_stale_env_base_url,
     load_zcode_credentials,
     merge_env_with_creds,
@@ -291,6 +296,273 @@ class TestCredentials(unittest.TestCase):
         c = {"ZCODE_BASE_URL": "https://api.z.ai/api/anthropic"}
         merged = merge_env_with_creds(c, {"ZCODE_BASE_URL": "https://self-hosted.test"})
         self.assertEqual(merged["ZCODE_BASE_URL"], "https://self-hosted.test")
+
+
+# ============================================================
+# C11/C12: 内嵌副本与 shared 权威版的同步测试 (整体 review P2-1)
+#   mcp-server / agent-help 为"单文件可独立运行"各内嵌了一份凭证逻辑副本,
+#   这里断言它们与 shared/credentials.py 权威实现在同一 fixture 上行为一致, 防漂移。
+# ============================================================
+MCP_SERVER_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "packages", "mcp-server", "zcode-mcp-server"
+)
+AGENT_HELP_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "packages", "agent-help", "zcode-agent-help"
+)
+
+_CRED_KEYS = ("ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY")
+
+
+def _load_single_file_module(path, name):
+    """exec 加载无后缀单文件组件 (去掉 __main__ 块), 与 test_mcp_protocol 同模式。"""
+    mod = types.ModuleType(name)
+    mod.__file__ = path
+    with open(path) as f:
+        code = f.read()
+    code_no_main = code.split('if __name__ == "__main__":')[0]
+    exec(code_no_main, mod.__dict__)
+    return mod
+
+
+def _isolated_env(test_case, home, **env):
+    """patch os.environ: 移除三个凭证 key + HOME 指向隔离目录, 叠加 env 指定值。"""
+    new = {k: v for k, v in os.environ.items() if k not in _CRED_KEYS}
+    new["HOME"] = home
+    new.update(env)
+    p = mock.patch.dict(os.environ, new, clear=True)
+    p.start()
+    test_case.addCleanup(p.stop)
+
+
+def _write_isolated_config(home, enabled_url="https://api.z.ai/api/anthropic",
+                           stale_url="https://zcode.z.ai/api/v1/zcode-plan/anthropic"):
+    """在隔离 HOME 里写两 provider 的 config (enabled + 一个 disabled 的 stale), 返回路径。"""
+    cfg_dir = os.path.join(home, ".zcode", "v2")
+    os.makedirs(cfg_dir, exist_ok=True)
+    cfg_path = os.path.join(cfg_dir, "config.json")
+    with open(cfg_path, "w") as f:
+        json.dump({
+            "provider": {
+                "builtin:zai-coding-plan": {
+                    "enabled": True,
+                    "options": {"baseURL": enabled_url, "apiKey": "sk-good-key-123456"},
+                    "models": {"GLM-5.2": {}},
+                },
+                "builtin:zai-start-plan": {
+                    "enabled": False,
+                    "options": {"baseURL": stale_url, "apiKey": "jwt-stale"},
+                    "models": {"GLM-5.2": {}},
+                },
+            }
+        }, f)
+    return cfg_path
+
+
+class TestMcpServerSync(unittest.TestCase):
+    """C11: mcp-server 内嵌副本 (load_zcode_credentials / _merge_env_with_creds)
+    与 shared 权威版行为一致 (整体 review P2-1)。
+
+    mcp-server 副本用 Path.home() 定位 config、直读 os.environ (均不接受参数),
+    故用 HOME 环境变量隔离 + patch os.environ 注入场景。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mcp = _load_single_file_module(MCP_SERVER_PATH, "zcode_mcp_server")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg_path = _write_isolated_config(self._tmp.name)
+        _isolated_env(self, self._tmp.name)  # 基线: 无凭证 env
+
+    def _assert_merge_parity(self, scenario):
+        """对拍: mcp 副本与权威版 merge 后, 三个凭证 key 完全一致。"""
+        mcp_merged = self.mcp._merge_env_with_creds(self.mcp.load_zcode_credentials())
+        ref_merged = merge_env_with_creds(
+            load_zcode_credentials(config_path=self.cfg_path),
+            dict(os.environ), config_path=self.cfg_path)
+        for k in _CRED_KEYS:
+            self.assertEqual(mcp_merged.get(k, ""), ref_merged.get(k, ""),
+                             f"{scenario}: {k} 在 mcp-server 副本与权威版间不一致")
+        return ref_merged
+
+    def test_c11a_load_parity(self):
+        """C11a: load_zcode_credentials 副本与权威版读同一 config 结果一致"""
+        self.assertEqual(self.mcp.load_zcode_credentials(),
+                         load_zcode_credentials(config_path=self.cfg_path))
+
+    def test_c11b_merge_no_env(self):
+        """C11b: 无凭证 env → 双份都用 config 值"""
+        merged = self._assert_merge_parity("无 env")
+        self.assertEqual(merged["ZCODE_MODEL"], "GLM-5.2")
+        self.assertEqual(merged["ZCODE_BASE_URL"], "https://api.z.ai/api/anthropic")
+
+    def test_c11c_empty_env_not_override(self):
+        """C11c: 空串 env 不覆盖 (双份一致)"""
+        _isolated_env(self, self._tmp.name, ZCODE_MODEL="")
+        merged = self._assert_merge_parity("空串 env")
+        self.assertEqual(merged["ZCODE_MODEL"], "GLM-5.2")
+
+    def test_c11d_nonempty_env_overrides(self):
+        """C11d: 非空 env 覆盖 (双份一致)"""
+        _isolated_env(self, self._tmp.name, ZCODE_MODEL="GLM-5-Turbo")
+        merged = self._assert_merge_parity("非空 env")
+        self.assertEqual(merged["ZCODE_MODEL"], "GLM-5-Turbo")
+
+    def test_c11e_stale_env_self_heals(self):
+        """C11e: 残留 env (config 另一 provider 的 endpoint) → 双份都自愈为 enabled 值"""
+        _isolated_env(self, self._tmp.name, ZCODE_BASE_URL="https://zcode.z.ai")
+        merged = self._assert_merge_parity("残留 env")
+        self.assertEqual(merged["ZCODE_BASE_URL"], "https://api.z.ai/api/anthropic")
+
+    def test_c11f_custom_endpoint_respected(self):
+        """C11f: 自建 endpoint (不在 config 任何 provider) → 双份都尊重 env"""
+        _isolated_env(self, self._tmp.name, ZCODE_BASE_URL="https://my-proxy.example.com")
+        merged = self._assert_merge_parity("自建 endpoint")
+        self.assertEqual(merged["ZCODE_BASE_URL"], "https://my-proxy.example.com")
+
+
+class TestAgentHelp(unittest.TestCase):
+    """C12: agent-help 内嵌副本同步 + 本轮 review 修复的回归 (P1-1/3/4/5, P2-2/4/6)。
+
+    agent-help 是单文件可独立运行设计, 不 import shared, 靠这里的对拍防漂移。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ah = _load_single_file_module(AGENT_HELP_PATH, "zcode_agent_help")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _run_main(self, argv):
+        """调 agent-help main(), 返回 (rc, stdout, stderr)。"""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["zcode-agent-help"] + argv), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.ah.main()
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_c12a_safe_host_parity(self):
+        """C12a: agent-help._safe_host 与权威 _safe_host 逐值一致 (整体 review P1-1)"""
+        cases = [
+            "https://api.z.ai/api/anthropic",   # 带路径
+            "https://zcode.z.ai",               # 根域名 (App 注入形态)
+            "//zcode.z.ai/api/v1/x",            # 无 scheme → 补 https://
+            "http://localhost:8080/path",       # 带端口
+            "ftp://example.com/x",              # 非 http scheme
+            "zcode.z.ai/api/v1/x",              # 无 // → hostname 解析不出 → None
+            "", "not a url",
+        ]
+        for u in cases:
+            self.assertEqual(self.ah._safe_host(u), _safe_host(u), f"_safe_host 漂移: {u!r}")
+        # 无 scheme 补 https:// 分支必须存在 (P1-1 核心)
+        self.assertEqual(self.ah._safe_host("//zcode.z.ai/x"), "https://zcode.z.ai")
+
+    def test_c12b_section_missing_value(self):
+        """C12b: --section 末尾无值 → 用法错误 + return 1, 不静默打印全量 (P1-3)"""
+        rc, out, err = self._run_main(["--section"])
+        self.assertEqual(rc, 1)
+        self.assertIn("用法错误", err)
+        self.assertEqual(out, "", "不应打印全量 JSON")
+
+    def test_c12c_section_followed_by_flag(self):
+        """C12c: --section 后随另一个 flag → 同样按用法错误处理 (P1-3)"""
+        rc, out, err = self._run_main(["--section", "--pretty"])
+        self.assertEqual(rc, 1)
+        self.assertIn("用法错误", err)
+
+    def test_c12d_empty_creds_prints_env(self):
+        """C12d: config 无 enabled provider 但 env 有值 → 脱敏打印并标注 (P1-5)"""
+        _isolated_env(self, self._tmp.name,
+                      ZCODE_BASE_URL="https://zcode.z.ai",
+                      ANTHROPIC_API_KEY="sk-abcdef1234567890")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.ah.print_injected_env(config_path="/nonexistent/config.json")
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("config 无 enabled provider, 将直接使用 env 值", text)
+        self.assertIn("https://zcode.z.ai", text)
+        self.assertIn("sk-a...7890", text, "apiKey 应按 4+4 脱敏")
+        self.assertNotIn("sk-abcdef1234567890", text, "不得泄露明文 key")
+
+    def test_c12e_empty_creds_empty_env(self):
+        """C12e: config 空且 env 也空 → 维持原 ❌ 提示 (P1-5 不改变该路径)"""
+        _isolated_env(self, self._tmp.name)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.ah.print_injected_env(config_path="/nonexistent/config.json")
+        self.assertEqual(rc, 0)
+        self.assertIn("❌", out.getvalue())
+
+    def test_c12f_probe_exception_safety(self):
+        """C12f: zcode 二进制不可执行 (PermissionError) 时探测兜底不崩 (P1-4)"""
+        err = io.StringIO()
+        saved_run = self.ah.subprocess.run
+
+        def fake_run(*a, **kw):
+            raise PermissionError("cannot execute binary")
+
+        self.ah.subprocess.run = fake_run
+        try:
+            with contextlib.redirect_stderr(err):
+                self.assertIsNone(self.ah._run_zcode_json(["skills", "list"]))
+                self.assertEqual(self.ah._get_version(), "unknown")
+        finally:
+            self.ah.subprocess.run = saved_run
+        self.assertIn("探测失败", err.getvalue(), "探测失败应有 stderr 提示")
+
+    def test_c12g_commands_non_list_guard(self):
+        """C12g: commands list 返回 dict 型 commands → custom_commands=[] 不出垃圾 (P2-2)"""
+        saved_run = self.ah.subprocess.run
+
+        class _R:
+            returncode = 0
+            stdout = json.dumps({"commands": {"a": 1}})  # dict 而非 list
+
+        self.ah.subprocess.run = lambda *a, **kw: _R()
+        try:
+            env = self.ah.discover_environment()
+        finally:
+            self.ah.subprocess.run = saved_run
+        self.assertEqual(env["custom_commands"], [])
+
+    def test_c12h_pretty_incomplete_environment(self):
+        """C12h: print_pretty 对缺 key 的 environment 不 KeyError (P2-4)"""
+        saved_run = self.ah.subprocess.run
+
+        def fake_run(*a, **kw):
+            raise OSError("no zcode")
+
+        self.ah.subprocess.run = fake_run
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                cap = self.ah.build_full()
+        finally:
+            self.ah.subprocess.run = saved_run
+        cap["environment"] = {}  # 模拟不完整探测结果
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.ah.print_pretty(cap)  # 不应抛 KeyError
+        self.assertIn("unknown", out.getvalue())
+
+    def test_c12i_overview_tested_against(self):
+        """C12i: OVERVIEW 带 tested_against 语义注记 (P2-6)"""
+        self.assertIn("tested_against", self.ah.OVERVIEW)
+        self.assertIn("0.16.1", self.ah.OVERVIEW["tested_against"])
+
+    def test_c12j_stale_env_diagnosed(self):
+        """C12j: 残留 env 在 --print-injected-env 里被标注 🚫 (P1-1 行为级)"""
+        cfg_path = _write_isolated_config(self._tmp.name)
+        _isolated_env(self, self._tmp.name, ZCODE_BASE_URL="https://zcode.z.ai")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.ah.print_injected_env(config_path=cfg_path)
+        self.assertEqual(rc, 0)
+        self.assertIn("🚫 残留", out.getvalue())
 
 
 if __name__ == "__main__":

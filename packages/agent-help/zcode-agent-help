@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 
@@ -68,44 +69,65 @@ def _mask_key(key):
     return f"{key[:4]}...{key[-4:]}"
 
 
-def print_injected_env():
+def _safe_host(url):
+    """提取 URL 的 host (scheme://host[:port]), 解析失败返回 None。
+
+    与 shared/credentials.py._safe_host 逐字对齐 (整体 review P1-1),
+    含"无 scheme 补 https://"分支 — 保证本工具的残留诊断与 merge 的真实判定一致。
+    """
+    try:
+        p = urlparse(url)
+        if not p.hostname:
+            return None
+        return f"{p.scheme}://{p.netloc}" if p.scheme else f"https://{p.netloc}"
+    except Exception:
+        return None
+
+
+def print_injected_env(config_path=None):
     """打印"如果现在注入凭证, 会用哪些值"(脱敏), 用于不改 config 诊断 model/baseURL 来源。
 
     显示每个 key 的来源 (config vs 显式 env) + 最终值 (apiKey 脱敏),
     体现"显式 env 优先"的合并语义 (issue #3 子项2)。
+
+    Args:
+        config_path: 可选, 自定义配置文件路径 (测试用, 整体 review P2-3)。
+                     默认 ZCODE_CREDS_PATH。
     """
-    creds = _load_creds_internal()
+    path = config_path or ZCODE_CREDS_PATH
+    creds = _load_creds_internal(path)
+    keys = ["ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"]
     if not creds:
-        print(f"❌ 未从 {ZCODE_CREDS_PATH} 读取到凭证 (config 无 enabled provider 或文件缺失)")
+        # 整体 review P1-5: config 无 enabled provider 时不直接退出 — env 里的非空值
+        # 仍会被 merge 原样透传给 zcode 子进程, 必须脱敏打印出来, 否则用户无从知晓。
+        env_hits = {k: v for k in keys if (v := os.environ.get(k))}
+        if not env_hits:
+            print(f"❌ 未从 {path} 读取到凭证 (config 无 enabled provider 或文件缺失)")
+            return 0
+        print("=== 凭证注入诊断 (显式非空 env 优先于 config; 空串视为未设置) ===")
+        print(f"config 源: {path}")
+        print("⚠ config 无 enabled provider, 将直接使用 env 值:")
+        for k, v in env_hits.items():
+            shown = _mask_key(v) if k == "ANTHROPIC_API_KEY" else v
+            print(f"  {k}: {shown}  (来自 env)")
         return 0
     # 读 config 里所有 provider 的 baseURL (残留检测用, host 集合)
+    # 整体 review P1-1: 用与权威版逐字对齐的 _safe_host 构造, 消除诊断与真实注入的漂移
     all_config_hosts = set()
     try:
-        from urllib.parse import urlparse as _up
-        with open(ZCODE_CREDS_PATH) as _f:
+        with open(path) as _f:
             _cfg = json.load(_f)
         for _p in _cfg.get("provider", {}).values():
             _bu = _p.get("options", {}).get("baseURL", "")
             if _bu:
-                try:
-                    _h = _up(_bu)
-                    if _h.hostname:
-                        all_config_hosts.add(f"{_h.scheme}://{_h.netloc}" if _h.scheme else _h.netloc)
-                except Exception:
-                    pass
+                _h = _safe_host(_bu)
+                if _h:
+                    all_config_hosts.add(_h)
     except Exception:
         pass
 
-    def _host(u):
-        try:
-            h = _up(u)
-            return f"{h.scheme}://{h.netloc}" if (h.scheme and h.hostname) else None
-        except Exception:
-            return None
-
-    keys = ["ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"]
     print("=== 凭证注入诊断 (显式非空 env 优先于 config; 空串视为未设置) ===")
-    print(f"config 源: {ZCODE_CREDS_PATH}")
+    print(f"config 源: {path}")
     for k in keys:
         config_val = creds.get(k, "")
         env_val = os.environ.get(k)
@@ -115,8 +137,8 @@ def print_injected_env():
             print(f"    config → {('脱敏 ' + _mask_key(config_val)) if k == 'ANTHROPIC_API_KEY' and config_val else (config_val or '(空)')}")
             # ZCODE_BASE_URL 特殊: 检测 App 注入的残留官方 endpoint (host 匹配)
             if k == "ZCODE_BASE_URL" and config_val and env_val != config_val:
-                _eh = _host(env_val)
-                _ch = _host(config_val)
+                _eh = _safe_host(env_val)
+                _ch = _safe_host(config_val)
                 if _eh and _ch and _eh != _ch and _eh in all_config_hosts:
                     print(f"    env    → {shown}  🚫 残留! 是 config 里另一个 provider 的 endpoint")
                     print(f"             → bridge 会自动用 config 值: {config_val}")
@@ -141,6 +163,9 @@ def print_injected_env():
 OVERVIEW = {
     "tool": "zcode",
     "version_described": "0.16.1 (App 3.6.5)",
+    # 整体 review P2-6: version_described 是"静态清单基于该版本实测"的意思;
+    # 实际安装版本以 environment.zcode_version (动态探测) 为准, 两者可能不一致。
+    "tested_against": "0.16.1 (App 3.6.5)",
     "what_it_is": (
         "ZCode 是智谱(Z.AI)的 Agentic Coding CLI, 由 GLM 系列模型驱动。"
         "它能自主完成代码编写/审查/调试/分析等任务, 可调用工具(读写文件、"
@@ -592,15 +617,25 @@ ECOSYSTEM = {
 # 动态探测: 实时调用 zcode 获取当前环境信息
 # ============================================================
 def _run_zcode_json(args):
+    """调 zcode 子命令并解析 --json 输出; 探测失败返回 None 并打 stderr 提示。
+
+    整体 review P1-4: 异常捕获放宽为 (SubprocessError, OSError, ValueError) —
+    SubprocessError 含 TimeoutExpired, OSError 含 FileNotFoundError/PermissionError
+    (二进制存在但不可执行), ValueError 含 JSONDecodeError。提示走 stderr,
+    不污染 --json 的 stdout。
+    """
     try:
         result = subprocess.run(
             [ZCODE_BIN] + args + ["--json"],
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode != 0:
+            print(f"⚠ 探测失败: {ZCODE_BIN} {' '.join(args)} 退出码 {result.returncode}",
+                  file=sys.stderr)
             return None
         return json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        print(f"⚠ 探测失败: {ZCODE_BIN} {' '.join(args)}: {e}", file=sys.stderr)
         return None
 
 
@@ -610,7 +645,9 @@ def _get_version():
             [ZCODE_BIN, "version"], capture_output=True, text=True, timeout=10
         )
         return result.stdout.strip() or "unknown"
-    except Exception:
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        # 整体 review P1-4: 与 _run_zcode_json 同一捕获集合
+        print(f"⚠ 版本探测失败: {e}", file=sys.stderr)
         return "unknown"
 
 
@@ -633,7 +670,11 @@ def discover_environment():
     cmds_data = _run_zcode_json(["commands", "list"])
     if cmds_data and isinstance(cmds_data, dict):
         cmds = cmds_data.get("commands") or cmds_data.get("data") or []
-        env["custom_commands"] = [c.get("name", str(c)) if isinstance(c, dict) else str(c) for c in cmds]
+        # 整体 review P2-2: 守卫 cmds 非 list (dict/str 会被迭代出垃圾数据)
+        if isinstance(cmds, list):
+            env["custom_commands"] = [c.get("name", str(c)) if isinstance(c, dict) else str(c) for c in cmds]
+        else:
+            env["custom_commands"] = []
     else:
         env["custom_commands"] = []
 
@@ -668,7 +709,8 @@ def build_full():
 
 
 def print_pretty(cap):
-    v = cap["environment"]["zcode_version"]
+    # 整体 review P2-4: environment 是动态探测结果, 对缺 key 做 .get() 防御
+    v = cap.get("environment", {}).get("zcode_version", "unknown")
     print(f"╔══ ZCode v{v} — 开放生态能力说明书 ══╗\n")
     print(cap["what_it_is"], "\n")
 
@@ -712,11 +754,11 @@ def print_pretty(cap):
           f"({eco['session_storage']['location'][:40]}...)\n")
 
     # environment
-    env = cap["environment"]
+    env = cap.get("environment", {})
     print("▼ 当前环境 (动态探测)")
-    print(f"  zcode 版本: {env['zcode_version']}")
-    print(f"  已装 skill: {env['skills_count']} 个")
-    print(f"  已装组件: {[k for k,v in env['installed_components'].items() if v] or '无'}")
+    print(f"  zcode 版本: {env.get('zcode_version', 'unknown')}")
+    print(f"  已装 skill: {env.get('skills_count', 0)} 个")
+    print(f"  已装组件: {[k for k, v in env.get('installed_components', {}).items() if v] or '无'}")
 
 
 def main():
@@ -731,19 +773,25 @@ def main():
 
     if "--section" in args:
         idx = args.index("--section")
-        if idx + 1 < len(args):
-            section = args[idx + 1]
-            # 静态 section 直接查 SECTIONS; environment 是动态探测的, 单独处理
-            if section == "environment":
-                data = discover_environment()
-            else:
-                data = SECTIONS.get(section)
-            if data is not None:
-                print(json.dumps(data, indent=2, ensure_ascii=False))
-                return 0
-            print(f"未知 section: {section}\n可用: {', '.join(list(SECTIONS.keys()) + ['environment'])}",
+        # 整体 review P1-3: 末尾无值, 或后随另一个 flag (误把 --xxx 当 section 名),
+        # 按用法错误处理并 return 1, 不静默落到全量输出 (脚本调用方会误以为拿到了某节)。
+        if idx + 1 >= len(args) or args[idx + 1].startswith("--"):
+            print(f"用法错误: --section 需要跟一个 section 名\n"
+                  f"可用: {', '.join(list(SECTIONS.keys()) + ['environment'])}",
                   file=sys.stderr)
             return 1
+        section = args[idx + 1]
+        # 静态 section 直接查 SECTIONS; environment 是动态探测的, 单独处理
+        if section == "environment":
+            data = discover_environment()
+        else:
+            data = SECTIONS.get(section)
+        if data is not None:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return 0
+        print(f"未知 section: {section}\n可用: {', '.join(list(SECTIONS.keys()) + ['environment'])}",
+              file=sys.stderr)
+        return 1
 
     cap = build_full()
     if "--pretty" in args:

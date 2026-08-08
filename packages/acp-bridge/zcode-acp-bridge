@@ -73,15 +73,19 @@ CLI 0.16.1 适配 (依据 docs/upgrade-0.16.1-spec.md, 全部经实测复核):
 依赖: 仅 Python3 标准库
 """
 
+import itertools
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 # ============================================================
 # 配置
@@ -90,6 +94,16 @@ ACP_PROTOCOL_VERSION = 1
 BRIDGE_INFO = {"name": "zcode-acp-bridge", "title": "ZCode (GLM-5.2)", "version": "1.0.0"}
 ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 ZCODE_CREDS_PATH = Path.home() / ".zcode" / "v2" / "config.json"
+
+# 整体 review 安全发现 (mimosa 新发现2): session/new 未显式指定 mode 时的默认权限
+# 模式。默认 yolo (历史行为: 跳过一切工具权限确认, 任意 prompt 都可能触发无确认的
+# 文件修改/命令执行); 注重安全的环境可设 ZCODE_ACP_DEFAULT_MODE=build 等收紧默认值,
+# 无需改代码。启动日志会对 yolo 默认值打出显眼告警 (见 run())。
+DEFAULT_ACP_MODE = os.environ.get("ZCODE_ACP_DEFAULT_MODE") or "yolo"
+
+# 整体 review P2-1/P2-2: differ 与 state 投影按 session 累积, 而 ACP baseline 没有
+# session 关闭钩子可挂清理, 设软上限 FIFO 淘汰最旧条目, 防长驻进程内存单调增长
+_MAX_SESSION_STATES = 64
 
 # 0.16+ server→client 反向调用 session/requestRuntimePreferences 的应答体
 # (schema 实测自 bundle zod): bridge 无这些客户端能力, 全部关闭
@@ -113,6 +127,14 @@ def load_zcode_credentials():
     try:
         with open(ZCODE_CREDS_PATH) as f:
             cfg = json.load(f)
+    except FileNotFoundError:
+        return {}  # 未配置凭证文件: 正常静默降级 (走纯环境变量, 不算故障)
+    except Exception as e:
+        # 整体 review P2-4: 文件存在但权限错误/JSON 损坏 → 显式警告,
+        # 让用户能区分「没配凭证」与「凭证文件损坏」(此前一律打成普通 log 难察觉)
+        log(f"⚠ 凭证文件存在但读取失败 ({ZCODE_CREDS_PATH}): {e}; 回退纯环境变量")
+        return {}
+    try:
         for _pid, p in cfg.get("provider", {}).items():
             if p.get("enabled"):
                 opts = p.get("options", {})
@@ -123,7 +145,7 @@ def load_zcode_credentials():
                     "ANTHROPIC_API_KEY": opts.get("apiKey", ""),
                 }
     except Exception as e:
-        log(f"读取凭证失败: {e}")
+        log(f"⚠ 凭证文件结构异常 ({ZCODE_CREDS_PATH}): {e}; 回退纯环境变量")
     return {}
 
 
@@ -146,21 +168,20 @@ def _merge_env_with_creds(creds):
     if env_bu and config_bu and env_bu != config_bu:
         all_hosts = set()
         try:
-            from urllib.parse import urlparse as _up
             with open(ZCODE_CREDS_PATH) as _f:
                 _cfg = json.load(_f)
             for _p in _cfg.get("provider", {}).values():
                 _bu = _p.get("options", {}).get("baseURL", "")
                 if _bu:
                     try:
-                        _h = _up(_bu)
+                        _h = urlparse(_bu)
                         if _h.hostname:
                             all_hosts.add(f"{_h.scheme}://{_h.netloc}" if _h.scheme else _h.netloc)
                     except Exception:
                         pass
-            _eh = _up(env_bu)
+            _eh = urlparse(env_bu)
             env_host = f"{_eh.scheme}://{_eh.netloc}" if (_eh.scheme and _eh.hostname) else None
-            _ch = _up(config_bu)
+            _ch = urlparse(config_bu)
             config_host = f"{_ch.scheme}://{_ch.netloc}" if (_ch.scheme and _ch.hostname) else None
         except Exception:
             env_host = config_host = None
@@ -324,6 +345,12 @@ class ZCodeBackend:
     def register_event_listener(self, zcode_sid, listener):
         """注册事件监听器, 之后该 sid 的 session/event 会路由到它。"""
         with self._listeners_lock:
+            # 整体 review P2-8: 同 sid 覆盖注册会静默丢前一个 listener (其事件
+            # 从此无人消费)。当前调用方保证同 sid 串行 + finally 注销, 正常不触发;
+            # 打告警防御未来引入同 session 并发 prompt 时丢事件难以排查
+            if zcode_sid in self._event_listeners:
+                log(f"⚠ register_event_listener: sid={zcode_sid} 已有 listener, "
+                    f"覆盖注册 (前一个 listener 的事件将无人消费)")
             self._event_listeners[zcode_sid] = listener
 
     def unregister_event_listener(self, zcode_sid):
@@ -406,6 +433,11 @@ class ZCodeBackend:
             self.proc.wait(timeout=3)
         except Exception:
             self.proc.kill()
+            # 整体 review P2-7: kill 后补 wait 收尸, 防子进程变僵尸残留
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
 
     # ---------- 0.16+ 协议探测 / 反向调用应答 / 状态投影 ----------
 
@@ -521,8 +553,10 @@ class ZCodeBackend:
         """
         msg_id = msg.get("id")
         method = msg.get("method")
-        # 本方法在 reader 线程内执行: send() 失败只记日志不抛出 — reader 循环的
-        # except 会 break 并把 backend 标记 dead, 一次应答异常不能带走整个 reader。
+        # 本方法在 reader 线程内执行: send() 失败只记日志、不抛出也不 break — 这是
+        # 设计意图 (reader 存活优先, 一次应答异常不能带走整个 reader)。代价是本次
+        # 应答丢失后 server 侧该请求会空等到它自己超时 (桥无法挽救), 但 reader 继续
+        # 分发后续帧, 其他请求不受影响 (整体 review P2-6: 注释与实际行为对齐)。
         if method == "session/requestRuntimePreferences":
             scope = msg.get("params", {}).get("scope", "?")
             log(f"  ← 应答 session/requestRuntimePreferences (scope={scope})")
@@ -549,6 +583,14 @@ class ZCodeBackend:
         if not sid or not isinstance(patch, dict):
             return
         with self._state_lock:
+            # 整体 review P2-2: 投影跨 session 无清理 (reset_projection 只管当前
+            # sid 的每 turn 入口), 且无 session 关闭钩 → 超上限 FIFO 淘汰最旧条目
+            if sid not in self._state_projections \
+                    and len(self._state_projections) >= _MAX_SESSION_STATES:
+                evicted = next(iter(self._state_projections))
+                self._state_projections.pop(evicted, None)
+                log(f"⚠ state 投影超上限 ({_MAX_SESSION_STATES}), "
+                    f"淘汰最旧 session: {evicted}")
             self._state_projections.setdefault(sid, {}).update(patch)
 
     def get_projection(self, zcode_sid):
@@ -1083,16 +1125,21 @@ class ACPBridge:
         self.session_map = {}
         # 当前进行中的 prompt: {acp_prompt_id: {zcode_sid, cancelled, perms_responses}}
         self.pending_turns = {}
-        # id 基数提到 10_000_000, 避免与 zcode 主动请求的 id 空间冲突
-        self._msg_counter = 10_000_000
+        # id 基数提到 10_000_000, 避免与 zcode 主动请求的 id 空间冲突。
+        # 整体 review P1-1: 用 itertools.count 取代"读-改-写"的 += 1 — next() 在
+        # CPython 下原子, 消除未来跨线程调用 _next_id 的 id 重复竞态 (当前虽全部
+        # 串行在主线程, 但原写法无护栏)
+        self._id_counter = itertools.count(10_000_001)
+        # 整体 review P1-2: stdout 协议帧写锁 — 全文件 stdout 写收进 _write_stdout(),
+        # 防未来后台线程写帧时与主循环产生交错的半截 JSON (ACP client 会解析失败)
+        self._stdout_lock = threading.Lock()
         # stdin 消息队列: 后台线程把每行 stdin 入队, 主循环/轮询循环从队列取
         # 这解决了 run() 单线程阻塞导致 cancel/permission 响应读不到的问题
         self._inbox = queue.Queue()
         self._stdin_thread = None
 
     def _next_id(self):
-        self._msg_counter += 1
-        return self._msg_counter
+        return next(self._id_counter)
 
     # 0.16 已删方法 (实测后端返 -32601 Method not found, 规格书 §2)
     # 0.16 已删方法清单 — 与 README/SKILL 的「0.16 已移除」表格标注双处维护,
@@ -1105,6 +1152,22 @@ class ACPBridge:
     def _backend_v16(self):
         """后端是否为 0.16+ 新协议 (ZCodeBackend 启动探测缓存; 测试桩无该属性按旧协议)。"""
         return getattr(self.backend, "protocol_mode", "legacy") == "v16"
+
+    def _backend_proc_dead(self):
+        """探测 backend 子进程是否已退出 (proc.poll() 非 None = 已死)。
+
+        整体 review P1-3 的收敛探测: 轮询连续无响应时用于区分「后端 hang 但活着」
+        (继续等) 与「子进程已死」(确定性故障, 立即报错)。测试桩无 proc 属性时按
+        「无法判定」返回 False (不提前收敛, 保持原有等满超时的行为)。
+        """
+        proc = getattr(self.backend, "proc", None)
+        poll = getattr(proc, "poll", None)
+        if not callable(poll):
+            return False
+        try:
+            return poll() is not None
+        except Exception:
+            return False
 
     def _removed_method_error(self, msg_id, zcode_method, resp):
         """把已删方法的后端 -32601 映射为明确文案 (规格书 §7)。
@@ -1238,9 +1301,11 @@ class ACPBridge:
         """ACP session/new → zcode session/create"""
         self.ensure_backend()
         cwd = params.get("cwd") or os.getcwd()
-        # 显式 mode 透传; 默认 yolo: 跳过工具权限确认, 否则 build 模式下工具调用
-        # turn 会卡在 pendingPermissions (0.15 实测; 0.16 stdio 下工具自动执行, 参数被忽略)
-        mode = params.get("mode") or "yolo"
+        # 显式 mode 透传; 缺省用 DEFAULT_ACP_MODE (默认 yolo, 可用环境变量
+        # ZCODE_ACP_DEFAULT_MODE 收紧 — 整体 review 安全发现): yolo 跳过工具权限确认,
+        # 否则 build 模式下工具调用 turn 会卡在 pendingPermissions (0.15 实测;
+        # 0.16 stdio 下工具自动执行, 参数被忽略)
+        mode = params.get("mode") or DEFAULT_ACP_MODE
         log(f"session/new: cwd={cwd}, mode={mode}")
 
         zc_id = self._next_id()
@@ -1498,15 +1563,22 @@ class ACPBridge:
         error.message 里, 原样返回会泄漏。这里用正则遮蔽常见密钥形态:
           - sk- 开头的 OpenAI/Anthropic 风格 key 前缀
           - JSON 里 "value":"..." / "apiKey":{...} 的敏感值
+          - 纯 hex (32+) / uuid 形态的无前缀 key (整体 review P2-3 纵深防御:
+            provider 用这类 apiKey 且被错误消息原样回显时也能遮蔽)
         保留非敏感部分以便排查。
         """
-        import re
         if not text:
             return text
         s = re.sub(r'sk-[A-Za-z0-9_-]{6,}', 'sk-***', text)
         s = re.sub(r'("value"\s*:\s*")([^"]{4,})(")', r'\1***\3', s)
         s = re.sub(r'("apiKey"\s*:\s*)("?\{[^}]*\}"?|"[^"]{4,}")',
                    r'\1***', s)
+        # uuid (8-4-4-4-12) 与 32+ 位纯 hex 是常见无前缀 key 形态, 一并遮蔽。
+        # 取舍说明 (复审 P2-5): 32+ hex 也可能命中 git SHA 等合法内容 — 但本函数
+        # 只用于错误消息回显路径, 宁可多遮蔽也不可漏 key。
+        s = re.sub(r'\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b',
+                   '***', s)
+        s = re.sub(r'\b[0-9a-fA-F]{32,}\b', '***', s)
         return s
 
     # ---------- session 级新方法 (0.15.0+) ----------
@@ -1874,8 +1946,7 @@ class ACPBridge:
                 cancel_id = req.get("id")
                 cancel_resp = self._on_prompt_enhance_cancel(cancel_id, req.get("params", {}))
                 if cancel_id is not None:
-                    sys.stdout.write(json.dumps(cancel_resp, ensure_ascii=False) + "\n")
-                    sys.stdout.flush()
+                    self._write_stdout(cancel_resp)  # P1-2: 统一加锁写口
                 continue
             # 非 cancel: 放回尾部, 不吞掉其他带外消息 (顺序保持)
             self._inbox.put(line)
@@ -2077,7 +2148,6 @@ class ACPBridge:
         if not ts:
             return None
         try:
-            from datetime import datetime, timezone
             return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
         except Exception:
             return None
@@ -2101,8 +2171,13 @@ class ACPBridge:
         """
         t0 = time.time()
         if probe_method:
-            # 用探测调用重试, 直到不再报 "prompt is running"
+            # 用探测调用重试, 直到不再报 "prompt is running"。
+            # 整体 review P2-5: (a) 固定 2s 改指数退避 (1s 起倍增, 8s 封顶),
+            # 防高频探测打后端; (b) 等待期间每轮 drain inbox — 主循环串行, 不
+            # drain 则此时到达的 session/cancel 会卡到等完才被处理
+            backoff = 1.0
             while time.time() - t0 < timeout:
+                self._drain_inbox()
                 probe_id = self._next_id()
                 resp, _ = self.backend.request(probe_id, probe_method,
                                                {"sessionId": zcode_sid, "action": "show"},
@@ -2113,16 +2188,18 @@ class ACPBridge:
                 err_msg = resp.get("error", {}).get("message", "")
                 # timeout 或 "prompt is running" 都继续等; 其他错误视为释放
                 if "prompt is running" in err_msg or "timeout" in err_msg.lower():
-                    time.sleep(2)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 8.0)
                     continue
                 log(f"  [probe] 非锁错误, 视为释放: {err_msg[:50]}")
                 return True
             log(f"  [probe] 等待超时 ({timeout}s), lock 可能仍占用")
             return False
         else:
-            # fallback: 轮询 status
+            # fallback: 轮询 status (同样每轮 drain inbox 让 cancel 可响应, P2-5)
             monitor = TurnMonitor(self.backend, zcode_sid, self)
             while time.time() - t0 < timeout:
+                self._drain_inbox()
                 proj = monitor.poll_once()
                 if proj and proj.get("status") == "idle":
                     time.sleep(1)
@@ -2166,105 +2243,107 @@ class ACPBridge:
 
         log(f"session/prompt: sid={acp_sid[:20]}..., text={prompt_text[:40]!r}")
 
-        # 注册 pending turn (供 cancel 查询)
+        # 注册 pending turn (供 cancel 查询)。
+        # 整体 review P1-5: try/finally 保证任何退出路径 (含中途异常) 都摘掉
+        # pending 条目 — 此前各 return 前裸 del, 异常路径会留下僵尸条目, 长驻
+        # 运行累积内存且干扰后续 cancel 的 turn 匹配
         turn = {"zcode_sid": zcode_sid, "cancelled": False}
         self.pending_turns[msg_id] = turn
+        try:
+            # zcode review P1-1 防御: 新 turn 入口清该 session 的 state.updated 状态投影,
+            # 防跨 turn 陈旧值误导 _run_event_turn 停滞检查 (核实结论: 该竞态在 0.16.1
+            # 不可达, 此处为零成本防御, 详见 ZCodeBackend.reset_projection docstring)。
+            # getattr 兜底: 测试桩 (FakeBackend) 无此方法。
+            _reset_proj = getattr(self.backend, "reset_projection", None)
+            if callable(_reset_proj):
+                _reset_proj(zcode_sid)
 
-        # zcode review P1-1 防御: 新 turn 入口清该 session 的 state.updated 状态投影,
-        # 防跨 turn 陈旧值误导 _run_event_turn 停滞检查 (核实结论: 该竞态在 0.16.1
-        # 不可达, 此处为零成本防御, 详见 ZCodeBackend.reset_projection docstring)。
-        # getattr 兜底: 测试桩 (FakeBackend) 无此方法。
-        _reset_proj = getattr(self.backend, "reset_projection", None)
-        if callable(_reset_proj):
-            _reset_proj(zcode_sid)
+            # 建立 baseline: send 前先记录已有消息 id, 让 differ 只产出本轮新增 (修复 P1.1)
+            # differ 跨 turn 持久化 (按 session 存), 避免多轮/resume 误发历史
+            differ = self._get_or_create_differ(zcode_sid)
+            # 先喂一次当前 messages, 让 _seen_message_ids 标记所有历史消息为"已见"
+            baseline_msgs = self._fetch_messages(zcode_sid)
+            if baseline_msgs:
+                differ.mark_seen(baseline_msgs)
+            chunk_msg_id = f"msg_{uuid.uuid4().hex[:12]}"
 
-        # 建立 baseline: send 前先记录已有消息 id, 让 differ 只产出本轮新增 (修复 P1.1)
-        # differ 跨 turn 持久化 (按 session 存), 避免多轮/resume 误发历史
-        differ = self._get_or_create_differ(zcode_sid)
-        # 先喂一次当前 messages, 让 _seen_message_ids 标记所有历史消息为"已见"
-        baseline_msgs = self._fetch_messages(zcode_sid)
-        if baseline_msgs:
-            differ.mark_seen(baseline_msgs)
-        chunk_msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+            # ===== 双模式: 优先事件驱动, 失败降级轮询 (轮询仅限旧协议模式) =====
+            # 新版 ZCode (0.14.8+) 支持 session/subscribe 推送流式事件 (model.streaming)。
+            # 事件驱动模式下: model.streaming → 逐段 TextDelta (真流式);
+            #                tool.updated → 实时工具调用状态。
+            # 降级模式 (旧协议 / subscribe 失败): 轮询 session/read, turn 结束整段发 (伪流式)。
+            # 0.16+ 新协议模式不降级: subscribe 是其必备事件通道, 失败即报错 (规格书 §4)。
 
-        # ===== 双模式: 优先事件驱动, 失败降级轮询 (轮询仅限旧协议模式) =====
-        # 新版 ZCode (0.14.8+) 支持 session/subscribe 推送流式事件 (model.streaming)。
-        # 事件驱动模式下: model.streaming → 逐段 TextDelta (真流式);
-        #                tool.updated → 实时工具调用状态。
-        # 降级模式 (旧协议 / subscribe 失败): 轮询 session/read, turn 结束整段发 (伪流式)。
-        # 0.16+ 新协议模式不降级: subscribe 是其必备事件通道, 失败即报错 (规格书 §4)。
+            # ⚠️ 时序关键: 必须先 subscribe + register listener, 再 session/send。
+            # 否则 send 和 register 之间的 session/event 会被 reader 线程丢弃,
+            # 短 turn 的 turn.completed 可能丢失导致 120s 超时。
+            listener = EventStreamListener(self.backend, zcode_sid)
+            sub_id = self._next_id()
+            sub_result = listener.subscribe(sub_id)
 
-        # ⚠️ 时序关键: 必须先 subscribe + register listener, 再 session/send。
-        # 否则 send 和 register 之间的 session/event 会被 reader 线程丢弃,
-        # 短 turn 的 turn.completed 可能丢失导致 120s 超时。
-        listener = EventStreamListener(self.backend, zcode_sid)
-        sub_id = self._next_id()
-        sub_result = listener.subscribe(sub_id)
+            if sub_result is not None:
+                # 事件驱动模式: 先注册 listener (确保不丢事件), 再 send。
+                # register/unregister 接口只有真实 ZCodeBackend 有, getattr 兜底
+                # (测试桩没有, 此时事件经 request() 第二返回值喂入, 见下)。
+                _reg = getattr(self.backend, "register_event_listener", None)
+                if callable(_reg):
+                    _reg(zcode_sid, listener)
+                _unreg = getattr(self.backend, "unregister_event_listener", None)
+                try:
+                    # 现在 send prompt (listener 已注册, 不会丢事件)
+                    zc_id = self._next_id()
+                    resp, send_events = self.backend.request(
+                        zc_id, "session/send",
+                        {"sessionId": zcode_sid, "content": prompt_text},
+                        timeout=10)
+                    if "error" in resp:
+                        return self._error(msg_id, -32603,
+                                           f"zcode send failed: {resp['error'].get('message', '')}")
+                    if not resp.get("result", {}).get("accepted", False):
+                        return self._error(msg_id, -32603,
+                                           "zcode send 未被接受 (无 accepted 响应)")
 
-        if sub_result is not None:
-            # 事件驱动模式: 先注册 listener (确保不丢事件), 再 send。
-            # register/unregister 接口只有真实 ZCodeBackend 有, getattr 兜底
-            # (测试桩没有, 此时事件经 request() 第二返回值喂入, 见下)。
-            _reg = getattr(self.backend, "register_event_listener", None)
-            if callable(_reg):
-                _reg(zcode_sid, listener)
-            _unreg = getattr(self.backend, "unregister_event_listener", None)
-            try:
-                # 现在 send prompt (listener 已注册, 不会丢事件)
+                    # request() 第二返回值携带 send 期间到达的事件 (测试 seam; 真实
+                    # backend 恒为 [], 真实事件经 reader → 已注册 listener 到达)
+                    for ev in send_events or []:
+                        listener.handle_event(ev)
+
+                    result = self._run_event_turn(
+                        listener, acp_sid, zcode_sid, msg_id, turn, chunk_msg_id, differ)
+                finally:
+                    if callable(_unreg):
+                        _unreg(zcode_sid)
+                return result
+            else:
+                # 0.16+ 新协议模式 (实锤判定): 轮询降级为旧协议专用, subscribe 失败直接报错
+                if self._backend_v16() and getattr(self.backend, "protocol_confirmed", True):
+                    return self._error(msg_id, -32603,
+                                       "zcode session/subscribe 失败 (0.16+ 必须走事件订阅; "
+                                       "轮询降级仅限旧协议模式)")
+                # zcode review P1-3 修复: "v16" 若只是探测超时兜底判定 (protocol_confirmed
+                # =False, 无实锤), subscribe 失败本身就是旧协议的实锤 (真 0.16 server 的
+                # subscribe 不会失败) → 推翻探测结果, 回退 legacy 走原有轮询降级
+                # (与 _detect_protocol docstring「新协议代码路径对 0.15 亦兼容」对齐)。
+                if self._backend_v16():
+                    self.backend.protocol_mode = "legacy"
+                    self.backend.protocol_confirmed = True
+                    log("  ⚠ subscribe 失败, 推翻探测超时的 v16 兜底判定 → 回退旧协议轮询")
+                # 降级: 轮询模式 — send 在轮询循环前发
                 zc_id = self._next_id()
-                resp, send_events = self.backend.request(
-                    zc_id, "session/send",
-                    {"sessionId": zcode_sid, "content": prompt_text},
-                    timeout=10)
+                resp, _ = self.backend.request(zc_id, "session/send",
+                                               {"sessionId": zcode_sid, "content": prompt_text},
+                                               timeout=10)
                 if "error" in resp:
-                    del self.pending_turns[msg_id]
                     return self._error(msg_id, -32603,
                                        f"zcode send failed: {resp['error'].get('message', '')}")
                 if not resp.get("result", {}).get("accepted", False):
-                    del self.pending_turns[msg_id]
                     return self._error(msg_id, -32603, "zcode send 未被接受 (无 accepted 响应)")
-
-                # request() 第二返回值携带 send 期间到达的事件 (测试 seam; 真实
-                # backend 恒为 [], 真实事件经 reader → 已注册 listener 到达)
-                for ev in send_events or []:
-                    listener.handle_event(ev)
-
-                result = self._run_event_turn(
-                    listener, acp_sid, zcode_sid, msg_id, turn, chunk_msg_id, differ)
-            finally:
-                if callable(_unreg):
-                    _unreg(zcode_sid)
-            return result
-        else:
-            # 0.16+ 新协议模式 (实锤判定): 轮询降级为旧协议专用, subscribe 失败直接报错
-            if self._backend_v16() and getattr(self.backend, "protocol_confirmed", True):
-                del self.pending_turns[msg_id]
-                return self._error(msg_id, -32603,
-                                   "zcode session/subscribe 失败 (0.16+ 必须走事件订阅; "
-                                   "轮询降级仅限旧协议模式)")
-            # zcode review P1-3 修复: "v16" 若只是探测超时兜底判定 (protocol_confirmed
-            # =False, 无实锤), subscribe 失败本身就是旧协议的实锤 (真 0.16 server 的
-            # subscribe 不会失败) → 推翻探测结果, 回退 legacy 走原有轮询降级
-            # (与 _detect_protocol docstring「新协议代码路径对 0.15 亦兼容」对齐)。
-            if self._backend_v16():
-                self.backend.protocol_mode = "legacy"
-                self.backend.protocol_confirmed = True
-                log("  ⚠ subscribe 失败, 推翻探测超时的 v16 兜底判定 → 回退旧协议轮询")
-            # 降级: 轮询模式 — send 在轮询循环前发
-            zc_id = self._next_id()
-            resp, _ = self.backend.request(zc_id, "session/send",
-                                           {"sessionId": zcode_sid, "content": prompt_text},
-                                           timeout=10)
-            if "error" in resp:
-                del self.pending_turns[msg_id]
-                return self._error(msg_id, -32603,
-                                   f"zcode send failed: {resp['error'].get('message', '')}")
-            if not resp.get("result", {}).get("accepted", False):
-                del self.pending_turns[msg_id]
-                return self._error(msg_id, -32603, "zcode send 未被接受 (无 accepted 响应)")
-            log("  ⟳ 降级轮询模式 (事件流不可用)")
-            return self._run_polling_turn(
-                acp_sid, zcode_sid, msg_id, turn, chunk_msg_id, differ)
+                log("  ⟳ 降级轮询模式 (事件流不可用)")
+                return self._run_polling_turn(
+                    acp_sid, zcode_sid, msg_id, turn, chunk_msg_id, differ)
+        finally:
+            # P1-5: 正常返回/异常上抛都必执行; turn 循环内部先 del 过也无害 (幂等)
+            self.pending_turns.pop(msg_id, None)
 
     def _run_event_turn(self, listener, acp_sid, zcode_sid, msg_id, turn, chunk_msg_id, differ):
         """事件驱动 turn 循环: 消费 session/event 推送, 翻译成 ACP 事件实时发。
@@ -2395,6 +2474,13 @@ class ACPBridge:
         # 超时
         del self.pending_turns[msg_id]
         log("session/prompt 超时: 事件模式下 120s 未完成")
+        if translator.turn_started and not translator.turn_done:
+            # 整体 review P2-5 (tests 报告): turn 已启动但 120s 未收到完成信号,
+            # 说明事件流断了 (turn.completed/turn.failed 丢失), 属异常而非
+            # 「turn 真的太长」— 返回错误, 不再用正常 stopReason 让 client 误判
+            return self._error(msg_id, -32603,
+                               "zcode 事件流超时: turn 已启动但 120s 未收到完成信号 "
+                               "(turn.completed 丢失或事件流中断)")
         return {"jsonrpc": "2.0", "id": msg_id,
                 "result": {"stopReason": "max_turn_requests"}}
 
@@ -2426,6 +2512,15 @@ class ACPBridge:
                 consecutive_none += 1
                 if consecutive_none >= 10:  # 连续 ~5s 无响应
                     log(f"  ⚠ 连续 {consecutive_none} 次 poll 失败")
+                # 整体 review P1-3: 连续无响应超阈值 (20 次 ≈ 10s) 时探测后端
+                # 子进程存活; 已死是确定性故障, 立即报错返回, 不让调用方空等
+                # 耗满 120s 预算 (子进程 hang 但活着则继续等, 行为不变)
+                if consecutive_none >= 20 and self._backend_proc_dead():
+                    del self.pending_turns[msg_id]
+                    log("  ✗ zcode 后端进程已退出, 轮询提前收敛 (不再空等 120s)")
+                    return self._error(
+                        msg_id, -32603,
+                        "zcode 后端进程已退出 (连续 20 次 poll 无响应)")
                 time.sleep(0.5)
                 continue
             consecutive_none = 0
@@ -2487,9 +2582,12 @@ class ACPBridge:
             return {"jsonrpc": "2.0", "id": msg_id,
                     "result": {"stopReason": "max_turn_requests"}}
 
-        # turn 正常完成。differ 已发本轮新增 text; 若本轮无新增 text, 兜底发最后一条 assistant 回复
+        # turn 正常完成。differ 已发本轮新增 text; 若本轮无新增 text, 兜底发最后一条 assistant 回复。
+        # 整体 review P1-4: 删掉此处两处 emitted_text_this_turn=False 冗余自赋值 —
+        # "本轮"标记的 reset 单点在 _get_or_create_differ 的 reset_turn() (每 turn
+        # 入口必调), 这里把一个已是 False 的字段再赋 False 是空操作, 且会掩盖
+        # 「忘了在入口 reset」的未来回归
         if not differ.emitted_text_this_turn:
-            differ.emitted_text_this_turn = False  # reset
             reply_text = self._fetch_last_reply(zcode_sid, differ)
             if reply_text:
                 self._send_acp_notification("session/update", {
@@ -2502,7 +2600,6 @@ class ACPBridge:
                 })
             log(f"session/prompt 完成: stopReason=end_turn, 回复 {len(reply_text)} 字 (兜底)")
         else:
-            differ.emitted_text_this_turn = False  # reset for next turn
             log("session/prompt 完成: stopReason=end_turn, text 已随事件发送")
 
         return {"jsonrpc": "2.0", "id": msg_id,
@@ -2514,13 +2611,21 @@ class ACPBridge:
         """获取或创建 session 级别的 ProjectionDiffer (跨 turn 持久化)。
 
         修复 P1.1: differ 按 session 存, 不每 turn 新建, 避免多轮/resume 误发历史。
+        整体 review P2-1: ACP baseline 无 session 关闭钩, differ 只增不减 → 超
+        _MAX_SESSION_STATES 上限时 FIFO 淘汰最旧条目 (代价: 该 session 再 prompt
+        时会重建 baseline, 可接受), 防长驻进程内存单调增长。
         """
         if not hasattr(self, "_differs"):
             self._differs = {}
         if zcode_sid not in self._differs:
+            if len(self._differs) >= _MAX_SESSION_STATES:
+                evicted = next(iter(self._differs))
+                self._differs.pop(evicted, None)
+                log(f"⚠ differ 超上限 ({_MAX_SESSION_STATES}), "
+                    f"淘汰最旧 session: {evicted}")
             self._differs[zcode_sid] = ProjectionDiffer()
         d = self._differs[zcode_sid]
-        d.reset_turn()  # 重置"本轮"标记
+        d.reset_turn()  # 重置"本轮"标记 (emitted_text_this_turn 的唯一 reset 点)
         return d
 
     def _fetch_messages(self, zcode_sid):
@@ -2594,12 +2699,17 @@ class ACPBridge:
             resp, _ = self.backend.request(zc_id, "session/messages",
                                            {"sessionId": zcode_sid}, timeout=10)
             if "error" in resp or "result" not in resp:
+                # 整体 review P1-6: 重试间隙 drain inbox — 主循环串行, 此处阻塞
+                # 期间到达的 session/cancel 不 drain 就会卡到重试结束才生效
+                self._drain_inbox()
                 time.sleep(0.4)
                 continue
             messages = resp["result"].get("messages", [])
             # 找最后一条 differ 未见的 assistant 消息
             for m in reversed(messages):
-                info = m.get("info", {})
+                if not isinstance(m, dict):
+                    continue  # 整体 review P2-9: 防御非 dict 元素 (与 diff() 风格一致)
+                info = m.get("info", {}) if isinstance(m.get("info"), dict) else {}
                 if info.get("role") != "assistant":
                     continue
                 # 若传了 differ, 跳过已见消息 (避免兜底旧回复)
@@ -2613,6 +2723,7 @@ class ACPBridge:
                 text = "\n".join(texts)
                 if text.strip():  # 拿到非空且未见的文本才返回
                     return text
+            self._drain_inbox()  # P1-6: 同上, 重试间隙让 cancel 可响应
             time.sleep(0.4)  # 还没数据, 等一会再试
         return ""
 
@@ -2730,11 +2841,19 @@ class ACPBridge:
 
     # ---------- 工具方法 ----------
 
+    def _write_stdout(self, obj):
+        """把一帧 JSON 写进 stdout 协议流 (整体 review P1-2: 全文件唯一 stdout 写口)。
+
+        加 _stdout_lock: 主循环响应 / notification / enhance drain 的写帧都走这里,
+        防未来任何后台线程写 stdout 时产生交错的半截 JSON 帧 (ACP client 解析即失败)。
+        """
+        with self._stdout_lock:
+            sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
     def _send_acp_notification(self, method, params):
         """向 ACP client 发 notification (无 id)"""
-        msg = {"jsonrpc": "2.0", "method": method, "params": params}
-        sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        self._write_stdout({"jsonrpc": "2.0", "method": method, "params": params})
 
     def _error(self, msg_id, code, message):
         return {"jsonrpc": "2.0", "id": msg_id,
@@ -2783,6 +2902,10 @@ class ACPBridge:
     def run(self):
         """主循环: 后台线程读 stdin 入队, 主循环从队列取消息处理"""
         log(f"启动 zcode-acp-bridge, ACP protocol v{ACP_PROTOCOL_VERSION}, agent={BRIDGE_INFO['name']}")
+        if DEFAULT_ACP_MODE == "yolo":
+            # 整体 review 安全发现: 启动即显眼标注当前默认 mode 的权限风险
+            log("⚠️ 默认权限模式 mode=yolo: 任意 session/prompt 触发的文件修改与命令 "
+                "执行均无确认; 注重安全可设 ZCODE_ACP_DEFAULT_MODE=build 等收紧默认值")
         self._stdin_thread = threading.Thread(target=self._stdin_reader, daemon=True)
         self._stdin_thread.start()
         while True:
@@ -2803,13 +2926,11 @@ class ACPBridge:
             try:
                 resp = self.handle_acp(req)
                 if resp is not None:
-                    sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                    sys.stdout.flush()
+                    self._write_stdout(resp)  # P1-2: 统一加锁写口
             except Exception as e:
                 log(f"处理异常: {e}")
                 err = self._error(req.get("id"), -32603, str(e))
-                sys.stdout.write(json.dumps(err, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+                self._write_stdout(err)  # P1-2: 统一加锁写口
         log("stdin 关闭, 退出")
         if self.backend:
             self.backend.close()
