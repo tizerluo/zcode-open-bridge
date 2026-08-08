@@ -155,3 +155,12 @@
 ### §2 存活清单补记
 
 - `session/updateRuntimeModelConfig`：commander 实测 0.16.1 仍存活，但 schema 新要求 `runtimeModel.revision`（string）必填。
+
+### headless CLI 参数与权限模式勘误（2026-08-08 review 重构实测）
+
+以下来自 0.16.1 headless 实测（逆向 bundle + 运行验证），触发背景是 MCP server review 体系从 `--mode plan` 重构为「yolo + 写工具物理禁用」：
+
+- **`--allowed-tools` / `--max-turns` 帮助文案有、但未注册 parseArgs**：调用直接报 `Unknown option`，不可用；白名单方向只有 `--disallowed-tools` 可用。
+- **`auto` 权限模式是保留值未实现**：`session/setMode` 切到 `auto` 会导致工具调用全拒，勿用。
+- **headless 下 build/edit 的写操作不是「等授权」而是直接失败**：报 `No permission client configured`。所以自动化场景要么 yolo 全程免授权，要么用 `--disallowed-tools` 物理收权，不存在「build 模式等确认」这条中间路。
+- 附带实证：`--disallowed-tools` 是工具集级物理移除，先于权限层，`--mode yolo` 也绕不过；但必须连 Node REPL 一族（`js` / `mcp__node_repl__js*`）一起禁，否则模型可用 `execSync` 等价执行任意命令打穿 Bash 黑名单（实测复现）。

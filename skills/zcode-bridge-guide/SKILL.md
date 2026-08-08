@@ -86,7 +86,8 @@ for k,v in c['provider'].items():
 ```bash
 zcode --prompt "<prompt>" --attach <file> --mode build --json
 # --mode build   允许写文件 + 执行命令
-# --mode plan    只读分析，不改文件（最安全，适合审查）
+# --mode plan    只读分析，不改文件（注意: 只禁写, 不禁止读探索/子代理;
+#                自动化审查推荐用下方"评审形态"的 yolo+黑名单组合）
 # --mode edit    允许写文件，不执行命令
 # --mode yolo    全自动（--prompt 的默认模式）
 # --json         输出 JSON（含 sessionId, response, usage）
@@ -109,7 +110,15 @@ zcode --target "新目标" --target-replace
 
 ### 评审形态（只读）
 ```bash
-zcode --prompt "<review-prompt>" --attach <file> --mode plan --json
+# MCP server 的 zcode_review 内部用的形态（推荐，物理只读）：
+zcode --prompt "<review-prompt>" --attach <file> --mode yolo \
+  --disallowed-tools "Write Edit MultiEdit ApplyPatch Bash js js_reset js_add_node_module_dir mcp__node_repl__js mcp__node_repl__js_reset mcp__node_repl__js_add_node_module_dir" \
+  --no-color --json
+# 原理: --mode yolo 全程免授权; --disallowed-tools 是工具集级物理移除 (先于权限层,
+# yolo 也绕不过), 写/执行工具连同 Node REPL 一族一起禁 = 改不了任何文件。
+# 注意: js / mcp__node_repl__js* 必须同禁, 否则可被 execSync 打穿 Bash 黑名单 (0.16.1 实测)。
+# 旧形态 --mode plan 已不推荐: plan 只禁"改文件", 读探索/子代理照样放行 (限流超时主因),
+# 且 plan→build 惯性容易让 review 变成"边审边修"。
 ```
 
 ### 显式 env 包装（非交互 shell 用）
@@ -135,7 +144,7 @@ ANTHROPIC_API_KEY="$api_key" ZCODE_BASE_URL="$base_url" ZCODE_MODEL="$model" \
 1. **不支持 stdin 管道**：不能 `cat file | zcode --prompt`，必须用 `--attach`
 2. **无流式输出**（`--stream-json` 不支持）：turn 结束一次性返回
 3. **tool call 轮次不稳定**：duration 38s~100s+，有时不完成
-4. **自由 prompt 可能触发限流**：开放式 prompt 会 spawn 多个 explore 子代理，撞 z.ai 限流。修法：把证据塞进 `--attach`，prompt 写明「不要调用工具/不要 spawn 子代理，只基于附件推理」
+4. **自由 prompt 可能触发限流**：开放式 prompt 会 spawn 多个 explore 子代理，撞 z.ai 限流。修法：把证据塞进 `--attach`，prompt 写明「不要调用工具/不要 spawn 子代理，只基于附件推理」。MCP server 的 `zcode_review` / `zcode_security_review` 两个 tool 已内置此纪律（prompt 内置「只审不修」约束 + 写/执行工具物理禁用 + 证据走附件），走 MCP 调用时无需手工处理
 
 ---
 
@@ -294,7 +303,7 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 
 ## 模式三：MCP tools（MCP client 内直接调用）
 
-MCP server 暴露两个标准 MCP tool，供 Claude Code / Cursor 等 MCP client 调用。
+MCP server 暴露三个标准 MCP tool，供 Claude Code / Cursor 等 MCP client 调用。
 
 ### 注册到 MCP client
 
@@ -318,13 +327,21 @@ MCP server 暴露两个标准 MCP tool，供 Claude Code / Cursor 等 MCP client
 | Tool | 用途 | 安全性 |
 |------|------|--------|
 | `get_zcode_capabilities` | 返回 ZCode 完整能力清单 | 只读 |
-| `zcode_review` | 调用 ZCode 审查代码 | 只读（`--mode plan`，不改文件） |
+| `zcode_review` | 调用 ZCode 审查代码 | 只读（`--mode yolo` + `--disallowed-tools` 物理禁用写/执行工具，全程免授权但改不了文件） |
+| `zcode_security_review` | 安全专项审查：mimosa 规则引擎全仓预扫 → ZCode 逐条核实 findings | 只读（同上；需本机装有 mimosa 或设 `ZCODE_BRIDGE_MIMOSA_ROOT`） |
 
 ### `zcode_review` 参数
 - `files`：要审查的文件路径列表
 - `code`：直接传入代码文本（与 files 二选一或组合）
 - `focus`：审查重点（如 "安全性"、"性能"、"找 bug"）
 - `cwd`：工作目录（影响 zcode 的项目上下文）
+
+### `zcode_security_review` 参数
+- `path`：要扫描审查的项目目录（默认当前目录）
+- `focus`：可选，额外审查重点（如 "重点关注注入与鉴权"）
+- `cwd`：zcode 工作目录（默认与 path 相同）
+
+> 两阶段流程：① mimosa `security_scan`（确定性规则引擎，零 LLM 流量）全仓快扫出 findings；② findings 作 `--attach` 附件喂 zcode 逐条核实（确认漏洞/误报/存疑 + 攻击路径 + 修复建议），并可发现清单之外的问题。mimosa 定位：`ZCODE_BRIDGE_MIMOSA_ROOT` 优先，否则探测 `~/.local/share/mimosa/*` 与 `~/.zcode/cli/plugins/cache/*/mimosa/*`；扫描超时 `ZCODE_BRIDGE_MIMOSA_TIMEOUT`（默认 180s）。
 
 ---
 
@@ -413,7 +430,7 @@ npm test     # 全量，看实际数字
 - 流式事件中的 `agent_message_chunk` → 文本输出（真流式有多段）
 
 ### MCP 模式
-- `zcode_review` 返回 `{content: [{type: "text", text: "..."}]}`
+- `zcode_review` / `zcode_security_review` 返回 `{content: [{type: "text", text: "..."}]}`；text 是 zcode `--json` 输出中提取的 `response` 字段（输出非 JSON 时原样返回）
 - `isError: true` → 失败
 
 ---
