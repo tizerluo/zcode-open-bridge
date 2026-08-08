@@ -151,11 +151,14 @@ class TestToolsListShape(_MainLoopCase):
                 self.assertFalse(t["annotations"]["destructiveHint"])
 
     def test_tl2_order_deterministic(self):
-        """TL2: tools/list 顺序两次调用一致 (2025-11-25 SHOULD 级确定性排序)"""
-        names1 = [t["name"] for t in self.mod.TOOLS]
-        names2 = [t["name"] for t in self.mod.TOOLS]
-        self.assertEqual(names1, names2)
-        self.assertEqual(len(names1), len(set(names1)), "tool 名不得重复")
+        """TL2: 两次 tools/list 响应顺序一致 (走完整主循环路径, 2025-11-25 SHOULD 级)"""
+        req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        r1 = self._run_main([req])
+        r2 = self._run_main([req])
+        n1 = [t["name"] for t in r1[0]["result"]["tools"]]
+        n2 = [t["name"] for t in r2[0]["result"]["tools"]]
+        self.assertEqual(n1, n2)
+        self.assertEqual(len(n1), len(set(n1)), "tool 名不得重复")
 
     def test_tl3_tool_naming_convention(self):
         """TL3: tool 名符合 2025-11-25 命名规范 (1-128 字符, A-Za-z0-9_-.)"""

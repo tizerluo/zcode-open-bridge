@@ -43,6 +43,7 @@ ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 # Kimi Code 0.34 / Cursor / zcode 0.16.1) 实测均兼容 2024-11-05..2025-11-25 全段。
 # 2026-07-28 新纪元 (无状态/server-discover) 见 README 路线图, 另行评估。
 SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+_SUPPORTED_PV_SET = set(SUPPORTED_PROTOCOL_VERSIONS)  # 协商查表用 (list 保留给可读性/有序)
 PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]  # 我们支持的最高版本
 
 # 作为 MCP client 调 mimosa 时用的版本: mimosa 1.0.3 实测讲 2024-11-05,
@@ -716,7 +717,7 @@ TOOLS = [
             "readOnlyHint": True,    # 对被审项目只读 (mimosa 扫描历史写在 ~/.mimosa)
             "destructiveHint": False,
             "idempotentHint": False,
-            "openWorldHint": True,    # 复核阶段调外部 LLM API
+            "openWorldHint": True,    # 复核阶段调外部 LLM API: 数据外发且结果不可复现
         },
         "description": (
             "安全专项审查,两阶段: ① mimosa 确定性规则引擎扫描 (零 LLM 流量,"
@@ -765,7 +766,7 @@ TOOLS = [
             "readOnlyHint": True,    # git/mimosa/zcode 全部只读路径
             "destructiveHint": False,
             "idempotentHint": False,
-            "openWorldHint": True,    # 复核阶段调外部 LLM API
+            "openWorldHint": True,    # 复核阶段调外部 LLM API: 数据外发且结果不可复现
         },
         "description": (
             "PR 审查模式: 自动算 git diff (base...HEAD, merge-base 语义) 得到改动清单,"
@@ -1274,11 +1275,12 @@ def handle_request(req):
         # (legacy lifecycle 规则; client 不认会自行断开)
         params = req.get("params") or {}
         requested = params.get("protocolVersion")
-        negotiated = requested if requested in SUPPORTED_PROTOCOL_VERSIONS \
+        negotiated = requested if (isinstance(requested, str)
+                                   and requested in _SUPPORTED_PV_SET) \
             else PROTOCOL_VERSION
         return make_response(msg_id, {
             "protocolVersion": negotiated,
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {"listChanged": False}},  # 工具集静态, 明确声明
             "serverInfo": SERVER_INFO,
         })
 
@@ -1335,7 +1337,7 @@ def main():
             log("收到非 JSON-RPC 对象消息 (batch?), 拒绝")
             send_message(make_error(
                 None, -32600,
-                "Invalid Request: 只接受单个 JSON-RPC 对象 (batch 已于 2025-06-18 从规范移除)"))
+                "Invalid Request: 仅接受单个 JSON-RPC 对象"))
             continue
 
         try:
