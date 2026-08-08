@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+"""
+zcode-review-gate — PR 自动审查闸门守护进程 (zcode-open-bridge 第 4 组件)
+
+常驻轮询配置的 GitHub 仓库: 对每个 open PR 的新 head sha, 通过 bridge 的
+`zcode-mcp-server --call zcode_pr_review` 完成审查 (git diff + mimosa 深扫
++ ZCode 只读复核), 把带 verdict (pass/concerns) 的结果回贴为 PR 评论。
+
+设计要点:
+  - 审查一律经 mcp-server 子进程 (--call 一次性模式) 完成: 跨进程文件锁、
+    限流退避重试、yolo 只读护栏全部复用 TOOL_HANDLERS 同源路径, 本组件
+    不 import/exec mcp-server 源码, 更不重造这些机制。
+  - 同一 head sha 不重复审 (state 文件去重); 失败按指数退避重试, 超限
+    gave_up; head 更新 (force-push / 新 commit) 自动复活重审。
+  - token 不落盘: 只经 `git -c http.extraHeader` 逐命令进程内注入; clone
+    URL / .git/config / state / config 文件里都没有 token。
+  - verdict 解析是确定性 fail-safe: 严重度分布解析不出来一律按 concerns。
+
+依赖: 仅 Python3 标准库 (零第三方依赖)
+日志: 全部走 stderr (带时间戳前缀)
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+VERSION = "0.1.0"
+
+DEFAULT_CONFIG_PATH = "~/.config/zcode-review-gate/config.json"
+DEFAULT_STATE_FILE = "~/.local/state/zcode-review-gate/state.json"
+DEFAULT_CLONE_ROOT = "~/.local/state/zcode-review-gate/clones"
+DEFAULT_MCP_SERVER = "zcode-mcp-server"
+DEFAULT_GITHUB_API = "https://api.github.com"
+
+HTTP_TIMEOUT = 30           # GitHub API 单请求超时 (秒)
+GIT_TIMEOUT = 120           # 单条 git 命令超时 (秒)
+REVIEW_TIMEOUT = 3600       # 单次 zcode 审查超时 (秒; deep 档 mimosa+zcode 很慢)
+PULLS_PER_PAGE = 100        # pulls 列表每页条数 (GitHub 上限)
+PULLS_MAX_PAGES = 10        # 分页兜底: 单仓 open PR 超过 1000 个极罕见
+VERDICT_SCAN_HEAD = 3000    # verdict 只扫报告前 N 字符 (汇总段在开头, 防正文干扰)
+
+# 严重度分布解析: 在报告开头找 "P0 ... <数字>" 三段。确定性 fail-safe:
+# 宁可解析失败按 concerns, 也不猜。P 必须大写 (不用 IGNORECASE),
+# 防正文里 "p0" 之类的偶然命中。
+_RE_P0 = re.compile(r"P0[^\d]{0,12}(\d+)")
+_RE_P1 = re.compile(r"P1[^\d]{0,12}(\d+)")
+_RE_P2 = re.compile(r"P2[^\d]{0,12}(\d+)")
+
+_TRUNC_MARK = "\n\n[... 报告超长已截断 ...]"
+
+_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
+_LOG_LEVEL = "INFO"
+
+_SHUTDOWN = False
+
+
+def log(msg, level="INFO"):
+    """日志走 stderr, 带时间戳前缀; 低于 --log-level 阈值的不打。"""
+    if _LOG_LEVELS.get(level, 20) < _LOG_LEVELS.get(_LOG_LEVEL, 20):
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
+
+
+# ============================================================
+# 错误分类 (决定走退避还是跳仓)
+# ============================================================
+class RateLimited(Exception):
+    """GitHub API 限流 (403 + X-RateLimit-Remaining: 0)。
+
+    reset_at 为 unix 秒; 本轮跳过该仓, 下个 poll 周期自然重试
+    (不烧 PR 重试次数 — 限流是仓级事件, 不是单个 PR 的错)。
+    """
+
+    def __init__(self, reset_at):
+        super().__init__(f"GitHub API rate limited (reset at {reset_at})")
+        self.reset_at = reset_at
+
+
+class RetryableError(Exception):
+    """可重试错误 (5xx / 网络异常等): 进该 PR 的指数退避。"""
+
+
+class RepoHardError(Exception):
+    """仓库级硬错误 (404 不存在/无权限): log + 跳过该仓, 不进 PR 退避。"""
+
+
+class GitError(Exception):
+    """git 命令失败 (clone/fetch 等)。"""
+
+
+# ============================================================
+# 配置
+# ============================================================
+def _as_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class GateConfig:
+    """运行配置: 全部键可选有默认值; env 覆盖见 apply_env_overrides。
+
+    对应配置文件 (JSON):
+      repos / poll_interval_seconds / state_file / clone_root / mcp_server /
+      github_api / review.{depth,focus} / retry.{base_seconds,max_seconds,
+      max_attempts} / comment.{enabled,max_body}
+    """
+
+    def __init__(self, data):
+        data = data or {}
+        self.repos = list(data.get("repos") or [])
+        self.poll_interval = _as_int(data.get("poll_interval_seconds"), 300)
+        self.state_file = os.path.expanduser(
+            data.get("state_file") or DEFAULT_STATE_FILE)
+        self.clone_root = os.path.expanduser(
+            data.get("clone_root") or DEFAULT_CLONE_ROOT)
+        self.mcp_server = data.get("mcp_server") or DEFAULT_MCP_SERVER
+        self.github_api = (data.get("github_api")
+                           or DEFAULT_GITHUB_API).rstrip("/")
+
+        review = data.get("review") or {}
+        self.review_depth = review.get("depth") or "deep"
+        if self.review_depth not in ("normal", "deep"):
+            # mcp-server 侧只认 normal|deep, 非法值会在审查时报错烧重试次数,
+            # 不如启动时就回退默认值并告警
+            log(f"非法 review.depth {self.review_depth!r}, 回退 deep", "WARNING")
+            self.review_depth = "deep"
+        self.review_focus = review.get("focus") or ""
+
+        retry = data.get("retry") or {}
+        self.retry_base = _as_int(retry.get("base_seconds"), 300)
+        self.retry_max = _as_int(retry.get("max_seconds"), 3600)
+        self.retry_max_attempts = _as_int(retry.get("max_attempts"), 5)
+
+        comment = data.get("comment") or {}
+        self.comment_enabled = bool(comment.get("enabled", True))
+        self.comment_max_body = _as_int(comment.get("max_body"), 60000)
+
+    def apply_env_overrides(self):
+        """env 覆盖 (优先级高于配置文件, 方便 systemd unit 里调 Environment=)。"""
+        env = os.environ
+        if env.get("GATE_STATE_FILE"):
+            self.state_file = os.path.expanduser(env["GATE_STATE_FILE"])
+        if env.get("GATE_CLONE_ROOT"):
+            self.clone_root = os.path.expanduser(env["GATE_CLONE_ROOT"])
+        if env.get("GATE_MCP_SERVER"):
+            self.mcp_server = env["GATE_MCP_SERVER"]
+        if env.get("GATE_POLL_INTERVAL"):
+            self.poll_interval = _as_int(env["GATE_POLL_INTERVAL"],
+                                         self.poll_interval)
+
+
+def load_config(path):
+    """读 JSON 配置: 文件不存在 → 全默认; 存在但解析失败 → 致命错误退出。
+
+    解析失败不退回默认是有意的: 用户明明写了配置却被静默忽略最难排查
+    (接着报"未配置仓库"会让人找错方向), 直接报真正的错。
+    """
+    expanded = os.path.expanduser(path)
+    if not os.path.isfile(expanded):
+        log(f"配置文件 {expanded} 不存在, 使用默认配置")
+        return GateConfig({})
+    try:
+        with open(expanded) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise SystemExit(f"配置文件 {expanded} 解析失败: {e}") from e
+    if not isinstance(data, dict):
+        raise SystemExit(f"配置文件 {expanded} 根节点必须是 JSON 对象")
+    log(f"已加载配置 {expanded}")
+    cfg = GateConfig(data)
+    cfg.apply_env_overrides()
+    return cfg
+
+
+# ============================================================
+# GitHub token (级联解析, 不落盘)
+# ============================================================
+def resolve_token():
+    """GitHub token 级联: GITHUB_TOKEN → GH_TOKEN → `gh auth token`。
+
+    无 token 不是致命错误: 公开仓的 pulls 列表与 git clone/fetch 可匿名;
+    但发评论必须要 token — 评论时无 token 算失败, 进 PR 退避。
+    """
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        token = (os.environ.get(var) or "").strip()
+        if token:
+            return token
+    try:
+        p = subprocess.run(["gh", "auth", "token"],
+                           capture_output=True, text=True, timeout=10)
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"gh auth token 不可用 ({e}); 未装 gh 或不在 PATH 属正常", "DEBUG")
+    return None
+
+
+# ============================================================
+# GitHub REST API (urllib)
+# ============================================================
+def github_request(token, api_base, method, path, body=None):
+    """一次 GitHub REST 调用, 返回解析后的 JSON; 错误按语义分类抛异常。"""
+    headers = {
+        "User-Agent": "zcode-review-gate",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(api_base + path, data=data,
+                                 headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw.strip() else None
+    except urllib.error.HTTPError as e:
+        hdrs = e.headers or {}
+        if e.code == 403 and hdrs.get("X-RateLimit-Remaining") == "0":
+            reset = hdrs.get("X-RateLimit-Reset") or "0"
+            raise RateLimited(int(reset) if reset.isdigit() else 0) from e
+        if e.code == 404:
+            raise RepoHardError(f"404 Not Found: {api_base}{path}") from e
+        if e.code >= 500:
+            raise RetryableError(f"HTTP {e.code}: {api_base}{path}") from e
+        # 其他 4xx (401/422/非限流 403): 重试多半也失败, 但会在
+        # max_attempts 后 gave_up, 方向 fail-safe
+        raise RetryableError(f"HTTP {e.code} (未分类 4xx): {api_base}{path}") from e
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        raise RetryableError(f"网络/解析错误: {e}") from e
+
+
+def list_open_prs(token, api_base, owner, repo):
+    """分页拉取 open PR (per_page=100, 最多 PULLS_MAX_PAGES 页兜底)。"""
+    prs = []
+    for page in range(1, PULLS_MAX_PAGES + 1):
+        batch = github_request(
+            token, api_base, "GET",
+            f"/repos/{owner}/{repo}/pulls?state=open"
+            f"&per_page={PULLS_PER_PAGE}&page={page}")
+        if not batch:
+            break
+        prs.extend(batch)
+        if len(batch) < PULLS_PER_PAGE:
+            break
+    return prs
+
+
+def post_comment(token, api_base, owner, repo, pr_number, body):
+    """在 PR 下发评论 (issues comments 端点; PR 本质上是带代码的 issue)。"""
+    return github_request(
+        token, api_base, "POST",
+        f"/repos/{owner}/{repo}/issues/{pr_number}/comments",
+        body={"body": body})
+
+
+# ============================================================
+# git 操作 (subprocess; token 只经进程内 header 注入)
+# ============================================================
+def git(args, token=None):
+    """执行一条 git 命令, 失败抛 GitError, 成功返回 stdout。
+
+    token 只经 `-c http.extraHeader` 逐命令进程内注入 (不写 .git/config);
+    错误信息只回显业务 args 不碰 header 部分, 保证 token 不进日志。
+    """
+    cmd = ["git"]
+    if token:
+        cmd += ["-c", f"http.extraHeader=Authorization: Bearer {token}"]
+    cmd += list(args)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=GIT_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        raise GitError(f"git {args[0]} 超时 ({GIT_TIMEOUT}s)") from e
+    except OSError as e:
+        raise GitError(f"git 不可执行: {e}") from e
+    if p.returncode != 0:
+        detail = (p.stderr or "").strip()[:500]
+        raise GitError(f"git {args[0]} 失败 (exit={p.returncode}): {detail}")
+    return p.stdout
+
+
+def ensure_clone(cfg, token, owner, repo):
+    """确保本地 clone 存在, 返回 clone 路径。
+
+    clone URL 不含 token (匿名 https + extraHeader 认证, token 不落盘);
+    目录名 owner__repo ("/" 不能进目录名)。
+    """
+    dest = os.path.join(cfg.clone_root, f"{owner}__{repo}")
+    if os.path.isdir(os.path.join(dest, ".git")):
+        return dest
+    os.makedirs(cfg.clone_root, exist_ok=True)
+    url = f"https://github.com/{owner}/{repo}.git"
+    log(f"clone {owner}/{repo} → {dest}")
+    git(["clone", url, dest], token=token)
+    return dest
+
+
+def fetch_repo(clone, token):
+    """每轮一次的整仓 fetch (--prune 清掉远端已删的分支)。"""
+    git(["-C", clone, "fetch", "origin", "--prune"], token=token)
+
+
+def fetch_pr_refs(clone, token, pr_number, base_ref):
+    """拉单个 PR 的 head ref 与 base 分支, 保证 head sha 与 merge-base 本地可见。
+
+    PR head 走 refs/pull/{n}/head (fork 来的 PR 也能拿到), 落到
+    refs/remotes/pr/{n}; base 落到 refs/remotes/origin/{base_ref},
+    供审查参数里的 `origin/<base>` 引用。
+    """
+    git(["-C", clone, "fetch", "origin",
+         f"+refs/pull/{pr_number}/head:refs/remotes/pr/{pr_number}"],
+        token=token)
+    git(["-C", clone, "fetch", "origin",
+         f"+refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"],
+        token=token)
+
+
+# ============================================================
+# 审查调用 (经 mcp-server --call 子进程)
+# ============================================================
+def _result_text(data):
+    """从 --call 输出取 result.content[0].text (MCP result 的标准形状)。"""
+    result = (data or {}).get("result") or {}
+    content = result.get("content") or []
+    if content and isinstance(content[0], dict):
+        return content[0].get("text") or ""
+    return ""
+
+
+def run_review(cfg, clone, base_ref, head_sha):
+    """经 mcp-server --call 调 zcode_pr_review, 返回 (ok, 报告正文 | 错误描述)。
+
+    锁/限流重试/只读护栏全在 mcp-server 侧 (TOOL_HANDLERS 同源路径), 这里
+    只做进程调用与结果解包。base 必须带 origin/ 前缀 — mcp-server 的 diff
+    是 base...head 三点语法 (merge-base 语义), 引用要指向远端跟踪分支。
+    """
+    args = {
+        "path": clone,
+        "base": f"origin/{base_ref}",
+        "head": head_sha,
+        "depth": cfg.review_depth,
+        "focus": cfg.review_focus,
+    }
+    cmd = [cfg.mcp_server, "--call", "zcode_pr_review",
+           json.dumps(args, ensure_ascii=False)]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=REVIEW_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, f"审查子进程超时 ({REVIEW_TIMEOUT}s)"
+    except OSError as e:
+        return False, f"无法执行 mcp-server ({cfg.mcp_server}): {e}"
+    out = (p.stdout or "").strip()
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return False, f"mcp-server 输出非 JSON (exit={p.returncode}): {out[:300]}"
+    if p.returncode != 0 or not data.get("ok"):
+        return False, f"审查失败 (exit={p.returncode}): {_result_text(data)[:500]}"
+    text = _result_text(data)
+    if not text:
+        return False, "mcp-server 返回空报告"
+    return True, text
+
+
+# ============================================================
+# verdict 解析 (确定性, fail-safe)
+# ============================================================
+def parse_severity_counts(report):
+    """从报告前 VERDICT_SCAN_HEAD 字符解析 (P0, P1, P2) 条数; 任一缺失 → None。"""
+    head = (report or "")[:VERDICT_SCAN_HEAD]
+    counts = []
+    for pattern in (_RE_P0, _RE_P1, _RE_P2):
+        m = pattern.search(head)
+        if not m:
+            return None
+        counts.append(int(m.group(1)))
+    return tuple(counts)
+
+
+def verdict_from_counts(counts):
+    """counts=None (解析失败) → concerns (fail-safe); P0/P1>0 → concerns; 否则 pass。"""
+    if counts is None:
+        return "concerns"
+    return "concerns" if (counts[0] > 0 or counts[1] > 0) else "pass"
+
+
+def build_comment_body(verdict, counts, head_sha, report, max_body):
+    """拼 GitHub 评论 markdown; 超 max_body 时截断报告正文并标注。
+
+    max_body 默认 60000, 低于 GitHub 评论 65536 硬上限留余量; 只截报告
+    正文, 头部的 verdict 表格与尾部署名永远完整。
+    """
+    def assemble(body_text):
+        icon = "✅ pass" if verdict == "pass" else "⚠️ concerns"
+        if counts is not None:
+            sev = f"P0 × {counts[0]} · P1 × {counts[1]} · P2 × {counts[2]}"
+        else:
+            sev = "解析失败（严重度分布解析失败，请人工核对）"
+        conclusion = ("未发现阻断问题，可以合并" if verdict == "pass"
+                      else "存在需关注的问题，合并前请处理")
+        return (
+            f"## ZCode Review Gate：{icon}\n\n"
+            "| 项 | 值 |\n"
+            "|---|---|\n"
+            f"| head | `{head_sha[:12]}` |\n"
+            f"| 严重度分布 | {sev} |\n"
+            f"| 结论 | {conclusion} |\n"
+            "\n"
+            "<details><summary>完整审查报告（zcode_pr_review：git diff + "
+            "mimosa 深扫 + ZCode 只读复核）</summary>\n"
+            "\n"
+            f"{body_text}\n"
+            "\n"
+            "</details>\n"
+            "\n"
+            "---\n"
+            "<sub>由 [zcode-review-gate]"
+            "(https://github.com/tizerluo/zcode-open-bridge) 自动审查 · "
+            "写工具物理禁用 · 同一 head 不重复审</sub>"
+        )
+
+    body = assemble(report)
+    if len(body) <= max_body:
+        return body
+    budget = max(max_body - len(assemble("")) - len(_TRUNC_MARK), 0)
+    return assemble(report[:budget] + _TRUNC_MARK)
+
+
+# ============================================================
+# 状态文件 (JSON, 原子写)
+# ============================================================
+class StateStore:
+    """PR 审查状态 (JSON 文件, 原子写: 同目录 tmp + os.replace)。
+
+    形状: {"prs": {"owner/repo#5": {head_sha, status, verdict, attempts,
+    next_retry_at, reviewed_at, comment_url, error}}}
+    status ∈ pending|reviewed|failed|gave_up (pending 只在一轮处理中瞬态
+    存在; 崩溃残留时下轮会被当作待审自然恢复)。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.data = {"prs": {}}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except (json.JSONDecodeError, OSError) as e:
+            log(f"state 文件 {self.path} 损坏, 从零开始: {e}", "WARNING")
+            return
+        if isinstance(data, dict) and isinstance(data.get("prs"), dict):
+            self.data = data
+        else:
+            log(f"state 文件 {self.path} 形状非法, 从零开始", "WARNING")
+
+    def save(self):
+        """原子落盘 (os.replace 同目录换名, 防中途断电留半个 JSON)。"""
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.path)
+
+    def get(self, key):
+        return self.data["prs"].get(key)
+
+    def put(self, key, entry):
+        self.data["prs"][key] = entry
+
+
+# ============================================================
+# 去重 / 退避状态机
+# ============================================================
+def needs_review(entry, head_sha, now):
+    """去重/退避判定: 这个 PR 的当前 head 本轮要不要审。"""
+    if entry is None:
+        return True                                     # 首见
+    if entry.get("head_sha") != head_sha:
+        return True                                     # head 更新 → 重审 (复活)
+    status = entry.get("status")
+    if status in ("reviewed", "gave_up"):
+        return False                                    # 同 sha 已审 / 已放弃
+    if status == "failed" and float(entry.get("next_retry_at") or 0) > now:
+        return False                                    # 退避未到点
+    return True                     # failed 到点重试 / pending 断点恢复
+
+
+def mark_failure(entry, error, now, cfg):
+    """记录一次失败: attempts+1; 超限 gave_up, 否则指数退避。
+
+    退避: base * 2**(attempts-1) 封顶 max_seconds
+    (默认 300 → 600 → 1200 → 2400 → gave_up@5次)。
+    """
+    entry["attempts"] = int(entry.get("attempts") or 0) + 1
+    entry["error"] = str(error)[:500]
+    entry["verdict"] = None
+    if entry["attempts"] >= cfg.retry_max_attempts:
+        entry["status"] = "gave_up"
+        entry["next_retry_at"] = 0.0
+        log(f"    已达最大重试 {cfg.retry_max_attempts} 次, gave_up "
+            f"(head 更新才复活): {entry['error'][:200]}")
+    else:
+        entry["status"] = "failed"
+        delay = min(cfg.retry_base * 2 ** (entry["attempts"] - 1),
+                    cfg.retry_max)
+        entry["next_retry_at"] = now + delay
+        log(f"    失败 (第 {entry['attempts']} 次), {int(delay)}s 后重试: "
+            f"{entry['error'][:200]}")
+
+
+def mark_reviewed(entry, verdict, comment_url):
+    """审查+评论完成: 落 verdict 与时间戳, attempts 归零。"""
+    entry["status"] = "reviewed"
+    entry["verdict"] = verdict
+    entry["error"] = ""
+    entry["attempts"] = 0
+    entry["next_retry_at"] = 0.0
+    entry["comment_url"] = comment_url
+    entry["reviewed_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+# ============================================================
+# 主流程
+# ============================================================
+def _pr_info(pr):
+    """从 pulls REST 响应提取处理所需字段。
+
+    REST 的 head sha 在 pr["head"]["sha"] (GraphQL 里叫 headRefOid),
+    base 分支名在 pr["base"]["ref"]。
+    """
+    return {
+        "number": pr.get("number"),
+        "head_sha": (pr.get("head") or {}).get("sha") or "",
+        "base_ref": (pr.get("base") or {}).get("ref") or "main",
+        "title": pr.get("title") or "",
+    }
+
+
+def process_pr(cfg, state, token, owner, repo, clone, info, now):
+    """单个 PR 全链路: 取 ref → 审查 → verdict → 评论 → 落状态。
+
+    RateLimited (评论时遇限流) 不在此捕获, 上抛 process_repo 停本轮。
+    """
+    key = f"{owner}/{repo}#{info['number']}"
+    head_sha = info["head_sha"]
+    entry = state.get(key)
+    if entry is not None and entry.get("head_sha") != head_sha:
+        log(f"{key}: 新 head {head_sha[:12]} "
+            f"(旧 {str(entry.get('head_sha') or '')[:12]}), 重置重审")
+        entry = None        # head 变化 → 换新 entry, attempts 随之清零
+    if entry is None:
+        entry = {"head_sha": head_sha, "status": "pending", "verdict": None,
+                 "attempts": 0, "next_retry_at": 0.0, "reviewed_at": "",
+                 "comment_url": "", "error": ""}
+        state.put(key, entry)
+
+    try:
+        fetch_pr_refs(clone, token, info["number"], info["base_ref"])
+    except GitError as e:
+        mark_failure(entry, f"git fetch 失败: {e}", now, cfg)
+        return
+
+    log(f"{key}: 开始审查 head={head_sha[:12]} "
+        f"base=origin/{info['base_ref']} depth={cfg.review_depth}")
+    ok, payload = run_review(cfg, clone, info["base_ref"], head_sha)
+    if not ok:
+        mark_failure(entry, payload, now, cfg)
+        return
+
+    report = payload
+    counts = parse_severity_counts(report)
+    verdict = verdict_from_counts(counts)
+    if counts is None:
+        log(f"{key}: verdict=concerns (严重度分布解析失败, fail-safe 请人工核对)")
+    else:
+        log(f"{key}: verdict={verdict} "
+            f"(P0={counts[0]} P1={counts[1]} P2={counts[2]})")
+
+    comment_url = ""
+    if cfg.comment_enabled:
+        if not token:
+            mark_failure(entry, "发评论需要 GitHub token "
+                         "(GITHUB_TOKEN/GH_TOKEN/gh auth token), 当前均无",
+                         now, cfg)
+            return
+        body = build_comment_body(verdict, counts, head_sha, report,
+                                  cfg.comment_max_body)
+        try:
+            resp = post_comment(token, cfg.github_api, owner, repo,
+                                info["number"], body)
+            comment_url = (resp or {}).get("html_url") or ""
+            log(f"{key}: 评论已发布 {comment_url or '(无返回 url)'}")
+        except RetryableError as e:
+            mark_failure(entry, f"评论发布失败: {e}", now, cfg)
+            return
+        except RepoHardError as e:
+            # 评论 404: PR 在拉取列表后被关闭/删除属常态, 不烧重试次数,
+            # 留下次轮询的列表自然收敛
+            log(f"{key}: 评论端点 404 (PR 已关闭?), 跳过: {e}", "WARNING")
+            return
+    else:
+        log(f"{key}: 评论已禁用 (comment.enabled=false), 只落状态")
+
+    mark_reviewed(entry, verdict, comment_url)
+
+
+def process_repo(cfg, state, token, repo_full, pr_filter, now):
+    """一个仓库的一轮: 拉 open PR → 筛出待审 → 准备 clone → 逐 PR 处理。"""
+    owner, sep, repo = repo_full.partition("/")
+    if not sep or not owner or not repo or "/" in repo:
+        log(f"非法仓库格式 {repo_full!r} (应为 owner/name), 跳过", "ERROR")
+        return
+    log(f"--- {owner}/{repo} ---")
+    try:
+        raw_prs = list_open_prs(token, cfg.github_api, owner, repo)
+    except RateLimited as e:
+        reset = (time.strftime("%H:%M:%S", time.localtime(e.reset_at))
+                 if e.reset_at else "未知")
+        log(f"{repo_full}: API 限流, 本轮跳过 (reset: {reset})", "WARNING")
+        return
+    except RepoHardError as e:
+        log(f"{repo_full}: {e} — 仓库不存在或无权限, 本轮跳过", "ERROR")
+        return
+    except RetryableError as e:
+        log(f"{repo_full}: 拉取 PR 列表失败, 下轮重试: {e}", "WARNING")
+        return
+
+    infos = [i for i in (_pr_info(p) for p in raw_prs)
+             if i["number"] and i["head_sha"]]
+    if pr_filter:
+        infos = [i for i in infos if i["number"] in pr_filter]
+    todo = [i for i in infos
+            if needs_review(state.get(f"{owner}/{repo}#{i['number']}"),
+                            i["head_sha"], now)]
+    if not todo:
+        log(f"{repo_full}: {len(infos)} 个 open PR, 无待审新 head")
+        return
+    log(f"{repo_full}: {len(infos)} 个 open PR, {len(todo)} 个待审")
+
+    try:
+        clone = ensure_clone(cfg, token, owner, repo)
+        fetch_repo(clone, token)
+    except GitError as e:
+        # 仓库级 git 失败 (网络抖动/磁盘满等) 不该烧各 PR 的重试次数:
+        # 本轮整体跳过, 下个 poll 周期自然重试
+        log(f"{repo_full}: git 准备失败, 本轮跳过 (不消耗 PR 重试): {e}",
+            "ERROR")
+        return
+
+    for info in todo:
+        key = f"{owner}/{repo}#{info['number']}"
+        try:
+            process_pr(cfg, state, token, owner, repo, clone, info, now)
+        except RateLimited as e:
+            log(f"{repo_full}: 发评论时遇限流, 本轮停止 "
+                f"(reset: {e.reset_at})", "WARNING")
+            return
+        except Exception as e:  # 单 PR 意外不拖垮守护进程 (fail-safe 进退避)
+            log(f"{key}: 未预期异常: {e}", "ERROR")
+            entry = state.get(key)
+            if entry is not None:
+                mark_failure(entry, f"内部异常: {e}", now, cfg)
+        finally:
+            state.save()    # 每个 PR 处理完立即落盘, 崩溃不丢进度
+
+
+def run_once(cfg, pr_filter=None):
+    """跑一轮全部仓库。"""
+    log("===== 轮询开始 =====")
+    token = resolve_token()
+    if not token:
+        log("无 GitHub token: 公开仓可匿名只读, 但评论会失败进退避 "
+            "(设 GITHUB_TOKEN 或 gh auth login)", "WARNING")
+    state = StateStore(cfg.state_file)
+    now = time.time()
+    for repo_full in cfg.repos:
+        process_repo(cfg, state, token, repo_full, pr_filter, now)
+    log("===== 轮询结束 =====")
+
+
+# ============================================================
+# CLI / 守护循环
+# ============================================================
+def _on_signal(signum, _frame):
+    """SIGTERM/SIGINT 只置标志, 主循环在本轮边界优雅退出。"""
+    global _SHUTDOWN
+    log(f"收到信号 {signum}, 本轮结束后退出")
+    _SHUTDOWN = True
+
+
+def _interruptible_sleep(seconds):
+    """分段 sleep, 每秒检查一次退出标志 (响应 SIGTERM 不拖延)。"""
+    deadline = time.time() + seconds
+    while not _SHUTDOWN and time.time() < deadline:
+        time.sleep(min(1.0, max(0.0, deadline - time.time())))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="zcode-review-gate",
+        description="PR 自动审查闸门: 轮询 GitHub open PR, 对新 head 调 "
+                    "zcode_pr_review 审查并把 verdict 回贴为 PR 评论")
+    parser.add_argument(
+        "--config", metavar="PATH",
+        default=os.environ.get("GATE_CONFIG", DEFAULT_CONFIG_PATH),
+        help=f"配置文件路径 (默认 {DEFAULT_CONFIG_PATH}; env GATE_CONFIG 覆盖)")
+    parser.add_argument("--once", action="store_true",
+                        help="只跑一轮立即退出 (cron / 调试实测用)")
+    parser.add_argument("--repo", action="append", dest="repos", default=[],
+                        metavar="owner/name",
+                        help="只监控指定仓库 (可多次; 覆盖配置文件 repos)")
+    parser.add_argument("--pr", action="append", dest="prs", type=int,
+                        default=[], metavar="N",
+                        help="只处理指定 PR 号 (可多次; 调试/实测用)")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=sorted(_LOG_LEVELS),
+                        help="日志级别 (默认 INFO)")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {VERSION}")
+    args = parser.parse_args(argv)
+
+    global _LOG_LEVEL
+    _LOG_LEVEL = args.log_level
+
+    cfg = load_config(args.config)
+    if args.repos:
+        cfg.repos = args.repos      # CLI 显式指定优先于配置文件 repos
+    if not cfg.repos:
+        print("错误: 未配置任何仓库 — 在配置文件 repos 或用 "
+              "--repo owner/name 指定", file=sys.stderr)
+        return 2
+    pr_filter = set(args.prs) or None
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    if args.once:
+        run_once(cfg, pr_filter)
+        return 0
+
+    log(f"进入守护循环: repos={cfg.repos} poll_interval={cfg.poll_interval}s "
+        f"state={cfg.state_file} clone_root={cfg.clone_root}")
+    while not _SHUTDOWN:
+        run_once(cfg, pr_filter)
+        _interruptible_sleep(cfg.poll_interval)
+    log("优雅退出")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
