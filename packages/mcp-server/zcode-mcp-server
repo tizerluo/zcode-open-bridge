@@ -6,8 +6,9 @@ zcode-mcp-server — 把 headless ZCode 能力暴露为标准 MCP server
 Claude Code、Cursor 等) 能标准化地发现并调用 headless zcode。
 
 暴露的 tools:
-  1. get_zcode_capabilities — 返回 headless zcode 完整能力清单 (JSON)
-  2. zcode_review           — 直接调 zcode 审查代码 (封装 --prompt + --attach + --mode plan)
+  1. get_zcode_capabilities  — 返回 headless zcode 完整能力清单 (JSON)
+  2. zcode_review            — 调 zcode 审查代码 (yolo + 写工具物理禁用, 免授权且只读)
+  3. zcode_security_review   — mimosa 规则引擎预扫 + zcode 只读逐条复核 (安全专项)
 
 协议: MCP over stdio (JSON-RPC 2.0, 每行一条消息)
 日志: 全部走 stderr (绝不污染 stdout 协议流)
@@ -19,6 +20,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import time
@@ -36,7 +38,7 @@ ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 
 # MCP 协议版本
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "zcode-mcp-server", "version": "1.0.0"}
+SERVER_INFO = {"name": "zcode-mcp-server", "version": "1.1.0"}
 
 
 def log(msg):
@@ -239,6 +241,169 @@ class ReviewFileLock:
 
 
 # ============================================================
+# Review 只读护栏 (2026-08-08 重构: 告别 --mode plan)
+# ------------------------------------------------------------
+# 旧实现用 --mode plan 求"只读", 但 plan 只禁"改文件": 读探索/子代理照样放
+# 行 (限流与超时主因), 且 plan→build 的规划惯性会让 review 顺手变成"边审边修"。
+# 0.16.1 实测结论 (逆向 bundle + headless 验证):
+#   - --disallowed-tools 是工具集级物理移除, 先于权限层, yolo 也绕不过;
+#   - 必须连 Node REPL 一族 (js / mcp__node_repl__js*) 一起禁, 否则模型可
+#     用 execSync 等价执行任意命令打穿 Bash 黑名单 (实测复现);
+#   - --mode yolo 全程免授权; headless 下 build/edit 的写操作不是"等授权"
+#     而是直接报 "No permission client configured" 失败;
+#   - --allowed-tools / --max-turns 帮助文案有, 但未注册 parseArgs (实测
+#     Unknown option), 不可用; auto 模式是保留值未实现。
+# 组合: --mode yolo (免授权) + 全量写/执行黑名单 (物理只读, 读工具全开)。
+# ============================================================
+REVIEW_DISALLOWED_TOOLS = (
+    "Write Edit MultiEdit ApplyPatch Bash "
+    "js js_reset js_add_node_module_dir "
+    "mcp__node_repl__js mcp__node_repl__js_reset mcp__node_repl__js_add_node_module_dir"
+)
+
+
+def _find_mimosa_root():
+    """定位 mimosa 插件根目录 (含 payload/dist/mcp/server.js 的那层)。
+
+    ZCODE_BRIDGE_MIMOSA_ROOT 优先; 否则探测常见安装位 (独立副本 + zcode
+    插件缓存), 同目录多版本取路径排序最大者。找不到返回 None。
+    """
+    env_root = os.environ.get("ZCODE_BRIDGE_MIMOSA_ROOT")
+    candidates = [env_root] if env_root else []
+    home = Path.home()
+    for pat in (".local/share/mimosa/*",
+                ".zcode/cli/plugins/cache/*/mimosa/*"):
+        candidates.extend(str(p) for p in sorted(home.glob(pat), reverse=True))
+    for c in candidates:
+        if c and (Path(c) / "payload" / "dist" / "mcp" / "server.js").exists():
+            return c
+    return None
+
+
+class MimosaMcpClient:
+    """极简 stdio MCP client (JSON-RPC 2.0, 每行一条消息, posix select 超时)。
+
+    用于把 mimosa 插件的 MCP server (payload/dist/mcp/server.js) 当子进程
+    直接调用, 不经过 zcode 插件体系。仅实现 initialize + tools/call。
+    """
+
+    def __init__(self, root, cwd, timeout=120):
+        server_js = Path(root) / "payload" / "dist" / "mcp" / "server.js"
+        if not server_js.exists():
+            raise FileNotFoundError(f"mimosa MCP server 不存在: {server_js}")
+        env = dict(os.environ)
+        env["ZCODE_PLUGIN_ROOT"] = str(root)
+        env.setdefault("MIMOSA_ENGINE", "native")
+        self._proc = subprocess.Popen(
+            ["node", str(server_js)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, cwd=cwd, env=env,
+        )
+        self.timeout = timeout
+        self._id = 0
+
+    def _send(self, msg):
+        self._proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        self._proc.stdin.flush()
+
+    def _recv(self):
+        fd = self._proc.stdout.fileno()
+        ready, _, _ = select.select([fd], [], [], self.timeout)
+        if not ready:
+            raise TimeoutError(f"mimosa MCP 响应超时 ({self.timeout}s)")
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError("mimosa MCP server 提前退出 (stdout EOF)")
+        return json.loads(line)
+
+    def _request(self, method, params):
+        self._id += 1
+        rid = self._id
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        while True:  # 跳过 notification, 等到 id 匹配的响应
+            resp = self._recv()
+            if resp.get("id") == rid:
+                if "error" in resp:
+                    raise RuntimeError(f"mimosa MCP {method} 错误: {resp['error']}")
+                return resp.get("result", {})
+
+    def initialize(self):
+        self._request("initialize", {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": SERVER_INFO["name"], "version": SERVER_INFO["version"]},
+        })
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def call_tool(self, name, arguments):
+        return self._request("tools/call", {"name": name, "arguments": arguments})
+
+    def close(self):
+        try:
+            if self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+        except Exception:
+            pass
+
+
+def _mimosa_quick_scan(root, scan_path):
+    """调 mimosa security_scan (同步快扫), 返回 (摘要文本, findings list)。失败抛异常。
+
+    security_scan 的 MCP 响应只有 Markdown 摘要 (scanId/scanDir/seal/计数),
+    全量 findings 需按摘要里的 scanDir 回读 <scanDir>/findings.json
+    (schemaVersion: mimosa-security-scan-findings/v1)。depth=normal 跳过
+    业务逻辑投研, 秒级; deep 明显更慢, 未接 (需要时应走 start/status 异步对)。
+    """
+    timeout = max(30, _env_int("ZCODE_BRIDGE_MIMOSA_TIMEOUT", 180))
+    client = MimosaMcpClient(root, cwd=scan_path, timeout=timeout)
+    try:
+        client.initialize()
+        result = client.call_tool(
+            "security_scan", {"project": scan_path, "depth": "normal"})
+    finally:
+        client.close()
+    texts = [c.get("text", "") for c in result.get("content", [])
+             if isinstance(c, dict) and c.get("type") == "text"]
+    body = "\n".join(t for t in texts if t)
+    if result.get("isError"):
+        raise RuntimeError(f"security_scan 返回错误: {body[:500]}")
+
+    findings = []
+    m = re.search(r"scanDir:\s*`([^`]+)`", body)
+    if m:
+        findings_file = Path(m.group(1)) / "findings.json"
+        try:
+            with open(findings_file) as f:
+                findings = json.load(f).get("findings", [])
+        except Exception as e:
+            log(f"⚠ findings.json 读取失败 ({e}), 仅用摘要文本")
+    else:
+        log("⚠ mimosa 摘要中未解析到 scanDir, 仅用摘要文本")
+    return body, findings
+
+
+def _compact_findings(findings):
+    """findings 投影到复核所需字段 (控制附件体积; 同类多 occurrence 逐条保留)。"""
+    out = []
+    for f in findings:
+        loc = f.get("location") or {}
+        out.append({
+            "severity": f.get("severity"),
+            "class": (f.get("identity") or {}).get("publicClass"),
+            "cwe": f.get("cwe"),
+            "path": loc.get("path"),
+            "line": loc.get("line"),
+            "title": f.get("title"),
+            "message": f.get("message"),
+        })
+    return out
+
+
+# ============================================================
 # Tool 定义
 # ============================================================
 TOOLS = [
@@ -267,9 +432,10 @@ TOOLS = [
     {
         "name": "zcode_review",
         "description": (
-            "调用 headless ZCode (GLM-5.2) 审查代码,返回审查结论。"
-            "内部以只读模式 (--mode plan) 运行,不会修改任何文件,安全。"
-            "适用于: 安全审查、代码质量评审、找 bug、最佳实践建议。"
+            "调用 headless ZCode (GLM) 审查代码,返回审查结论。"
+            "以 yolo+写/执行工具物理禁用运行: 全程免人工授权,可自由阅读代码但改不了任何文件,安全。"
+            "适用于: 代码质量评审、找 bug、最佳实践建议。"
+            "安全专项审查建议用 zcode_security_review (带 mimosa 规则引擎预扫)。"
             "可审查单个文件、多个文件,或直接传入代码文本。"
         ),
         "inputSchema": {
@@ -297,6 +463,34 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "zcode_security_review",
+        "description": (
+            "安全专项审查,两阶段: ① mimosa 确定性规则引擎全仓快扫 (零 LLM 流量,"
+            "覆盖面兜底) → ② headless ZCode 拿着 findings 逐条核实 (确认真漏洞/"
+            "排除误报/给出攻击路径与修复建议),并可发现清单之外的问题。"
+            "zcode 同样以 yolo+写工具物理禁用运行,只输出报告不动代码。"
+            "需要本机装有 mimosa 插件 (或设 ZCODE_BRIDGE_MIMOSA_ROOT 指向插件根)。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "要扫描审查的项目目录,默认当前目录",
+                },
+                "focus": {
+                    "type": "string",
+                    "description": "可选,额外审查重点,如 '重点关注注入与鉴权'",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "zcode 工作目录,默认与 path 相同",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -317,45 +511,33 @@ def tool_get_zcode_capabilities(args):
     return {"content": [{"type": "text", "text": result.stdout}]}
 
 
-def tool_zcode_review(args):
-    files = args.get("files", [])
-    code = args.get("code")
-    focus = args.get("focus", "全面审查: 安全、正确性、可维护性")
-    cwd = args.get("cwd")
+def _extract_response(output):
+    """--json 模式下 zcode stdout 是 JSON, 提取 response 字段; 解析失败原样返回。"""
+    try:
+        data = json.loads((output or "").strip())
+        if isinstance(data, dict) and isinstance(data.get("response"), str):
+            return data["response"]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return output
 
-    # 构造 prompt
-    prompt = (
-        f"你是资深代码审查专家。请审查以下代码,重点: {focus}。\n"
-        f"输出格式: 按严重程度 (严重/警告/建议) 分级,每个问题含文件位置和修复建议。用中文。"
-    )
 
-    # 构造 zcode 命令
-    cmd = [ZCODE_BIN, "--prompt", prompt, "--mode", "plan", "--no-color"]
+def _build_review_cmd(prompt, cwd):
+    """构造只读 review 的 zcode 命令 (yolo 免授权 + 写/执行工具物理禁用 + JSON 输出)。"""
+    cmd = [ZCODE_BIN, "--prompt", prompt,
+           "--mode", "yolo",
+           "--disallowed-tools", REVIEW_DISALLOWED_TOOLS,
+           "--no-color", "--json"]
     if cwd:
         cmd += ["--cwd", cwd]
+    return cmd
 
-    # 处理文件附件 + 内联代码
-    attach_files = list(files)
-    tmp_path = None  # 记录本次创建的临时文件 (修复 P2.5: 不用 glob 误删并发请求的文件)
-    if code:
-        import tempfile
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, prefix="zcode-review-"
-        )
-        tmp.write(code)
-        tmp.close()
-        tmp_path = tmp.name
-        attach_files.append(tmp_path)
 
-    for f in attach_files:
-        cmd += ["--attach", f]
+def _run_zcode_headless(cmd, env, timeout):
+    """带文件锁 + 限流有限重试执行 zcode headless, 返回 MCP result dict。
 
-    log(f"调用 zcode review: {len(attach_files)} 个输入")
-
-    # 注入凭证: MCP server 子进程不继承 shell 环境变量, 需自行读取。
-    # 显式非空环境变量优先 (issue #3 子项2): 已设置非空的会覆盖 config; 空串视为未设置。
-    env = _merge_env_with_creds(load_zcode_credentials())
-
+    锁与重试语义见 ReviewFileLock / _parse_provider_error 注释 (issue #3)。
+    """
     # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数。
     # clamp 到 >=0, 防止 ZCODE_BRIDGE_MAX_RETRIES=-1 导致不执行 zcode (Codex P2)
     max_retries = max(0, _env_int("ZCODE_BRIDGE_MAX_RETRIES", 3))
@@ -367,7 +549,7 @@ def tool_zcode_review(args):
             for attempt in range(max_retries + 1):
                 try:
                     result = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=120, env=env
+                        cmd, capture_output=True, text=True, timeout=timeout, env=env
                     )
                     output = result.stdout
                     # 错误判定: 只解析 stderr (Claude review P1-1: 若把 stdout 审查正文
@@ -393,11 +575,11 @@ def tool_zcode_review(args):
                         return {"content": [{"type": "text",
                                              "text": f"zcode 调用失败{suffix}: {err_text[:500]}"}],
                                 "isError": True}
-                    # 成功 (也可能 stdout 空但无错误 → 正常返回空)
-                    return {"content": [{"type": "text", "text": output}]}
+                    # 成功 (--json 输出提取 response; 非 JSON 原样返回)
+                    return {"content": [{"type": "text", "text": _extract_response(output)}]}
 
                 except subprocess.TimeoutExpired:
-                    return {"content": [{"type": "text", "text": "zcode review 超时 (120s)"}],
+                    return {"content": [{"type": "text", "text": f"zcode review 超时 ({timeout}s)"}],
                             "isError": True}
             # 理论不可达 (循环内都 return), 兜底
             return {"content": [{"type": "text", "text": f"zcode 调用失败: 重试耗尽 {last_err}"}],
@@ -405,8 +587,133 @@ def tool_zcode_review(args):
     except TimeoutError as e:
         return {"content": [{"type": "text", "text": f"zcode review 获取锁超时: {e}"}],
                 "isError": True}
+
+
+def _review_timeout():
+    """review 单次 zcode 调用超时 (秒), ZCODE_BRIDGE_REVIEW_TIMEOUT 可配。"""
+    return max(30, _env_int("ZCODE_BRIDGE_REVIEW_TIMEOUT", 300))
+
+
+def _write_temp(text, prefix):
+    """写临时文件并返回路径 (调用方负责清理)。"""
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, prefix=prefix)
+    tmp.write(text)
+    tmp.close()
+    return tmp.name
+
+
+def tool_zcode_review(args):
+    files = args.get("files", [])
+    code = args.get("code")
+    focus = args.get("focus", "全面审查: 安全、正确性、可维护性")
+    cwd = args.get("cwd")
+
+    # 构造 prompt — "只审不修"职责钉死在文本层, 写工具在工具集层物理禁用,
+    # 双保险防 "审着审着顺手改了" (plan→build 惯性, 2026-08-08 重构动因)。
+    prompt = (
+        f"你是资深代码审查专家。请审查附件中的代码,重点: {focus}。\n"
+        "规则:\n"
+        "1. 你的任务只是审查并输出报告 — 绝对不要修改、创建或删除任何文件"
+        " (写/执行工具已被物理禁用,不要尝试)。\n"
+        "2. 可以用只读工具 (Read/Grep/Glob) 阅读项目中的相关代码,获取更多上下文。\n"
+        "3. 不要提出\"我可以帮你修复\"之类的提议 — 是否修复、谁来修复由调用方决定。\n"
+        "输出格式: 按严重程度 (严重/警告/建议) 分级,每个问题含文件位置和修复建议。用中文。"
+    )
+
+    cmd = _build_review_cmd(prompt, cwd)
+
+    # 处理文件附件 + 内联代码
+    attach_files = list(files)
+    tmp_path = None  # 记录本次创建的临时文件 (修复 P2.5: 不用 glob 误删并发请求的文件)
+    if code:
+        tmp_path = _write_temp(code, "zcode-review-")
+        attach_files.append(tmp_path)
+
+    for f in attach_files:
+        cmd += ["--attach", f]
+
+    log(f"调用 zcode review: {len(attach_files)} 个输入 (yolo+只读黑名单)")
+
+    # 注入凭证: MCP server 子进程不继承 shell 环境变量, 需自行读取。
+    # 显式非空环境变量优先 (issue #3 子项2): 已设置非空的会覆盖 config; 空串视为未设置。
+    env = _merge_env_with_creds(load_zcode_credentials())
+
+    try:
+        return _run_zcode_headless(cmd, env, _review_timeout())
     finally:
         # 只清理本次创建的临时文件 (不用 glob, 避免误删并发请求的文件)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def tool_zcode_security_review(args):
+    """mimosa 规则引擎预扫 + zcode 只读复核 的安全专项管线。
+
+    ① mimosa security_scan (确定性规则, 零 LLM 流量) 全仓快扫 → findings 清单,
+      解决"AI 自由探索覆盖面随缘"的问题;
+    ② findings 作附件喂给 zcode, 逐条核实 (确认/误报/存疑 + 攻击路径 + 修复建议),
+      读工具全开可查证上下文, 写工具物理禁用保证只审不修。
+    """
+    scan_path = args.get("path") or args.get("cwd") or os.getcwd()
+    focus = args.get("focus", "")
+    cwd = args.get("cwd") or scan_path
+
+    root = _find_mimosa_root()
+    if not root:
+        return {"content": [{"type": "text", "text": (
+            "未找到 mimosa 安全扫描插件。请安装 mimosa,或设 ZCODE_BRIDGE_MIMOSA_ROOT "
+            "指向插件根目录 (含 payload/ 的那层);也可改用 zcode_review 做纯 AI 审查。"
+        )}], "isError": True}
+
+    # ① mimosa 快扫 (不走 review 文件锁: 确定性引擎无 LLM 限流问题)
+    log(f"mimosa 快扫: {scan_path} (root={root})")
+    try:
+        summary_text, findings = _mimosa_quick_scan(root, scan_path)
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"mimosa 扫描失败: {e}"}],
+                "isError": True}
+
+    # 附件 = 扫描摘要 + 结构化 findings (投影到复核所需字段)
+    attachment = f"# mimosa 扫描摘要\n{summary_text}\n"
+    if findings:
+        compact = _compact_findings(findings)
+        attachment += (
+            f"\n# findings 清单 ({len(compact)} 条, 逐条核实)\n"
+            + json.dumps(compact, ensure_ascii=False, indent=1)
+        )
+    else:
+        attachment += "\n# findings 清单\n(未取到结构化 findings, 以摘要为准;"
+        attachment += "如摘要显示 0 发现, 也请按你的判断抽查关键代码)\n"
+
+    # ② findings 落临时文件 → 附件喂 zcode 复核
+    tmp_path = None
+    try:
+        tmp_path = _write_temp(attachment, "zcode-mimosa-findings-")
+        prompt = (
+            "你是资深安全审查专家。附件是安全扫描器 (mimosa,确定性规则引擎) 对本项目的扫描结果。\n"
+            "任务:\n"
+            "1. 逐条核实每个 finding: 用只读工具 (Read/Grep/Glob) 阅读相关代码,判定为"
+            "【确认漏洞】/【误报】/【存疑】,给出依据 (可利用的攻击路径,或为什么不可利用)。\n"
+            "2. 对每个确认漏洞给出修复建议 (只写建议,不要动手修)。\n"
+            "3. 阅读过程中如发现清单之外的安全问题,一并报告。\n"
+            "规则: 绝对不要修改、创建或删除任何文件 (写/执行工具已被物理禁用);"
+            "不要提出\"帮你修复\"的提议;只输出审查报告。\n"
+            "输出格式: 先给汇总 (确认/误报/存疑各几条),再逐条详述 (位置/判定/依据/修复建议)。用中文。"
+        )
+        if focus:
+            prompt += f"\n额外审查重点: {focus}。"
+
+        cmd = _build_review_cmd(prompt, cwd)
+        cmd += ["--attach", tmp_path]
+
+        log("调用 zcode 复核 mimosa findings (yolo+只读黑名单)")
+        env = _merge_env_with_creds(load_zcode_credentials())
+        return _run_zcode_headless(cmd, env, _review_timeout())
+    finally:
         if tmp_path:
             try:
                 os.unlink(tmp_path)
@@ -425,6 +732,7 @@ def _env_int(name, default):
 TOOL_HANDLERS = {
     "get_zcode_capabilities": tool_get_zcode_capabilities,
     "zcode_review": tool_zcode_review,
+    "zcode_security_review": tool_zcode_security_review,
 }
 
 

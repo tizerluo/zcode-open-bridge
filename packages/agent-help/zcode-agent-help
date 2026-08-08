@@ -261,11 +261,13 @@ NATIVE_CLI = {
         {"category": "permission", "name": "mode", "supported": True,
          "description": "权限模式: 控制 zcode 自主权", "arg": "--mode <mode>",
          "values": {
-             "plan": "只读规划, 不改文件 (最安全, 适合 review)",
-             "build": "可读可写, 关键操作确认",
+             "plan": "只读规划, 不改文件 (但读探索/子代理仍放行)",
+             "build": "可读可写, 关键操作确认 (headless 下写操作直接失败: No permission client)",
              "edit": "可编辑文件",
              "yolo": "全自动, 跳过确认 (--prompt 默认)",
          },
+         "note": "0.16.1 headless 仅接受 build/edit/plan/yolo; auto 是 app-server schema "
+                 "保留值未实现 (setMode 切 auto 会全拒工具调用, mode.auto.unimplemented)",
          "example": "zcode --prompt \"review\" --mode plan"},
         # 浏览器
         {"category": "browser", "name": "browser-use", "supported": True,
@@ -292,25 +294,25 @@ NATIVE_CLI = {
         # 自主性
         {"category": "agency", "name": "autonomous-tools", "supported": True,
          "description": "自主调用工具: 读写文件、Bash、Grep、Web 搜索等",
-         "limitations": {"tool_allowlist": "0.16.1+ 支持 (--allowed-tools)",
-                         "tool_denylist": "0.16.1+ 支持 (--disallowed-tools)",
-                         "max_turns": "0.16.1+ 支持 (--max-turns)",
+         "limitations": {"tool_allowlist": "0.16.1 帮助文案宣称 --allowed-tools, 实测未注册 parseArgs (Unknown option)",
+                         "tool_denylist": "0.16.1+ 实测可用 (--disallowed-tools, 工具集级物理移除, yolo 也绕不过)",
+                         "max_turns": "0.16.1 帮助文案宣称 --max-turns, 实测未注册 parseArgs (Unknown option)",
                          "max_budget": "不支持"}},
-        {"category": "agency", "name": "tool-allowlist", "supported": True,
-         "description": "工具白名单: 仅允许列出的工具 (逗号/空格分隔, 仅 headless prompt)",
+        {"category": "agency", "name": "tool-allowlist", "supported": False,
+         "description": "工具白名单 — 帮助文案有但 0.16.1 未接线 (实测 Unknown option), 勿用",
          "arg": "--allowed-tools <list>",
-         "example": "zcode --prompt \"review\" --allowed-tools \"Read Grep\"",
-         "since": "0.16.1"},
+         "since": "0.16.1 (仅文案)"},
         {"category": "agency", "name": "tool-denylist", "supported": True,
-         "description": "工具黑名单: 禁止列出的工具 (逗号/空格分隔; camelCase 别名 --disallowedTools)",
+         "description": "工具黑名单: 禁止列出的工具 (逗号/空格分隔; camelCase 别名 --disallowedTools)。"
+                        "实测确认: 工具集级物理移除, 先于权限层, yolo 也绕不过;"
+                        "禁 Bash 时必须连 js / mcp__node_repl__js* 一族同禁, 否则可被 execSync 打穿",
          "arg": "--disallowed-tools <list>",
          "example": "zcode --prompt \"整理代码\" --disallowed-tools \"Bash(git *) Edit\"",
          "since": "0.16.1"},
-        {"category": "agency", "name": "max-turns", "supported": True,
-         "description": "限制 headless prompt 的最大模型轮次",
+        {"category": "agency", "name": "max-turns", "supported": False,
+         "description": "最大模型轮次 — 帮助文案有但 0.16.1 未接线 (实测 Unknown option), 勿用",
          "arg": "--max-turns <n>",
-         "example": "zcode --prompt \"修掉这个 bug\" --max-turns 20",
-         "since": "0.16.1"},
+         "since": "0.16.1 (仅文案)"},
     ],
     # 子命令 (zcode <command>, 实测自 0.16.1 --help)
     "subcommands": [
@@ -450,7 +452,9 @@ APP_SERVER = {
         {"method": "session/rewindCascade", "params": "sessionId, target?, scope?, expectedRevision?",
          "note": "❌ 0.16 已移除 (调用返 -32601); 原为 0.15.0+ 级联回退 (与 rewind 同 schema)"},
         {"method": "session/setMode", "params": "sessionId, mode",
-         "note": "0.15.0+ 暴露: 切换会话权限模式 (mode: plan|build|edit|yolo|auto)"},
+         "note": "0.15.0+ 暴露: 切换会话权限模式 (mode: plan|build|edit|yolo|auto); "
+                 "⚠ auto 为保留值未实现 — 切 auto 后该会话所有工具调用被 "
+                 "mode.auto.unimplemented 拒绝, 勿当'智能自动批准'用"},
         # ----- 0.15.0 (App 3.2.0) 新增 workspace/* 方法 (按工作区定位, 非 session) -----
         {"method": "workspace/readState", "params": "workspace:{workspacePath,workspaceKey}, runtimeModel?",
          "note": "0.15.0+: 读工作区状态 (settings/modelCatalog/slashCommands)"},
@@ -516,7 +520,8 @@ ECOSYSTEM = {
             "transport": "MCP over stdio (JSON-RPC 2.0)",
             "tools_exposed": [
                 {"name": "get_zcode_capabilities", "description": "返回 zcode 能力清单 (调 agent-help)"},
-                {"name": "zcode_review", "description": "调 zcode 审查代码 (--mode plan 只读)"},
+                {"name": "zcode_review", "description": "调 zcode 审查代码 (yolo+写工具物理禁用: 免授权只读)"},
+                {"name": "zcode_security_review", "description": "mimosa 规则引擎预扫 + zcode 只读复核 (安全专项)"},
             ],
             "config": "~/.zcode/cli/config.json 的 mcp.servers.zcode-mcp",
             "use_case": "让 MCP client (zcode 自身/Claude Code/Cursor) 标准化调用 zcode",
