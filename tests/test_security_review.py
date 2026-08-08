@@ -509,5 +509,285 @@ class TestSecurityReviewTool(_EnvGuard):
         self.assertFalse(os.path.exists(attach_path), "临时 findings 文件应被清理")
 
 
+class _StubDeepClient:
+    """deep 异步管线 stub: start → status 序列 → completed/failed。"""
+
+    statuses = ["running", "completed"]  # 测试可覆盖
+    scan_dir = None
+    instances = []
+
+    def __init__(self, root, cwd, timeout=120):
+        self.calls = []
+        self._status_idx = 0
+        _StubDeepClient.instances.append(self)
+
+    def initialize(self):
+        pass
+
+    def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name == "security_scan_start":
+            job = {"jobId": "job-1", "status": "running"}
+        elif name == "security_scan_status":
+            st = self.statuses[min(self._status_idx, len(self.statuses) - 1)]
+            self._status_idx += 1
+            job = {"jobId": "job-1", "status": st}
+            if st == "completed":
+                job["result"] = {"scanId": "s1", "scanDir": self.scan_dir,
+                                 "seal": "sha256:x", "findingCount": 1,
+                                 "hypotheses": [], "dependencySummary": {}}
+            if st == "failed":
+                job["error"] = {"message": "engine exploded"}
+        elif name == "security_scan_cancel":
+            job = {"jobId": "job-1", "status": "cancel_requested"}
+        else:
+            raise AssertionError(f"未预期的 tool: {name}")
+        text = json.dumps(
+            {"schemaVersion": "mimosa-mcp-security-scan-job/v1", "job": job})
+        return {"content": [{"type": "text", "text": text}]}
+
+    def close(self):
+        pass
+
+
+class TestParseScanJob(unittest.TestCase):
+    """_parse_scan_job: 异步响应 (嵌套 JSON 字符串) 解析"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def _result(self, text=None, is_error=False):
+        r = {"content": [{"type": "text", "text": text}] if text is not None else []}
+        if is_error:
+            r["isError"] = True
+        return r
+
+    def test_pj0_valid(self):
+        text = json.dumps({"schemaVersion": "mimosa-mcp-security-scan-job/v1",
+                           "job": {"jobId": "j1", "status": "running"}})
+        job = self.mod._parse_scan_job(self._result(text))
+        self.assertEqual(job["jobId"], "j1")
+
+    def test_pj1_is_error_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.mod._parse_scan_job(self._result("boom", is_error=True))
+
+    def test_pj2_non_json_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mod._parse_scan_job(self._result("not json at all"))
+        self.assertIn("非 JSON", str(ctx.exception))
+
+    def test_pj3_missing_job_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mod._parse_scan_job(self._result(json.dumps({"other": 1})))
+        self.assertIn("job", str(ctx.exception))
+
+    def test_pj4_empty_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.mod._parse_scan_job(self._result(None))
+
+
+class TestMimosaDeepScan(_EnvGuard):
+    """_mimosa_deep_scan: start/status 轮询/回读/失败/超时"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def setUp(self):
+        super().setUp()
+        _StubDeepClient.instances = []
+        _StubDeepClient.statuses = ["running", "completed"]
+        _StubDeepClient.scan_dir = None
+
+    def _run_deep(self, stub_cls=_StubDeepClient, focus_files=None):
+        mod = self.mod
+        saved_client = mod.MimosaMcpClient
+        saved_sleep = mod.time.sleep
+        mod.MimosaMcpClient = stub_cls
+        mod.time.sleep = lambda s: None
+        try:
+            return mod._mimosa_deep_scan("/fake/root", "/fake/proj", focus_files)
+        finally:
+            mod.MimosaMcpClient = saved_client
+            mod.time.sleep = saved_sleep
+
+    def _make_scan_dir(self):
+        import tempfile
+        scan_root = tempfile.mkdtemp(prefix="mimosa-scans-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(scan_root, ignore_errors=True))
+        scan_dir = os.path.join(scan_root, "project-x", "scan-1")
+        os.makedirs(scan_dir)
+        with open(os.path.join(scan_dir, "findings.json"), "w") as f:
+            json.dump({"findings": [
+                {"identity": {"publicClass": "sql-injection"},
+                 "severity": "high", "cwe": ["CWE-89"],
+                 "location": {"path": "app.py", "line": 11},
+                 "title": "SQL 注入", "message": "拼接查询"}]}, f)
+        os.environ["ZCODE_BRIDGE_MIMOSA_SCAN_ROOT"] = scan_root
+        return scan_dir
+
+    def test_ds0_happy_path(self):
+        """DS0: start→running→completed, findings 回读, focusFiles 透传"""
+        _StubDeepClient.scan_dir = self._make_scan_dir()
+        summary, findings = self._run_deep(focus_files=["app.py"])
+        self.assertIn("deep", summary)
+        self.assertIn("job-1", summary)
+        self.assertEqual(len(findings), 1)
+        client = _StubDeepClient.instances[0]
+        start_call = [a for n, a in client.calls if n == "security_scan_start"][0]
+        self.assertEqual(start_call["depth"], "deep")
+        self.assertEqual(start_call["focusFiles"], ["app.py"])
+        status_calls = [n for n, _ in client.calls if n == "security_scan_status"]
+        self.assertEqual(len(status_calls), 2, "running 一次 + completed 一次")
+
+    def test_ds1_failed_raises_with_message(self):
+        """DS1: status=failed → 抛错带 error.message"""
+        _StubDeepClient.statuses = ["running", "failed"]
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run_deep()
+        self.assertIn("engine exploded", str(ctx.exception))
+        self.assertIn("failed", str(ctx.exception))
+
+    def test_ds2_timeout_cancels_job(self):
+        """DS2: 一直 running + 超时 → TimeoutError 且 best-effort cancel"""
+        mod = self.mod
+
+        class RunningClient(_StubDeepClient):
+            statuses = ["running"]
+
+        saved_client = mod.MimosaMcpClient
+        saved_sleep = mod.time.sleep
+        saved_time = mod.time.time
+        mod.MimosaMcpClient = RunningClient
+        mod.time.sleep = lambda s: None
+        real_t = saved_time()
+        ticks = iter([real_t, real_t + 10000])  # t0, 首次检查即超 900s 预算
+        mod.time.time = lambda: next(ticks, real_t + 10000)
+        try:
+            with self.assertRaises(TimeoutError):
+                mod._mimosa_deep_scan("/fake/root", "/fake/proj")
+        finally:
+            mod.MimosaMcpClient = saved_client
+            mod.time.sleep = saved_sleep
+            mod.time.time = saved_time
+        names = [n for n, _ in RunningClient.instances[0].calls]
+        self.assertIn("security_scan_cancel", names, "超时应 best-effort cancel")
+
+    def test_ds3_no_jobid_raises(self):
+        """DS3: start 响应缺 jobId → 明确报错"""
+        mod = self.mod
+
+        class NoJobClient(_StubDeepClient):
+            def call_tool(self, name, arguments):
+                if name == "security_scan_start":
+                    return {"content": [{"type": "text", "text": json.dumps(
+                        {"job": {"status": "running"}})}]}
+                return super().call_tool(name, arguments)
+
+        saved_client = mod.MimosaMcpClient
+        mod.MimosaMcpClient = NoJobClient
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                mod._mimosa_deep_scan("/fake/root", "/fake/proj")
+            self.assertIn("jobId", str(ctx.exception))
+        finally:
+            mod.MimosaMcpClient = saved_client
+
+
+class TestSecurityReviewDepth(_EnvGuard):
+    """tool_zcode_security_review 的 depth/focus_files 参数"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def _patch(self):
+        import tempfile
+        mod = self.mod
+        proj = tempfile.mkdtemp(prefix="zcode-scan-proj-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(proj, ignore_errors=True))
+        saved = {
+            "find_root": mod._find_mimosa_root,
+            "quick": mod._mimosa_quick_scan,
+            "deep": mod._mimosa_deep_scan,
+            "run": mod.subprocess.run,
+        }
+        mod._find_mimosa_root = lambda: "/fake/mimosa"
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        return mod, saved, proj
+
+    def _restore(self, mod, saved):
+        mod._find_mimosa_root = saved["find_root"]
+        mod._mimosa_quick_scan = saved["quick"]
+        mod._mimosa_deep_scan = saved["deep"]
+        mod.subprocess.run = saved["run"]
+
+    def test_dp0_invalid_depth_rejected(self):
+        """DP0: 非法 depth → 明确报错"""
+        mod = self.mod
+        result = mod.tool_zcode_security_review(
+            {"path": "/tmp", "depth": "turbo"})
+        self.assertTrue(result.get("isError"))
+        self.assertIn("depth", result["content"][0]["text"])
+
+    def test_dp1_default_is_normal(self):
+        """DP1: 不传 depth → 走 normal 快扫, 不碰 deep"""
+        mod, saved, proj = self._patch()
+        called = {"quick": 0, "deep": 0}
+        mod._mimosa_quick_scan = lambda r, p: (called.update(quick=1), ("摘要", []))[1]
+
+        def deep_should_not_run(r, p, f=None):
+            called["deep"] += 1
+            return ("", [])
+
+        mod._mimosa_deep_scan = deep_should_not_run
+        mod.subprocess.run = lambda *a, **kw: _FakeCompletedProcess(0, "OK", "")
+        try:
+            result = mod.tool_zcode_security_review({"path": proj})
+        finally:
+            self._restore(mod, saved)
+        self.assertNotIn("isError", result)
+        self.assertEqual(called["quick"], 1)
+        self.assertEqual(called["deep"], 0)
+
+    def test_dp2_deep_routes_with_focus_files(self):
+        """DP2: depth=deep → 走异步管线, focus_files 透传, 附件标注 depth=deep"""
+        mod, saved, proj = self._patch()
+        captured = {}
+
+        def quick_should_not_run(r, p):
+            raise AssertionError("depth=deep 不应走 normal 快扫")
+
+        mod._mimosa_quick_scan = quick_should_not_run
+
+        def fake_deep(r, p, focus_files=None):
+            captured["focus_files"] = focus_files
+            return ("deep 摘要", [{"identity": {"publicClass": "x"},
+                                 "severity": "high", "cwe": [],
+                                 "location": {"path": "a.py", "line": 1},
+                                 "title": "t", "message": "m"}])
+
+        mod._mimosa_deep_scan = fake_deep
+
+        def fake_run(cmd, *a, **kw):
+            captured["cmd"] = cmd
+            return _FakeCompletedProcess(
+                0, json.dumps({"response": "deep 报告"}, ensure_ascii=False), "")
+
+        mod.subprocess.run = fake_run
+        try:
+            result = mod.tool_zcode_security_review(
+                {"path": proj, "depth": "deep", "focus_files": ["a.py"]})
+        finally:
+            self._restore(mod, saved)
+        self.assertNotIn("isError", result)
+        self.assertEqual(result["content"][0]["text"], "deep 报告")
+        self.assertEqual(captured["focus_files"], ["a.py"])
+        prompt = captured["cmd"][captured["cmd"].index("--prompt") + 1]
+        self.assertIn("depth=deep", prompt)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

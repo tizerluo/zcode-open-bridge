@@ -362,13 +362,41 @@ class MimosaMcpClient:
             pass
 
 
+def _read_mimosa_findings(scan_dir_str):
+    """按 scanDir 回读 <scanDir>/findings.json 的 findings list。失败/越界返回 []。
+
+    狗食 review P1-1 + 复审 P1-A: scanDir 是不可信输入 (子进程产物经文本协议
+    传回, 属信任边界外) — 目录与 findings.json resolve 后都必须落在扫描历史根
+    (ZCODE_BRIDGE_MIMOSA_SCAN_ROOT, 默认 ~/.mimosa/security-scans) 之下,
+    防路径注入 / symlink 绕过导致任意文件回读喂给 LLM。
+    """
+    scan_root = Path(os.environ.get(
+        "ZCODE_BRIDGE_MIMOSA_SCAN_ROOT",
+        str(Path.home() / ".mimosa" / "security-scans")))
+    try:
+        scan_dir = Path(scan_dir_str).resolve()
+        resolved_root = scan_root.resolve()
+        if not (scan_dir == resolved_root or resolved_root in scan_dir.parents):
+            log(f"⚠ scanDir 越界 (不在 {resolved_root} 下), 跳过回读: {scan_dir_str}")
+            return []
+        real_file = (scan_dir / "findings.json").resolve()
+        if not (resolved_root in real_file.parents or real_file.parent == resolved_root):
+            log(f"⚠ findings.json 解析后越界 (疑似 symlink), 跳过回读: {real_file}")
+            return []
+        with open(real_file) as f:
+            return json.load(f).get("findings", [])
+    except Exception as e:
+        log(f"⚠ findings.json 读取失败 ({e}), 仅用摘要文本")
+        return []
+
+
 def _mimosa_quick_scan(root, scan_path):
     """调 mimosa security_scan (同步快扫), 返回 (摘要文本, findings list)。失败抛异常。
 
     security_scan 的 MCP 响应只有 Markdown 摘要 (scanId/scanDir/seal/计数),
     全量 findings 需按摘要里的 scanDir 回读 <scanDir>/findings.json
     (schemaVersion: mimosa-security-scan-findings/v1)。depth=normal 跳过
-    业务逻辑投研, 秒级; deep 明显更慢, 未接 (需要时应走 start/status 异步对)。
+    业务逻辑投研, 秒级; deep 走 _mimosa_deep_scan 异步管线。
     """
     timeout = max(30, _env_int("ZCODE_BRIDGE_MIMOSA_TIMEOUT", 180))
     client = MimosaMcpClient(root, cwd=scan_path, timeout=timeout)
@@ -387,31 +415,98 @@ def _mimosa_quick_scan(root, scan_path):
     findings = []
     m = re.search(r"scanDir:\s*`([^`]+)`", body)
     if m:
-        # 狗食 review P1-1: scanDir 是不可信输入 (子进程产物经文本协议传回,
-        # 属信任边界外) — 必须校验落在 mimosa 扫描历史根之下, 防路径注入
-        # 导致任意文件回读喂给 LLM。校验失败降级为仅用摘要文本。
-        scan_root = Path(os.environ.get(
-            "ZCODE_BRIDGE_MIMOSA_SCAN_ROOT",
-            str(Path.home() / ".mimosa" / "security-scans")))
-        try:
-            scan_dir = Path(m.group(1)).resolve()
-            resolved_root = scan_root.resolve()
-            if scan_dir == resolved_root or resolved_root in scan_dir.parents:
-                # 复审 P1-A: findings.json 本身 resolve 后也须在根下,
-                # 防"目录合法但 findings.json 是指向外部的 symlink"绕过
-                real_file = (scan_dir / "findings.json").resolve()
-                if resolved_root in real_file.parents or real_file.parent == resolved_root:
-                    with open(real_file) as f:
-                        findings = json.load(f).get("findings", [])
-                else:
-                    log(f"⚠ findings.json 解析后越界 (疑似 symlink), 跳过回读: {real_file}")
-            else:
-                log(f"⚠ scanDir 越界 (不在 {resolved_root} 下), 跳过回读: {m.group(1)}")
-        except Exception as e:
-            log(f"⚠ findings.json 读取失败 ({e}), 仅用摘要文本")
+        findings = _read_mimosa_findings(m.group(1))
     else:
         log("⚠ mimosa 摘要中未解析到 scanDir, 仅用摘要文本")
     return body, findings
+
+
+def _parse_scan_job(result):
+    """解析异步扫描四件 (start/status/cancel/resume) 的响应, 返回 job dict。
+
+    响应 content[0].text 是嵌套 JSON 字符串
+    (schemaVersion: mimosa-mcp-security-scan-job/v1), 不是 Markdown。
+    """
+    texts = [c.get("text", "") for c in result.get("content", [])
+             if isinstance(c, dict) and c.get("type") == "text"]
+    body = "\n".join(t for t in texts if t)
+    if result.get("isError"):
+        raise RuntimeError(f"mimosa 异步扫描返回错误: {body[:500]}")
+    if not body:
+        raise RuntimeError("mimosa 异步扫描返回空响应")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"mimosa 异步响应非 JSON (前80字符): {body[:80]!r}") from e
+    job = payload.get("job")
+    if not isinstance(job, dict):
+        raise RuntimeError(f"mimosa 异步响应缺 job 字段: {body[:200]}")
+    return job
+
+
+def _mimosa_deep_scan(root, scan_path, focus_files=None):
+    """deep 深扫 (含业务逻辑投研): start → status 轮询 → completed 后回读 findings。
+
+    实测 (mimosa 1.0.3, GC-8G): 400 文件项目 ~13s, 秒级到十几秒量级;
+    纯 native 引擎零 LLM 零网络 (evidenceBoundary: static_only_no_runtime_execution)。
+    注意: 完成判定必须 parse JSON 看 job.status — running 态也含
+    "completedAt":null, 字符串匹配 "completed" 会误判。
+    focus_files 只是 deep 业务逻辑复核的优先级提示, 静态引擎永远全量扫
+    (实测), 不能当"只扫这些文件"用。
+    超时/失败抛异常; 超时会 best-effort cancel 后台 job。
+    """
+    timeout = max(60, _env_int("ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT", 900))
+    poll = max(1, _env_int("ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL", 2))
+    client = MimosaMcpClient(root, cwd=scan_path, timeout=120)
+    try:
+        client.initialize()
+        start_args = {"project": scan_path, "depth": "deep"}
+        if focus_files:
+            start_args["focusFiles"] = list(focus_files)
+        job = _parse_scan_job(client.call_tool("security_scan_start", start_args))
+        job_id = job.get("jobId")
+        if not job_id:
+            raise RuntimeError("security_scan_start 未返回 jobId")
+        log(f"mimosa deep 扫描已启动: {job_id}")
+
+        t0 = time.time()
+        while True:
+            if time.time() - t0 > timeout:
+                try:  # best-effort 取消, 不留孤儿 job
+                    client.call_tool("security_scan_cancel", {"jobId": job_id})
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    f"mimosa deep 扫描超时 ({timeout}s), jobId={job_id}")
+            time.sleep(poll)
+            job = _parse_scan_job(
+                client.call_tool("security_scan_status", {"jobId": job_id}))
+            status = job.get("status")
+            if status == "completed":
+                break
+            if status in ("failed", "cancelled"):
+                err = job.get("error") or {}
+                raise RuntimeError(
+                    f"mimosa deep 扫描 {status}: "
+                    f"{err.get('message') or err or '未知错误'} (jobId={job_id})")
+
+        result = job.get("result") or {}
+        scan_dir = result.get("scanDir")
+        dep = result.get("dependencySummary") or {}
+        summary = (
+            f"**Mimosa deep security scan (异步 job {job_id})**\n"
+            f"- scanId: `{result.get('scanId')}`\n"
+            f"- scanDir: `{scan_dir}`\n"
+            f"- seal: `{result.get('seal')}`\n"
+            f"- findings: {result.get('findingCount')}\n"
+            f"- business-logic hypotheses: {len(result.get('hypotheses') or [])}\n"
+            f"- dependency: {dep.get('packagesScanned', 0)} package(s) "
+            f"(completion={dep.get('completion')})"
+        )
+        findings = _read_mimosa_findings(scan_dir) if scan_dir else []
+        return summary, findings
+    finally:
+        client.close()
 
 
 def _compact_findings(findings):
@@ -494,9 +589,10 @@ TOOLS = [
     {
         "name": "zcode_security_review",
         "description": (
-            "安全专项审查,两阶段: ① mimosa 确定性规则引擎全仓快扫 (零 LLM 流量,"
+            "安全专项审查,两阶段: ① mimosa 确定性规则引擎扫描 (零 LLM 流量,"
             "覆盖面兜底) → ② headless ZCode 拿着 findings 逐条核实 (确认真漏洞/"
             "排除误报/给出攻击路径与修复建议),并可发现清单之外的问题。"
+            "depth=normal 秒级快扫 (默认); depth=deep 含业务逻辑投研, 走异步任务, 稍慢。"
             "zcode 同样以 yolo+写工具物理禁用运行,只输出报告不动代码。"
             "需要本机装有 mimosa 插件 (或设 ZCODE_BRIDGE_MIMOSA_ROOT 指向插件根)。"
         ),
@@ -506,6 +602,18 @@ TOOLS = [
                 "path": {
                     "type": "string",
                     "description": "要扫描审查的项目目录,默认当前目录",
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["normal", "deep"],
+                    "description": "扫描深度: normal=规则快扫 (默认, 秒级); deep=含业务逻辑投研 (异步, 更彻底)",
+                    "default": "normal",
+                },
+                "focus_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选, 仅 deep: 优先复核的项目内文件 (如本次改动的文件)。"
+                                   "注意是优先级提示不是过滤器, 静态引擎仍全量扫",
                 },
                 "focus": {
                     "type": "string",
@@ -685,15 +793,22 @@ def tool_zcode_review(args):
 def tool_zcode_security_review(args):
     """mimosa 规则引擎预扫 + zcode 只读复核 的安全专项管线。
 
-    ① mimosa security_scan (确定性规则, 零 LLM 流量) 全仓快扫 → findings 清单,
-      解决"AI 自由探索覆盖面随缘"的问题;
+    ① mimosa security_scan (确定性规则, 零 LLM 流量) 扫描 → findings 清单,
+      解决"AI 自由探索覆盖面随缘"的问题; depth=normal 秒级快扫,
+      depth=deep 走异步 start/status 管线, 含业务逻辑投研;
     ② findings 作附件喂给 zcode, 逐条核实 (确认/误报/存疑 + 攻击路径 + 修复建议),
       读工具全开可查证上下文, 写工具物理禁用保证只审不修。
     """
     scan_path = args.get("path") or args.get("cwd") or os.getcwd()
     focus = args.get("focus", "")
     cwd = args.get("cwd") or scan_path
+    depth = args.get("depth", "normal")
+    focus_files = args.get("focus_files") or []
 
+    if depth not in ("normal", "deep"):
+        return {"content": [{"type": "text",
+                             "text": f"非法 depth: {depth!r} (只支持 normal|deep)"}],
+                "isError": True}
     if not os.path.isdir(scan_path):  # 狗食 review P2-8: 先校验, 错误信息明确
         return {"content": [{"type": "text",
                              "text": f"扫描目录不存在或不是目录: {scan_path}"}],
@@ -706,16 +821,19 @@ def tool_zcode_security_review(args):
             "指向插件根目录 (含 payload/ 的那层);也可改用 zcode_review 做纯 AI 审查。"
         )}], "isError": True}
 
-    # ① mimosa 快扫 (不走 review 文件锁: 确定性引擎无 LLM 限流问题)
-    log(f"mimosa 快扫: {scan_path} (root={root})")
+    # ① mimosa 扫描 (不走 review 文件锁: 确定性引擎无 LLM 限流问题)
+    log(f"mimosa {depth} 扫描: {scan_path} (root={root})")
     try:
-        summary_text, findings = _mimosa_quick_scan(root, scan_path)
+        if depth == "deep":
+            summary_text, findings = _mimosa_deep_scan(root, scan_path, focus_files)
+        else:
+            summary_text, findings = _mimosa_quick_scan(root, scan_path)
     except Exception as e:
         return {"content": [{"type": "text", "text": f"mimosa 扫描失败: {e}"}],
                 "isError": True}
 
     # 附件 = 扫描摘要 + 结构化 findings (投影到复核所需字段)
-    attachment = f"# mimosa 扫描摘要\n{summary_text}\n"
+    attachment = f"# mimosa 扫描摘要 (depth={depth})\n{summary_text}\n"
     if findings:
         compact = _compact_findings(findings)
         attachment += (
@@ -731,7 +849,8 @@ def tool_zcode_security_review(args):
     try:
         tmp_path = _write_temp(attachment, "zcode-mimosa-findings-")
         prompt = (
-            "你是资深安全审查专家。附件是安全扫描器 (mimosa,确定性规则引擎) 对本项目的扫描结果。\n"
+            f"你是资深安全审查专家。附件是安全扫描器 (mimosa,确定性规则引擎,depth={depth})"
+            "对本项目的扫描结果。\n"
             "任务:\n"
             "1. 逐条核实每个 finding: 用只读工具 (Read/Grep/Glob) 阅读相关代码,判定为"
             "【确认漏洞】/【误报】/【存疑】,给出依据 (可利用的攻击路径,或为什么不可利用)。\n"

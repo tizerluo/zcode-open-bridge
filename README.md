@@ -111,7 +111,7 @@ zcode --prompt "继续" --resume sess_xxxx
 |------|------|
 | `get_zcode_capabilities` | 返回 ZCode 能力清单（调 agent-help） |
 | `zcode_review` | 调 ZCode 审查代码（yolo + 写/执行工具物理禁用，全程免授权但改不了文件，安全） |
-| `zcode_security_review` | 安全专项审查：mimosa 确定性规则引擎全仓预扫 → ZCode 拿 findings 逐条核实（确认/误报/存疑 + 攻击路径 + 修复建议） |
+| `zcode_security_review` | 安全专项审查：mimosa 确定性规则引擎预扫 → ZCode 拿 findings 逐条核实（确认/误报/存疑 + 攻击路径 + 修复建议）。`depth=normal` 秒级快扫（默认），`depth=deep` 含业务逻辑投研（异步任务管线） |
 
 > **只读原理（2026-08-08 重构，告别 `--mode plan`）**：review 体系不再用 plan 模式——plan 只禁「改文件」，读探索/子代理照样放行（限流超时主因），且 plan→build 的规划惯性容易让 review 变成「边审边修」。新方案用 `--mode yolo`（全程免授权）+ `--disallowed-tools` 把 `Write/Edit/MultiEdit/ApplyPatch/Bash` 连同 Node REPL 一族（`js` / `mcp__node_repl__js*`）一起禁掉：`--disallowed-tools` 是工具集级物理移除、先于权限层，yolo 也绕不过；Node REPL 一族必须同禁，否则可被 `execSync` 打穿 Bash 黑名单（0.16.1 实测复现）。读工具（Read/Grep/Glob）全开，不影响审查能力。prompt 层另有「只审不修」职责约束（不修改文件、不提议帮忙修复）作双保险。
 
@@ -247,19 +247,29 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 注意：zcode 内部已有自己的指数退避重试（`_retryWithExponentialBackoff`），MCP 层的重试是补充，默认保守（max 3）。
 
-`zcode_security_review` 额外有 mimosa 相关的两个 env：
+`zcode_security_review` 额外有 mimosa 相关的 env：
 
 | 配置 | 作用 |
 |------|------|
 | `ZCODE_BRIDGE_MIMOSA_ROOT` | 指向 mimosa 插件根目录（含 `payload/dist/mcp/server.js` 的那层）；不设则自动探测 `~/.local/share/mimosa/*` 与 `~/.zcode/cli/plugins/cache/*/mimosa/*`，找不到会明确报错并建议改用 `zcode_review` |
-| `ZCODE_BRIDGE_MIMOSA_TIMEOUT` | mimosa `security_scan` 快扫超时（默认 180s） |
+| `ZCODE_BRIDGE_MIMOSA_TIMEOUT` | mimosa `security_scan` 快扫（depth=normal）超时（默认 180s） |
 | `ZCODE_BRIDGE_MIMOSA_SCAN_ROOT` | findings 回读的信任根（默认 `~/.mimosa/security-scans`）：从 mimosa 摘要解析出的 scanDir 必须落在其下才回读 `findings.json`，越界降级为仅用摘要（防路径注入导致任意文件回读） |
+| `ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT` | depth=deep 异步扫描的总预算（默认 900s），超时会 best-effort cancel 后台 job |
+| `ZCODE_BRIDGE_MIMOSA_POLL_INTERVAL` | depth=deep 的 status 轮询间隔（默认 2s） |
+
+**depth 两档**（2026-08-08 接入，mimosa 1.0.3 实测）：
+
+- `normal`（默认）：同步 `security_scan`，秒级（400 文件项目 ~2s），纯规则匹配
+- `deep`：异步 `security_scan_start` → `security_scan_status` 轮询 → 完成后回读 findings，含业务逻辑投研（threatModel/validation/pathAnalysis 等阶段），400 文件项目 ~13s。与 normal 共用同一条 findings 回读管线。纯 native 引擎、零 LLM、零网络（`evidenceBoundary: static_only_no_runtime_execution`）
+- `focus_files` 参数（仅 deep）：业务逻辑复核的**优先级提示**（如只给本次改动的文件），不是过滤器——静态引擎永远全量扫（实测）
+
+异步响应解析的两个坑（已在代码里处理）：start/status/cancel/resume 的 `content[0].text` 是**嵌套 JSON 字符串**（`mimosa-mcp-security-scan-job/v1`）而非 Markdown 摘要；完成判定必须 parse JSON 看 `job.status`——running 态也含 `"completedAt":null`，字符串匹配 `completed` 会误判。
 
 > mimosa 的调用不依赖 zcode 插件体系：bridge 用自带极简 stdio MCP client 直接 spawn mimosa 的 `server.js`（env `ZCODE_PLUGIN_ROOT=<root>`、`MIMOSA_ENGINE=native`，cwd=被扫项目）。mimosa 快扫是确定性规则引擎、零 LLM 流量，故不走 review 文件锁。
 >
 > 实测备注（2026-08-08，GC-8G）：① 独立调用时 mimosa 也会在被扫项目写一个小会话状态文件（`.mimosa/hook-state/sess_*.continue.json`，约 200 字节，无害）——即 bridge 自身的代码路径对被扫目录只读，但 mimosa 引擎会落这个状态文件，说"完全只读"不准确；② 从非登录 shell（systemd unit、cron、`sudo -u` 直调）启动时 PATH 可能不含 `~/.local/bin`，需显式 `export PATH="$HOME/.local/bin:$PATH"` 否则找不到 `zcode`。
 >
-> 并发与阻塞边界（狗食 review P2-4/P2-5）：mimosa 预扫**不在** review 文件锁内（确定性引擎无 LLM 限流问题），只有 zcode 复核阶段持锁——并发扫同一项目时 mimosa 的 hook-state 文件各写各的会话，无冲突。最坏阻塞时长估算：锁等待 300s + 单次调用 `ZCODE_BRIDGE_REVIEW_TIMEOUT`（默认 300s）×（1 + `ZCODE_BRIDGE_MAX_RETRIES` 默认 3）+ 限流退避，极端情况单次 tool 调用可阻塞约 20 分钟，调用方应把 MCP 超时设到相应量级。
+> 并发与阻塞边界（狗食 review P2-4/P2-5）：mimosa 预扫**不在** review 文件锁内（确定性引擎无 LLM 限流问题），只有 zcode 复核阶段持锁——并发扫同一项目时 mimosa 的 hook-state 文件各写各的会话，无冲突。最坏阻塞时长估算：锁等待 300s + 单次调用 `ZCODE_BRIDGE_REVIEW_TIMEOUT`（默认 300s）×（1 + `ZCODE_BRIDGE_MAX_RETRIES` 默认 3）+ 限流退避，极端情况单次 tool 调用可阻塞约 20 分钟；depth=deep 时前面还要再加 mimosa 异步扫描预算（`ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT` 默认 900s）。调用方应把 MCP 超时设到相应量级。
 
 ### 聚焦审查 prompt 建议
 
