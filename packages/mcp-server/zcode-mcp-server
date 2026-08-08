@@ -592,14 +592,25 @@ def _pr_diff(repo, base, head):
 
     返回 (changed_files, diff_text); 失败抛 RuntimeError。
     """
-    rc, files_out, err = _git(repo, "diff", "--name-only", f"{base}...{head}")
+    rc, files_out, err = _git(repo, "diff", "--name-only", f"{base}...{head}", "--")
     if rc != 0:
         raise RuntimeError(f"git diff {base}...{head} 失败: {err.strip()[:200]}")
     changed = [ln.strip() for ln in files_out.splitlines() if ln.strip()]
-    rc, diff_text, err = _git(repo, "diff", f"{base}...{head}")
+    rc, diff_text, err = _git(repo, "diff", f"{base}...{head}", "--")
     if rc != 0:
         raise RuntimeError(f"git diff {base}...{head} 失败: {err.strip()[:200]}")
     return changed, diff_text
+
+
+def _validate_rev(repo, rev, what):
+    """校验 git rev 合法: 非 - 开头 (防 git 选项注入, 自审 P1-1: --output= 等
+    会让只读 diff 写出文件) 且 rev-parse 可解析。返回错误文案或 None。"""
+    if not rev or rev.startswith("-"):
+        return f"非法 {what}: {rev!r} (空值或 - 开头会被 git 当选项解析, 已拒绝)"
+    rc, _, err = _git(repo, "rev-parse", "--verify", "--quiet", rev)
+    if rc != 0:
+        return f"{what} 不存在: {rev!r} (git: {err.strip()[:150]})"
+    return None
 
 
 # ============================================================
@@ -1045,11 +1056,10 @@ def tool_zcode_pr_review(args):
                 "无法自动探测 PR base 分支 (试了 origin/HEAD、main/master、"
                 "origin/main|master)。请显式传 base 参数, 如 base='main'。"
             )}], "isError": True}
-    rc, _, err = _git(scan_path, "rev-parse", "--verify", "--quiet", base)
-    if rc != 0:
-        return {"content": [{"type": "text",
-                             "text": f"base 不存在: {base!r} (git: {err.strip()[:150]})"}],
-                "isError": True}
+    for rev, what in ((base, "base"), (head, "head")):
+        bad = _validate_rev(scan_path, rev, what)
+        if bad:
+            return {"content": [{"type": "text", "text": bad}], "isError": True}
     try:
         changed, diff_text = _pr_diff(scan_path, base, head)
     except RuntimeError as e:
@@ -1063,8 +1073,10 @@ def tool_zcode_pr_review(args):
     # diff 体积上限 (附件体积保护, ZCODE_BRIDGE_PR_DIFF_MAX 可配)
     max_bytes = max(10_000, _env_int("ZCODE_BRIDGE_PR_DIFF_MAX", 500_000,
                                      maximum=5_000_000))
-    if len(diff_text.encode("utf-8")) > max_bytes:
-        diff_text = diff_text[:max_bytes] + (
+    diff_bytes = diff_text.encode("utf-8")
+    if len(diff_bytes) > max_bytes:
+        # 按字节截断再容错解码, 防多字节字符被切成半个 (自审 P1-2)
+        diff_text = diff_bytes[:max_bytes].decode("utf-8", errors="ignore") + (
             f"\n\n[... diff 超 {max_bytes} 字节已截断; 改动文件清单完整, "
             "可用只读工具阅读完整文件 ...]")
 

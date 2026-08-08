@@ -960,6 +960,30 @@ class TestPrReview(_EnvGuard):
             os.environ.pop("ZCODE_BRIDGE_PR_DIFF_MAX", None)
         self.assertNotIn("isError", result)
 
+    def test_pr6_dash_base_rejected(self):
+        """PR6: base 以 - 开头 → 拒绝 (自审 P1-1: git 选项注入防护)"""
+        mod, saved, proj, captured = self._patch(changed=["a.py"])
+        try:
+            result = mod.tool_zcode_pr_review(
+                {"path": proj, "base": "--output=/tmp/pwn"})
+        finally:
+            self._restore(mod, saved)
+        self.assertTrue(result.get("isError"))
+        self.assertIn("非法 base", result["content"][0]["text"])
+        self.assertNotIn("cmd", captured, "注入企图不应到达 zcode")
+
+    def test_pr7_dash_head_rejected(self):
+        """PR7: head 以 - 开头 → 拒绝 (head 同样校验, 不再漏检)"""
+        mod, saved, proj, captured = self._patch(changed=["a.py"])
+        try:
+            result = mod.tool_zcode_pr_review(
+                {"path": proj, "base": "main", "head": "--stdout"})
+        finally:
+            self._restore(mod, saved)
+        self.assertTrue(result.get("isError"))
+        self.assertIn("非法 head", result["content"][0]["text"])
+        self.assertNotIn("cmd", captured)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
