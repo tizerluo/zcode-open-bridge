@@ -836,8 +836,10 @@ class TestPrReview(_EnvGuard):
     def setUpClass(cls):
         cls.mod = _load_mcp_module()
 
-    def _patch(self, changed=None, diff_text="diff --git a/app.py b/app.py\n+new line\n"):
-        """patch git/mimosa/zcode 三路。changed=None 表示非 git 仓库。"""
+    def _patch(self, changed=None, diff_text="diff --git a/app.py b/app.py\n+new line\n",
+               rev_ok=True):
+        """patch git/mimosa/zcode 三路。changed=None 表示非 git 仓库;
+        rev_ok=False 表示所有 rev 解析失败 (测 base 自动探测失败)。"""
         import tempfile
         mod = self.mod
         proj = tempfile.mkdtemp(prefix="zcode-pr-proj-")
@@ -855,7 +857,11 @@ class TestPrReview(_EnvGuard):
                 if changed is None:  # 非 git 仓库
                     return _FakeCompletedProcess(128, "", "not a git repository")
                 sub = cmd[3]  # ["git", "-C", repo, <sub>, ...]
+                if sub == "rev-parse" and "--git-dir" in cmd:
+                    return _FakeCompletedProcess(0, ".git\n", "")  # 仓库探测恒过
                 if sub == "rev-parse" or sub == "symbolic-ref":
+                    if not rev_ok:  # rev 校验/分支探测失败
+                        return _FakeCompletedProcess(1, "", "unknown revision")
                     return _FakeCompletedProcess(0, "ok\n", "")
                 if sub == "diff" and "--name-only" in cmd:
                     return _FakeCompletedProcess(
@@ -983,6 +989,44 @@ class TestPrReview(_EnvGuard):
         self.assertTrue(result.get("isError"))
         self.assertIn("非法 head", result["content"][0]["text"])
         self.assertNotIn("cmd", captured)
+
+    def test_pr8_base_autodetect_failure(self):
+        """PR8: base 自动探测全部失败 → 明确报错建议显式传 base (复审 P2-4)"""
+        mod, saved, proj, captured = self._patch(changed=["a.py"], rev_ok=False)
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj})
+        finally:
+            self._restore(mod, saved)
+        self.assertTrue(result.get("isError"))
+        self.assertIn("无法自动探测", result["content"][0]["text"])
+        self.assertNotIn("cmd", captured)
+
+    def test_pr9_mimosa_failure_clean_error(self):
+        """PR9: mimosa 扫描失败 → 明确报错, 不调 zcode (复审 P2-4)"""
+        mod, saved, proj, captured = self._patch(changed=["a.py"])
+
+        def boom(root, path, focus_files=None):
+            raise RuntimeError("engine boom")
+
+        mod._mimosa_deep_scan = boom
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+        self.assertTrue(result.get("isError"))
+        self.assertIn("mimosa 扫描失败", result["content"][0]["text"])
+        self.assertNotIn("cmd", captured)
+
+    def test_pr10_attachment_tmpfile_cleaned(self):
+        """PR10: PR 附件临时文件用后被清理 (复审 P2-4)"""
+        mod, saved, proj, captured = self._patch(changed=["a.py"])
+        try:
+            mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+        attach_path = captured["cmd"][captured["cmd"].index("--attach") + 1]
+        self.assertIn("zcode-pr-review-", attach_path)
+        self.assertFalse(os.path.exists(attach_path), "PR 附件临时文件应被清理")
 
 
 if __name__ == "__main__":

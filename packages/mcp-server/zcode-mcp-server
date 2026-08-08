@@ -581,7 +581,8 @@ def _resolve_pr_base(repo):
         candidates.append(out.strip())  # 形如 origin/main
     candidates += ["main", "master", "origin/main", "origin/master"]
     for cand in candidates:
-        rc, _, _ = _git(repo, "rev-parse", "--verify", "--quiet", cand)
+        rc, _, _ = _git(repo, "rev-parse", "--verify", "--quiet",
+                        "--end-of-options", cand)
         if rc == 0:
             return cand
     return None
@@ -591,23 +592,32 @@ def _pr_diff(repo, base, head):
     """计算 base...head 的改动文件清单 + diff 全文 (三点 = merge-base 语义)。
 
     返回 (changed_files, diff_text); 失败抛 RuntimeError。
+    base/head 需先过 _validate_rev; 这里再加 --end-of-options 双保险,
+    末尾 -- 隔离 pathspec。
     """
-    rc, files_out, err = _git(repo, "diff", "--name-only", f"{base}...{head}", "--")
+    range_spec = f"{base}...{head}"
+    rc, files_out, err = _git(repo, "diff", "--name-only", "--end-of-options",
+                              range_spec, "--")
     if rc != 0:
-        raise RuntimeError(f"git diff {base}...{head} 失败: {err.strip()[:200]}")
+        raise RuntimeError(f"git diff {range_spec} 失败: {err.strip()[:200]}")
     changed = [ln.strip() for ln in files_out.splitlines() if ln.strip()]
-    rc, diff_text, err = _git(repo, "diff", f"{base}...{head}", "--")
+    rc, diff_text, err = _git(repo, "diff", "--end-of-options", range_spec, "--")
     if rc != 0:
-        raise RuntimeError(f"git diff {base}...{head} 失败: {err.strip()[:200]}")
+        raise RuntimeError(f"git diff {range_spec} 失败: {err.strip()[:200]}")
     return changed, diff_text
 
 
 def _validate_rev(repo, rev, what):
     """校验 git rev 合法: 非 - 开头 (防 git 选项注入, 自审 P1-1: --output= 等
-    会让只读 diff 写出文件) 且 rev-parse 可解析。返回错误文案或 None。"""
+    会让只读 diff 写出文件) 且 rev-parse 可解析。返回错误文案或 None。
+
+    rev-parse 带 --end-of-options (git ≥ 2.24, 复审 P1-1 补强): 彻底关掉
+    rev 被当选项解析的残余路径 (如 rev-parse 自身选项别名)。
+    """
     if not rev or rev.startswith("-"):
         return f"非法 {what}: {rev!r} (空值或 - 开头会被 git 当选项解析, 已拒绝)"
-    rc, _, err = _git(repo, "rev-parse", "--verify", "--quiet", rev)
+    rc, _, err = _git(repo, "rev-parse", "--verify", "--quiet",
+                      "--end-of-options", rev)
     if rc != 0:
         return f"{what} 不存在: {rev!r} (git: {err.strip()[:150]})"
     return None
@@ -873,10 +883,20 @@ def _write_temp(text, prefix):
     return tmp.name
 
 
+def _clamp_focus(focus):
+    """focus 来自 MCP client (信任边界外): 长度钳 2000 字符 (复审 P2-3:
+    超长 focus 会撑大 prompt; 三个 review tool 统一在此收口)。"""
+    focus = focus or ""
+    if len(focus) > 2000:
+        log(f"⚠ focus 超 2000 字符 ({len(focus)}), 截断")
+        focus = focus[:2000]
+    return focus
+
+
 def tool_zcode_review(args):
     files = args.get("files", [])
     code = args.get("code")
-    focus = args.get("focus", "全面审查: 安全、正确性、可维护性")
+    focus = _clamp_focus(args.get("focus")) or "全面审查: 安全、正确性、可维护性"
     cwd = args.get("cwd")
 
     # 构造 prompt — "只审不修"职责钉死在文本层, 写工具在工具集层物理禁用,
@@ -930,7 +950,7 @@ def tool_zcode_security_review(args):
       读工具全开可查证上下文, 写工具物理禁用保证只审不修。
     """
     scan_path = args.get("path") or args.get("cwd") or os.getcwd()
-    focus = args.get("focus", "")
+    focus = _clamp_focus(args.get("focus"))
     depth = args.get("depth", "normal")
     focus_files = args.get("focus_files") or []
 
@@ -1029,7 +1049,7 @@ def tool_zcode_pr_review(args):
     全程只读: 写工具物理禁用; git/mimosa 都是只读调用。
     """
     scan_path = args.get("path") or args.get("cwd") or os.getcwd()
-    focus = args.get("focus", "")
+    focus = _clamp_focus(args.get("focus"))
     depth = args.get("depth", "deep")
     head = args.get("head", "HEAD")
 
@@ -1075,8 +1095,13 @@ def tool_zcode_pr_review(args):
                                      maximum=5_000_000))
     diff_bytes = diff_text.encode("utf-8")
     if len(diff_bytes) > max_bytes:
-        # 按字节截断再容错解码, 防多字节字符被切成半个 (自审 P1-2)
-        diff_text = diff_bytes[:max_bytes].decode("utf-8", errors="ignore") + (
+        # 按字节截断: 先退到最后一个完整行 (复审 P1-2: 防半行误导 diff 结构),
+        # 再容错解码防多字节字符切半
+        cut = diff_bytes[:max_bytes]
+        nl = cut.rfind(b"\n")
+        if nl > 0:
+            cut = cut[:nl]
+        diff_text = cut.decode("utf-8", errors="ignore") + (
             f"\n\n[... diff 超 {max_bytes} 字节已截断; 改动文件清单完整, "
             "可用只读工具阅读完整文件 ...]")
 
@@ -1087,12 +1112,16 @@ def tool_zcode_pr_review(args):
             "指向插件根目录 (含 payload/ 的那层);也可改用 zcode_review 做纯 AI 审查。"
         )}], "isError": True}
 
-    # ② mimosa 扫描 (focus_files=改动文件; deep 档业务逻辑投研聚焦, 全仓仍全量扫)
+    # ② mimosa 扫描 (focus_files=改动文件, 上限 200 与 security_review 一致;
+    # deep 档业务逻辑投研聚焦, 全仓仍全量扫)
+    focus_files = changed[:200]
+    if len(changed) > 200:
+        log(f"⚠ 改动文件 {len(changed)} 超 200, focus_files 截断 (清单在附件里完整)")
     log(f"mimosa {depth} 扫描 (PR 模式): {scan_path} (root={root}, "
         f"{len(changed)} 个改动文件)")
     try:
         if depth == "deep":
-            summary_text, findings = _mimosa_deep_scan(root, scan_path, changed)
+            summary_text, findings = _mimosa_deep_scan(root, scan_path, focus_files)
         else:
             summary_text, findings = _mimosa_quick_scan(root, scan_path)
     except Exception as e:
