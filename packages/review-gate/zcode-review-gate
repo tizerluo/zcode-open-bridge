@@ -45,7 +45,11 @@ DEFAULT_GITHUB_API = "https://api.github.com"
 HTTP_TIMEOUT = 30           # GitHub API 单请求超时 (秒)
 GIT_TIMEOUT = 120           # 单条 git 命令超时 (秒; fetch/rev-parse 等)
 CLONE_TIMEOUT = 600         # clone 单独放宽 (大仓首次克隆慢)
-REVIEW_TIMEOUT = 3600       # 单次 zcode 审查超时 (秒; deep 档 mimosa+zcode 很慢)
+ZCODE_REVIEW_TIMEOUT = 3600  # 传给 mcp-server 的 zcode 审查预算 (透传 env;
+                             #  mcp-server 侧 _review_timeout 上限正好 3600)
+REVIEW_TIMEOUT = ZCODE_REVIEW_TIMEOUT + 120  # gate 等子进程的总超时:
+                             #  zcode 预算 + mimosa 扫描与进程收尾余量 120s,
+                             #  防 zcode 报告已出却被 gate 提前掐掉
 PULLS_PER_PAGE = 100        # pulls 列表每页条数 (GitHub 上限)
 PULLS_MAX_PAGES = 10        # 分页兜底: 单仓 open PR 超过 1000 个极罕见
 VERDICT_SCAN_HEAD = 3000    # verdict 只扫报告前 N 字符 (汇总段在开头, 防正文干扰)
@@ -101,7 +105,16 @@ class RepoHardError(Exception):
 
 
 class GitError(Exception):
-    """git 命令失败 (clone/fetch 等)。"""
+    """git 命令失败 (clone/fetch 等)。
+
+    transient=True 表示瞬时故障 (git 不可执行 / 命令超时等): 调用方不应
+    据此做破坏性恢复 (如删 clone 重建), 上抛当本轮仓级失败即可;
+    transient=False (rc≠0) 才是真损坏。
+    """
+
+    def __init__(self, msg, transient=False):
+        super().__init__(msg)
+        self.transient = transient
 
 
 # ============================================================
@@ -309,9 +322,9 @@ def git(args, token=None, timeout=GIT_TIMEOUT):
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout, env=env)
     except subprocess.TimeoutExpired as e:
-        raise GitError(f"git {args[0]} 超时 ({timeout}s)") from e
+        raise GitError(f"git {args[0]} 超时 ({timeout}s)", transient=True) from e
     except OSError as e:
-        raise GitError(f"git 不可执行: {e}") from e
+        raise GitError(f"git 不可执行: {e}", transient=True) from e
     if p.returncode != 0:
         detail = (p.stderr or "").strip()[:500]
         raise GitError(f"git {args[0]} 失败 (exit={p.returncode}): {detail}")
@@ -339,14 +352,18 @@ def ensure_clone(cfg, token, owner, repo):
     clone URL 不含 token (匿名 https + env 注入认证, token 不落盘);
     目录名 owner__repo ("/" 不能进目录名)。
     自愈: 上次 clone 中断/失败留下的半成品 (有 .git 目录但 rev-parse
-    不过) 删除重建; clone 失败也清理残留, 让下轮从干净状态重试。
+    rc≠0) 删除重建; clone 失败也清理残留, 让下轮从干净状态重试。
+    rev-parse 的瞬时故障 (git 缺失/磁盘卡顿导致的 OSError/超时) 直接
+    上抛当本轮仓级失败 — 健康 clone 不能因一次卡顿被误删。
     """
     dest = os.path.join(cfg.clone_root, f"{owner}__{repo}")
     if os.path.isdir(os.path.join(dest, ".git")):
         try:
             git(["-C", dest, "rev-parse", "--git-dir"], token=token)
             return dest
-        except GitError:
+        except GitError as e:
+            if e.transient:
+                raise   # 上抛给 process_repo 当仓级失败, 下轮自然重试
             log(f"{dest} 是不完整 clone (rev-parse 不过), 删除重建", "WARNING")
             shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(cfg.clone_root, exist_ok=True)
@@ -398,9 +415,10 @@ def run_review(cfg, clone, base_ref, head_sha):
     锁/限流重试/只读护栏全在 mcp-server 侧 (TOOL_HANDLERS 同源路径), 这里
     只做进程调用与结果解包。base 必须带 origin/ 前缀 — mcp-server 的 diff
     是 base...head 三点语法 (merge-base 语义), 引用要指向远端跟踪分支。
-    ZCODE_BRIDGE_REVIEW_TIMEOUT 显式透传: mcp-server 侧 zcode 审查默认
-    300s 超时, deep 档远远不够, 把 gate 等子进程的超时传过去保持一致
-    (mcp-server 上限 3600 正好兼容 REVIEW_TIMEOUT)。
+    ZCODE_BRIDGE_REVIEW_TIMEOUT 显式透传 ZCODE_REVIEW_TIMEOUT (3600):
+    mcp-server 侧 zcode 审查默认 300s 超时, deep 档远远不够; gate 自身
+    等子进程的总超时 REVIEW_TIMEOUT 在此基础上再加 120s, 留给 mimosa
+    扫描与进程收尾, 防 zcode 报告已出却被 gate 提前掐掉。
     """
     args = {
         "path": clone,
@@ -412,7 +430,7 @@ def run_review(cfg, clone, base_ref, head_sha):
     cmd = [cfg.mcp_server, "--call", "zcode_pr_review",
            json.dumps(args, ensure_ascii=False)]
     env = dict(os.environ)
-    env["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = str(REVIEW_TIMEOUT)
+    env["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = str(ZCODE_REVIEW_TIMEOUT)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=REVIEW_TIMEOUT, env=env)

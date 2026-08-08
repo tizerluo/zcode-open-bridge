@@ -145,15 +145,22 @@ state 文件（默认 `~/.local/state/zcode-review-gate/state.json`）记录每�
 `reviewed` 后 `report` 缓存清空。
 **想强制重审某个 PR：删掉对应条目**（或把 PR 推一个新 commit，head 变化会
 自动复活重审）。
+注意：`gave_up` 时缓存的 `report`（每条最多 `comment.max_body` 字符）会
+留在 state 文件里供人工排查——长期积攒关注 state 文件体量，可定期清理
+已完结 PR 的条目。
 
 deep 档审查耗时长：gate 起审查子进程时已自动透传
-`ZCODE_BRIDGE_REVIEW_TIMEOUT=3600`（= 自身等子进程的超时），mcp-server
-侧不会以默认 300s 提前掐断 zcode。
+`ZCODE_BRIDGE_REVIEW_TIMEOUT=3600`，自身等子进程的总超时再加 120s 留给
+mimosa 扫描与进程收尾（=3720），mcp-server 侧不会以默认 300s 提前掐断
+zcode。
 
 ## 限制
 
 - **评论以 token 身份发出**：用什么 token 评论就显示什么账号，建议专用 bot
   账号或 GitHub App token。
+- **评论 at-least-once**：评论请求发出后响应丢失（超时/连接断开）会按失败
+  重试，而 GitHub issue comments 没有幂等键——极端情况下同一 head 可能
+  出现重复评论，属已知限制（方向仍是宁多勿漏）。
 - **verdict 依赖报告文本解析**：从报告开头解析 `P0/P1/P2` 条数得出
   pass/concerns；解析失败时 fail-safe 为 **concerns**（宁错拦不错放），
   评论里会标注"严重度分布解析失败，请人工核对"。

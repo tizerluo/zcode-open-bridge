@@ -585,6 +585,25 @@ class TestEnsureClone(_GateCase):
                 self.mod.ensure_clone(cfg, "tok", "o", "r")
         self.assertFalse(os.path.exists(dest))
 
+    def test_revparse_transient_keeps_clone(self):
+        """rev-parse 超时/OSError (瞬时故障) → GitError 上抛, 健康 clone 不被误删"""
+        cfg = self._cfg()
+        dest = os.path.join(self.tmp, "clones", "o__r")
+        os.makedirs(os.path.join(dest, ".git"))
+
+        def fake_run(cmd, *a, **kw):
+            if "rev-parse" in cmd:
+                raise subprocess.TimeoutExpired(cmd=list(cmd), timeout=120)
+            if "clone" in cmd:  # 不应走到: 瞬时故障不触发重建
+                raise AssertionError("瞬时故障不应删除重建")
+            return _CP(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(self.mod.subprocess, "run", fake_run):
+            with self.assertRaises(self.mod.GitError) as cm:
+                self.mod.ensure_clone(cfg, "tok", "o", "r")
+        self.assertTrue(cm.exception.transient)
+        self.assertTrue(os.path.isdir(os.path.join(dest, ".git")))  # 未被删
+
     def test_git_base_url_derivation(self):
         self.assertEqual(self.mod._git_base_url("https://api.github.com"),
                          "https://github.com")
@@ -648,7 +667,8 @@ class TestRunReview(_GateCase):
         self.assertIn("超时", err)
 
     def test_timeout_env_passthrough(self):
-        """gate 等子进程的超时透传给 mcp-server 的 zcode 超时 (防 300s 提前掐断)"""
+        """zcode 审查预算 (3600) 透传给 mcp-server; gate 总超时再多留
+        120s 给 mimosa 扫描与收尾 (REVIEW_TIMEOUT = ZCODE_REVIEW_TIMEOUT + 120)"""
         seen = {}
 
         def fake_run(cmd, *a, **kw):
@@ -660,9 +680,11 @@ class TestRunReview(_GateCase):
         with mock.patch.object(self.mod.subprocess, "run", fake_run):
             ok, _report = self.mod.run_review(self._cfg(), "/c", "main", "s")
         self.assertTrue(ok)
+        self.assertEqual(self.mod.REVIEW_TIMEOUT,
+                         self.mod.ZCODE_REVIEW_TIMEOUT + 120)
         self.assertEqual(seen["timeout"], self.mod.REVIEW_TIMEOUT)
         self.assertEqual(seen["env"]["ZCODE_BRIDGE_REVIEW_TIMEOUT"],
-                         str(self.mod.REVIEW_TIMEOUT))
+                         str(self.mod.ZCODE_REVIEW_TIMEOUT))
 
     def test_stderr_tail_in_error(self):
         payload = {"ok": False, "result": {
