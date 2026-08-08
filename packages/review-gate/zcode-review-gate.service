@@ -14,8 +14,6 @@
 #       Environment=GITHUB_TOKEN=ghp_xxx
 #     更安全的方式是 `systemctl --user edit zcode-review-gate` 写 override,
 #     避免 token 进 unit 文件本体。
-#   - 非登录 shell 的 PATH 可能不含 ~/.local/bin / git / zcode 的安装位置,
-#     必要时加: Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Unit]
 Description=ZCode Review Gate — PR 自动审查闸门 (zcode-open-bridge)
@@ -31,6 +29,9 @@ RestartSec=30
 # 子进程留收敛时间; 超时仍 SIGKILL — 万一撞 ReviewFileLock 残锁,
 # mcp-server 侧 300s 锁超时兜底, 不会死锁。
 TimeoutStopSec=120
+# systemd --user 默认 PATH=/usr/local/bin:/usr/bin:/bin, 不含 ~/.local/bin
+# (GC-8G 实测踩坑), 而组件/git/zcode 通常就装在 ~/.local/bin — 默认带上
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

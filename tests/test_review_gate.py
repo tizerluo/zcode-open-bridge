@@ -20,6 +20,7 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
   - git: token 经 GIT_CONFIG_* env 注入且 argv 无 token / GitError 不带 token
   - ensure_clone: 半成品重建 / clone 失败清理 / web 宿主推导
   - run_review: 坏 JSON / 空报告 / OSError / TimeoutExpired / 超时透传 / stderr 尾部
+  - mcp_server 解析: PATH 命中 / ~/.local/bin 回退 / 不可执行不用 / 原样兜底
   - --once 全链路 (新 sha → 审+评+落盘; 同 sha 不重复; 新 sha 重审 attempts 清零)
   - 评论失败两路径: RetryableError → comment_failed+退避+缓存, 下轮只补评论;
     RateLimited → 不烧 attempts 有缓存, 下轮只补评论
@@ -637,6 +638,63 @@ class TestEnsureClone(_GateCase):
             self.mod.ensure_clone(cfg, "tok", "o", "r")
         clone_cmd = next(c for c in cmds if "clone" in c)
         self.assertIn("https://ghe.example.com/o/r.git", clone_cmd)
+
+
+# ============================================================
+# mcp_server 解析 (PATH → ~/.local/bin 回退 → 原样)
+# ============================================================
+class TestResolveMcpServer(_GateCase):
+    """GC-8G 实测: systemd --user 默认 PATH 不含 ~/.local/bin,
+    纯命令名需回退 ~/.local/bin 找组件。"""
+
+    ENV_KEYS = _EnvGuard.ENV_KEYS + ("HOME",)
+
+    def _cfg(self, name="zcode-mcp-server"):
+        return self.mod.GateConfig({"mcp_server": name})
+
+    def _make_local_exe(self, mode=0o755):
+        os.environ["HOME"] = self.tmp
+        local_bin = os.path.join(self.tmp, ".local", "bin")
+        os.makedirs(local_bin)
+        exe = os.path.join(local_bin, "zcode-mcp-server")
+        with open(exe, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(exe, mode)
+        return exe
+
+    def test_which_hit_returns_name(self):
+        with mock.patch.object(self.mod.shutil, "which",
+                               return_value="/usr/bin/zcode-mcp-server"):
+            self.assertEqual(self.mod._resolve_mcp_server(self._cfg()),
+                             "zcode-mcp-server")
+
+    def test_fallback_to_local_bin(self):
+        """which 返回 None + ~/.local/bin 存在可执行文件 → 选用回退路径"""
+        exe = self._make_local_exe()
+        with mock.patch.object(self.mod.shutil, "which", return_value=None):
+            self.assertEqual(self.mod._resolve_mcp_server(self._cfg()), exe)
+
+    def test_fallback_requires_executable(self):
+        """~/.local/bin 里文件存在但不可执行 → 不用, 按原样交给 subprocess"""
+        self._make_local_exe(mode=0o644)
+        with mock.patch.object(self.mod.shutil, "which", return_value=None):
+            self.assertEqual(self.mod._resolve_mcp_server(self._cfg()),
+                             "zcode-mcp-server")
+
+    def test_missing_everywhere_returns_as_is(self):
+        """PATH 与 ~/.local/bin 都没有 → 原样 (OSError 走既有错误路径)"""
+        os.environ["HOME"] = self.tmp
+        with mock.patch.object(self.mod.shutil, "which", return_value=None):
+            self.assertEqual(self.mod._resolve_mcp_server(self._cfg()),
+                             "zcode-mcp-server")
+
+    def test_path_value_used_as_is(self):
+        """含路径分隔符的值原样使用, 不做任何探测"""
+        with mock.patch.object(self.mod.shutil, "which") as m_which:
+            self.assertEqual(
+                self.mod._resolve_mcp_server(self._cfg("/opt/mcp/server")),
+                "/opt/mcp/server")
+        m_which.assert_not_called()
 
 
 # ============================================================

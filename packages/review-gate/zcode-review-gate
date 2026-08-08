@@ -422,6 +422,31 @@ def _result_text(data):
     return ""
 
 
+def _resolve_mcp_server(cfg):
+    """解析 mcp_server 配置值为可执行路径。
+
+    GC-8G 实测踩坑: systemd --user 默认 PATH 不含 ~/.local/bin, 而标准
+    安装法把组件装在 ~/.local/bin — 纯命令名 (无路径分隔符) 且 PATH 里
+    找不到时, 回退试 ~/.local/bin/<name> (存在且可执行才用); 都没有按
+    原样交给 subprocess (OSError 走既有"无法执行 mcp-server"错误路径)。
+    含路径分隔符的值原样使用。
+    """
+    name = cfg.mcp_server
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return name
+    if shutil.which(name):
+        log(f"mcp_server 解析: {name} (PATH 命中)", "DEBUG")
+        return name             # PATH 里能找到, 按原样 (子进程同样走 PATH)
+    fallback = os.path.expanduser(f"~/.local/bin/{name}")
+    if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
+        log(f"mcp_server 解析: {name} → {fallback} "
+            f"(PATH 未命中, 回退 ~/.local/bin)", "DEBUG")
+        return fallback
+    log(f"mcp_server 解析: {name} (PATH 与 ~/.local/bin 均未见, 按原样)",
+        "DEBUG")
+    return name
+
+
 def run_review(cfg, clone, base_ref, head_sha):
     """经 mcp-server --call 调 zcode_pr_review, 返回 (ok, 报告正文 | 错误描述)。
 
@@ -440,7 +465,7 @@ def run_review(cfg, clone, base_ref, head_sha):
         "depth": cfg.review_depth,
         "focus": cfg.review_focus,
     }
-    cmd = [cfg.mcp_server, "--call", "zcode_pr_review",
+    cmd = [_resolve_mcp_server(cfg), "--call", "zcode_pr_review",
            json.dumps(args, ensure_ascii=False)]
     env = dict(os.environ)
     env["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = str(ZCODE_REVIEW_TIMEOUT)

@@ -66,10 +66,11 @@ loginctl enable-linger "$USER"
 
 注意事项：
 
-- **PATH**：systemd --user 的非登录 shell 环境极简，`~/.local/bin` 不一定在
-  PATH 里。`zcode-review-gate` 调 `git`、`zcode-mcp-server`（以及它间接调
-  `zcode`）都依赖 PATH，必要时在 unit 里加
-  `Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin`。
+- **PATH**：systemd --user 默认 `PATH=/usr/local/bin:/usr/bin:/bin`，不含
+  `~/.local/bin`（GC-8G 实测踩坑）。unit 模板已默认带
+  `Environment=PATH=%h/.local/bin:...`；此外 gate 解析 `mcp_server` 纯
+  命令名时若 PATH 找不到会自动回退试 `~/.local/bin/<name>`，双保险。
+  但 `git`、`zcode` 仍依赖 PATH——自己改 unit 时别把默认 PATH 行删掉。
 - **sudo -u 场景**：用 `sudo -u <user> systemctl --user ...` 操作别人的
   user manager 时，需要 `XDG_RUNTIME_DIR=/run/user/$(id -u <user>)`，
   否则连不上 user bus。
@@ -87,7 +88,7 @@ loginctl enable-linger "$USER"
 | `poll_interval_seconds` | `300` | 轮询间隔（秒） |
 | `state_file` | `~/.local/state/zcode-review-gate/state.json` | 状态文件（去重/退避） |
 | `clone_root` | `~/.local/state/zcode-review-gate/clones` | 仓库 clone 存放目录 |
-| `mcp_server` | `zcode-mcp-server` | bridge mcp-server 可执行名/路径（须支持 `--call`） |
+| `mcp_server` | `zcode-mcp-server` | bridge mcp-server 可执行名/路径（须支持 `--call`）。纯命令名且 PATH 找不到时自动回退试 `~/.local/bin/<name>`（存在且可执行才用，log DEBUG 记录解析结果） |
 | `github_api` | `https://api.github.com` | GitHub API base（企业版可改）。clone 的 web 宿主按惯例推导：`api.github.com`→`github.com`，`<host>/api/v3`→`<host>`（GHE），其他形态回退 `github.com` |
 | `review.depth` | `deep` | 审查深度：`normal`（快扫）/ `deep`（含业务逻辑投研） |
 | `review.focus` | `""` | 额外审查重点（透传给 zcode prompt） |
