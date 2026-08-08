@@ -41,6 +41,8 @@ import io
 import json
 import os
 import queue
+import subprocess
+import tempfile
 import threading
 import time
 import types
@@ -1263,6 +1265,227 @@ class TestAppServerMethods(unittest.TestCase):
         bridge, _ = self._new_bridge()
         resp = self._call(bridge, "session/nonexistent", {"sessionId": "sess_x"})
         self._assert_error_code(resp, -32601)
+
+    # ---------- RV: 整体 deep review (zcode 狗食) 修复回归锚 ----------
+    def test_rv1_next_id_monotonic_and_threadsafe(self):
+        """RV1 (P1-1): _next_id 基于 itertools.count — 单调递增且并发取 id 不重复"""
+        bridge, _ = self._new_bridge()
+        first = bridge._next_id()
+        self.assertGreaterEqual(first, 10_000_001,
+                                "id 空间从 10_000_001 起 (避开 server 的 id 空间)")
+        self.assertEqual(bridge._next_id(), first + 1)
+        # 并发冒烟: 两线程各取 500 个 id, 全集不得重复 (count 的 next() 原子)
+        got = []
+        lock = threading.Lock()
+
+        def _grab():
+            local = [bridge._next_id() for _ in range(500)]
+            with lock:
+                got.extend(local)
+
+        threads = [threading.Thread(target=_grab) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(set(got)), len(got), "并发取 id 不得重复")
+
+    def test_rv2_write_stdout_single_locked_frame(self):
+        """RV2 (P1-2): stdout 全收进 _write_stdout 加锁写口, 输出完整单行 JSON 帧"""
+        bridge, _ = self._new_bridge()
+        self.assertTrue(hasattr(bridge, "_stdout_lock"), "bridge 应持有 stdout 写锁")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bridge._send_acp_notification("session/update", {"sessionId": "s"})
+        line = out.getvalue()
+        self.assertTrue(line.endswith("\n") and "\n" not in line[:-1],
+                        "一帧必须是单行 JSON (半截/交错帧会让 client 解析失败)")
+        frame = json.loads(line)
+        self.assertEqual(frame["method"], "session/update")
+        self.assertNotIn("id", frame, "notification 无 id")
+
+    def test_rv3_pending_turns_cleaned_on_exception(self):
+        """RV3 (P1-5): prompt 中途异常也必须摘掉 pending turn (try/finally 兜底)"""
+        class _BoomBackend:
+            """session/messages 抛异常 (模拟 baseline 拉取失败) 的最小桩"""
+
+            def request(self, msg_id, method, params=None, timeout=30):
+                if method == "session/messages":
+                    raise RuntimeError("boom (模拟中途异常)")
+                return {"result": {"ok": True}}, []
+
+            def send(self, msg):
+                pass
+
+        bridge = self.Bridge()
+        bridge.backend = _BoomBackend()
+        bridge.session_map["acp_rv3"] = "sess_rv3"
+        with self.assertRaises(RuntimeError):
+            self._call(bridge, "session/prompt",
+                       {"sessionId": "acp_rv3", "prompt": "hi"})
+        self.assertEqual(bridge.pending_turns, {},
+                         "异常路径不得留下僵尸 pending turn (P1-5)")
+
+    def test_rv4_differs_cap_fifo_eviction(self):
+        """RV4 (P2-1): differ 超 _MAX_SESSION_STATES 上限 FIFO 淘汰最旧 session"""
+        bridge, _ = self._new_bridge()
+        cap = self.mod._MAX_SESSION_STATES
+        for i in range(cap + 3):
+            bridge._get_or_create_differ(f"sess_{i}")
+        self.assertEqual(len(bridge._differs), cap, "differ 总数不得超上限")
+        self.assertNotIn("sess_0", bridge._differs, "最旧条目应被 FIFO 淘汰")
+        self.assertIn(f"sess_{cap + 2}", bridge._differs, "最新条目必须保留")
+
+    def test_rv5_state_projection_cap_fifo_eviction(self):
+        """RV5 (P2-2): state 投影超上限同样 FIFO 淘汰 (跨 session 无清理的兜底)"""
+        backend = self._bare_backend()
+        cap = self.mod._MAX_SESSION_STATES
+        for i in range(cap + 3):
+            backend._merge_state_patch({"sessionId": f"sess_{i}",
+                                        "patch": {"status": "running"}})
+        self.assertEqual(len(backend._state_projections), cap,
+                         "投影总数不得超上限")
+        self.assertIsNone(backend.get_projection("sess_0"), "最旧投影应被淘汰")
+        self.assertIsNotNone(backend.get_projection(f"sess_{cap + 2}"),
+                             "最新投影必须保留")
+
+    def test_rv6_redact_secret_hex_and_uuid(self):
+        """RV6 (P2-3): 纯 hex (32+) / uuid 形态的无前缀 key 也脱敏"""
+        hex_key = "0123456789abcdef" * 4  # 64 位 hex
+        uuid_key = "123e4567-e89b-12d3-a456-426614174000"
+        out = self.Bridge._redact_secret(
+            f"provider error: key={hex_key} alt={uuid_key} path=/tmp/ok")
+        self.assertNotIn(hex_key, out, "64 位 hex key 应被遮蔽")
+        self.assertNotIn(uuid_key, out, "uuid 形态 key 应被遮蔽")
+        self.assertIn("path=/tmp/ok", out, "非敏感部分保留")
+        # 短十六进制不误伤 (如 git 短 sha / 普通单词)
+        self.assertIn("abc1234", self.Bridge._redact_secret("commit abc1234"))
+
+    def test_rv7_close_kill_reaps_zombie(self):
+        """RV7 (P2-7): close() 的 kill() 后补 wait(timeout=2) 收尸防僵尸"""
+        calls = []
+
+        class _Proc:
+            def terminate(self):
+                calls.append("terminate")
+
+            def wait(self, timeout=None):
+                calls.append(("wait", timeout))
+                if timeout == 3:
+                    raise subprocess.TimeoutExpired("zcode", 3)
+
+            def kill(self):
+                calls.append("kill")
+
+        backend = self.mod.ZCodeBackend.__new__(self.mod.ZCodeBackend)
+        backend.proc = _Proc()
+        backend.close()
+        self.assertEqual(calls, ["terminate", ("wait", 3), "kill", ("wait", 2)],
+                         "kill 后必须再 wait 收尸, 防子进程变僵尸")
+
+    def test_rv8_register_listener_overwrite_warns(self):
+        """RV8 (P2-8): 同 sid 重复注册 listener 打告警 (防静默丢事件)"""
+        backend = self._bare_backend()
+        l1, l2 = object(), object()
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            backend.register_event_listener("sess_rv8", l1)
+            backend.register_event_listener("sess_rv8", l2)
+        self.assertIn("覆盖", captured.getvalue(),
+                      "同 sid 覆盖注册必须打告警")
+        self.assertIs(backend._event_listeners["sess_rv8"], l2,
+                      "覆盖后路由到新 listener (当前行为保留, 只是不再静默)")
+
+    def test_rv9_wait_for_turn_idle_backoff_and_drain(self):
+        """RV9 (P2-5): goal 等待循环指数退避 (1s→2s) 且每轮 drain inbox"""
+        bridge, fake = self._new_bridge({
+            "session/goal": {"response": [
+                {"error": {"message": "Cannot manage goals while a prompt is running"}},
+                {"error": {"message": "Cannot manage goals while a prompt is running"}},
+                {"result": {"ok": True}},
+            ]},
+        })
+        bridge.session_map["sess_rv9"] = "sess_rv9"
+        turn = {"zcode_sid": "sess_rv9", "cancelled": False}
+        bridge.pending_turns[7] = turn
+        bridge._inbox.put(json.dumps({"method": "session/cancel",
+                                      "params": {"sessionId": "sess_rv9"}}))
+        sleeps = []
+        real_sleep = time.sleep
+        time.sleep = lambda s: sleeps.append(s)
+        try:
+            ok = bridge._wait_for_turn_idle("sess_rv9", timeout=60,
+                                            probe_method="session/goal")
+        finally:
+            time.sleep = real_sleep
+        self.assertTrue(ok, "第三次探测成功应返回 True")
+        self.assertEqual(sleeps[:2], [1.0, 2.0], "探测重试应指数退避 (1s→2s, 封顶 8s)")
+        self.assertTrue(turn["cancelled"], "等待期间应 drain inbox 让 cancel 生效")
+
+    def test_rv10_credentials_missing_vs_corrupt(self):
+        """RV10 (P2-4): 凭证文件缺失静默降级 {}; 存在但损坏 → 显式警告文案"""
+        mod = self.mod
+        orig_path = mod.ZCODE_CREDS_PATH
+        bad_path = None
+        try:
+            # 缺失: 静默降级, 不打损坏警告
+            mod.ZCODE_CREDS_PATH = "/nonexistent/dir/config.json"
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                creds = mod.load_zcode_credentials()
+            self.assertEqual(creds, {}, "未配置文件应静默降级为空 dict")
+            self.assertNotIn("凭证文件存在但读取失败", captured.getvalue(),
+                             "未配置属正常降级, 不得打损坏警告")
+            # 损坏: 返回 {} 但打显式警告 (区别于「没配凭证」)
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+                f.write("{not valid json")
+                bad_path = f.name
+            mod.ZCODE_CREDS_PATH = bad_path
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                creds = mod.load_zcode_credentials()
+            self.assertEqual(creds, {})
+            self.assertIn("凭证文件存在但读取失败", captured.getvalue(),
+                          "文件存在但损坏必须显式警告")
+        finally:
+            mod.ZCODE_CREDS_PATH = orig_path
+            if bad_path:
+                os.unlink(bad_path)
+
+    def test_rv11_default_mode_env_override(self):
+        """RV11 (安全发现): ZCODE_ACP_DEFAULT_MODE 覆盖 session/new 缺省 mode,
+        默认仍 yolo, 显式 mode 优先级最高"""
+        self.assertEqual(self.mod.DEFAULT_ACP_MODE, "yolo",
+                         "缺省默认仍是 yolo (历史行为不变)")
+        # 无 env 时 session/new 缺省 mode=yolo
+        bridge, fake = self._new_bridge()
+        self._call(bridge, "session/new", {"cwd": "/p"})
+        create = [c for c in fake.calls if c["method"] == "session/create"]
+        self.assertEqual(create[0]["params"].get("mode"), "yolo")
+
+        old = os.environ.get("ZCODE_ACP_DEFAULT_MODE")
+        os.environ["ZCODE_ACP_DEFAULT_MODE"] = "build"
+        try:
+            mod2 = _load_bridge_module()  # 重新 exec 模块让 env 生效
+            self.assertEqual(mod2.DEFAULT_ACP_MODE, "build")
+            bridge2 = mod2.ACPBridge()
+            fake2 = FakeBackend()
+            bridge2.backend = fake2
+            bridge2.handle_acp({"jsonrpc": "2.0", "id": 1, "method": "session/new",
+                                "params": {"cwd": "/p"}})
+            create2 = [c for c in fake2.calls if c["method"] == "session/create"]
+            self.assertEqual(create2[0]["params"].get("mode"), "build",
+                             "env 覆盖后缺省 mode 应取 env 值")
+            bridge2.handle_acp({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                                "params": {"cwd": "/p", "mode": "plan"}})
+            create3 = [c for c in fake2.calls if c["method"] == "session/create"]
+            self.assertEqual(create3[1]["params"].get("mode"), "plan",
+                             "显式 mode 优先于 env 默认值")
+        finally:
+            if old is None:
+                os.environ.pop("ZCODE_ACP_DEFAULT_MODE", None)
+            else:
+                os.environ["ZCODE_ACP_DEFAULT_MODE"] = old
 
 
 if __name__ == "__main__":

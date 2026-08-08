@@ -59,6 +59,7 @@ translate() 入参为 session/event 通知的 params 整体 (与旧版 seam 一�
 
 import os
 import threading
+import time
 import types
 import unittest
 
@@ -561,6 +562,87 @@ class TestEventTranslator(unittest.TestCase):
         self.assertEqual(resp["error"]["code"], -32603)
         self.assertIn("Provider authentication failed.", resp["error"]["message"],
                       "失败文案应取 payload 的 error.message (实测载荷无 resultType)")
+
+
+class _TimeoutScriptBackend:
+    """最小桩: 按 method 脚本化响应 (事件超时用例只需 session/read)"""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+
+    def request(self, msg_id, method, params=None, timeout=30):
+        self.calls.append(method)
+        return self.responses.get(method, {"result": {}}), []
+
+    def send(self, msg):
+        pass
+
+
+class TestEventTurnTimeout(unittest.TestCase):
+    """事件模式 120s 超时的语义 (整体 review tests 报告 P2-5):
+
+    turn 已启动 (turn.started) 但事件流再未给完成信号 → -32603「事件流超时」,
+    不再返回 max_turn_requests 正常 stopReason (否则 client 无法区分「turn 真的
+    太长」与「事件流卡死」); turn 从未启动则保持 max_turn_requests 原语义。
+
+    time.time 快进 (同 test_app_server_methods.py PM3 手法), 不真等 120s。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_bridge_module()
+
+    def _run_event_turn_fast(self, bridge, first_event):
+        """直调 _run_event_turn; poll_event 首调用给 first_event 之后恒 None,
+        time.time 每次调用快进 1s 让 120s 超时瞬时触发。"""
+        zcode_sid = "sess_timeout"
+        bridge.session_map[zcode_sid] = zcode_sid
+        msg_id = 1
+        turn = {"zcode_sid": zcode_sid, "cancelled": False, "perms_responses": {}}
+        bridge.pending_turns[msg_id] = turn
+        listener = self.mod.EventStreamListener(bridge.backend, zcode_sid)
+        sent = [False]
+
+        def _poll(timeout=0.5):
+            if not sent[0] and first_event is not None:
+                sent[0] = True
+                return first_event
+            return None
+
+        listener.poll_event = _poll  # 实例级替换, 不真阻塞 0.5s
+        differ = bridge._get_or_create_differ(zcode_sid)
+        real_time = time.time
+        clock = [real_time()]
+        try:
+            time.time = lambda: (clock.__setitem__(0, clock[0] + 1.0), clock[0])[1]
+            return _run_with_guard(lambda: bridge._run_event_turn(
+                listener, zcode_sid, zcode_sid, msg_id, turn,
+                chunk_msg_id="chunk_timeout", differ=differ))
+        finally:
+            time.time = real_time
+
+    def test_et1_turn_started_stream_broken_is_error(self):
+        """ET1 (P2-5): turn.started 后事件流断 (120s 无完成信号) → -32603 事件流超时"""
+        bridge = self.mod.ACPBridge()
+        # 停滞检查的 session/read 一直说 running (turn 永不完成, 事件流实断)
+        bridge.backend = _TimeoutScriptBackend({
+            "session/read": {"result": {"projection": {"status": "running"}}},
+        })
+        resp = self._run_event_turn_fast(
+            bridge, _session_event("turn.started", _turn_started()))
+        self.assertIn("error", resp, "事件流中断属异常, 不得返回正常 stopReason")
+        self.assertEqual(resp["error"]["code"], -32603)
+        self.assertIn("事件流超时", resp["error"]["message"])
+        self.assertEqual(bridge.pending_turns, {}, "超时路径也应摘掉 pending turn")
+
+    def test_et2_turn_never_started_keeps_stop_reason(self):
+        """ET2 (P2-5 边界): turn 从未启动 (无任何事件) → 保持 max_turn_requests 原语义"""
+        bridge = self.mod.ACPBridge()
+        bridge.backend = _TimeoutScriptBackend({})
+        resp = self._run_event_turn_fast(bridge, None)
+        self.assertNotIn("error", resp)
+        self.assertEqual(resp["result"]["stopReason"], "max_turn_requests")
 
 
 if __name__ == "__main__":

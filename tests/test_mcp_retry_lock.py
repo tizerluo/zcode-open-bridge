@@ -22,6 +22,7 @@ test_mcp_retry_lock.py — MCP server 限流重试与文件锁单测
 依赖: 仅 Python 标准库 + zcode-mcp-server 模块
 """
 
+import json
 import os
 import types
 import unittest
@@ -344,6 +345,140 @@ class TestRetryLogic(unittest.TestCase):
                 os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
             else:
                 os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = old
+    # ---------- RT7: stderr 警告词 + stdout 有结论 → 不误杀 (整体 review P1-1) ----------
+    def test_rt7_stderr_warning_with_stdout_not_error(self):
+        """RT7: exit=0 + stdout 是合法 --json 结论 + stderr 含错误关键词 → 算成功
+
+        整体 review P1-1 + 复审 P1-A: 判据是"stdout 可解析出 response 结果"
+        (非"非空") — zcode 常往 stderr 打 Node 警告/诊断, 恰好含
+        "Unauthorized" 等词时, 旧规则会把成功审查误判为错误丢弃结论。
+        """
+        mod = self.mod
+        procs = [_FakeCompletedProcess(
+            returncode=0,
+            stdout=json.dumps({"response": "审查结论: 代码无问题"}, ensure_ascii=False),
+            stderr="(node:123) Warning: Unauthorized token refresh attempt, retried OK")]
+        old = os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        try:
+            calls, saved_run, real_sleep = self._patch(mod, procs)
+            try:
+                result = self._review(mod)
+            finally:
+                self._restore(mod, saved_run, real_sleep)
+            self.assertNotIn("isError", result,
+                             "stderr 警告词 + stdout 合法结论不应误判为错误")
+            self.assertEqual(calls["n"], 1, "不应触发重试")
+            self.assertIn("审查结论", result["content"][0]["text"])
+        finally:
+            if old is None:
+                os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+            else:
+                os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = old
+
+    def test_rt7b_nonjson_stdout_with_stderr_keyword_is_error(self):
+        """RT7b: stdout 非空但不是合法 JSON 结果 (错误回显文本) + stderr 命中 → 判错误
+
+        复审 P1-A 反例: 收窄不能漏掉"stdout 有内容但实为错误回显"。
+        """
+        mod = self.mod
+        procs = [_FakeCompletedProcess(
+            returncode=0,
+            stdout="Error: provider returned an error page",  # 非 JSON 的错误文本
+            stderr="APICallError: Unauthorized")]
+        old = os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        try:
+            calls, saved_run, real_sleep = self._patch(mod, procs)
+            try:
+                result = self._review(mod)
+            finally:
+                self._restore(mod, saved_run, real_sleep)
+            self.assertTrue(result.get("isError"),
+                            "stdout 非 JSON 结果 + stderr 命中应判错误")
+        finally:
+            if old is None:
+                os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+            else:
+                os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = old
+
+    def test_rt7c_leading_warning_line_tolerated(self):
+        """RT7c: stdout 先打 AI SDK 警告行再输出 JSON → 仍能提取 response (实测形态)"""
+        mod = self.mod
+        payload = ("AI SDK Warning System: To turn off warning logging...\n"
+                   + json.dumps({"response": "正文结论"}, ensure_ascii=False))
+        procs = [_FakeCompletedProcess(returncode=0, stdout=payload, stderr="")]
+        old = os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        try:
+            calls, saved_run, real_sleep = self._patch(mod, procs)
+            try:
+                result = self._review(mod)
+            finally:
+                self._restore(mod, saved_run, real_sleep)
+            self.assertNotIn("isError", result)
+            self.assertEqual(result["content"][0]["text"], "正文结论")
+        finally:
+            if old is None:
+                os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+            else:
+                os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = old
+
+    # ---------- RT8: stdout 体积上限截断 (整体 review P2-1) ----------
+    def test_rt8_stdout_size_cap(self):
+        """RT8: 成功但 stdout 超 ZCODE_BRIDGE_MAX_OUTPUT → 截断 + 标注"""
+        mod = self.mod
+        procs = [_FakeCompletedProcess(0, "y" * 20000, "")]
+        old = os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+        old_mo = os.environ.pop("ZCODE_BRIDGE_MAX_OUTPUT", None)
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        os.environ["ZCODE_BRIDGE_MAX_OUTPUT"] = "10000"
+        try:
+            calls, saved_run, real_sleep = self._patch(mod, procs)
+            try:
+                result = self._review(mod)
+            finally:
+                self._restore(mod, saved_run, real_sleep)
+            self.assertNotIn("isError", result)
+            text = result["content"][0]["text"]
+            self.assertIn("已截断", text)
+            self.assertLess(len(text), 11000, "截断后长度应在上限附近")
+        finally:
+            if old is None:
+                os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
+            else:
+                os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = old
+            if old_mo is None:
+                os.environ.pop("ZCODE_BRIDGE_MAX_OUTPUT", None)
+            else:
+                os.environ["ZCODE_BRIDGE_MAX_OUTPUT"] = old_mo
+
+
+class TestEmbeddedProviderError(unittest.TestCase):
+    """内嵌 _parse_provider_error 与 shared/provider_error.py 权威版对齐
+    (整体 review P1-4: insufficient 拆成 credit/balance 两条, 漏 quota 形态)"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def test_ep0_insufficient_quota_recognized(self):
+        """EP0: 'insufficientQuota' (无词边界, \bquota\b 吃不到) → quota"""
+        r = self.mod._parse_provider_error("Your plan has insufficientQuota")
+        self.assertTrue(r["is_quota"], "insufficient.*quota 形态应判为配额错误")
+        self.assertEqual(r["error_kind"], "quota")
+
+    def test_ep1_insufficient_credit_balance(self):
+        """EP1: insufficient credit / balance → quota (对齐后不回归)"""
+        for text in ("insufficient credit", "insufficient balance"):
+            r = self.mod._parse_provider_error(text)
+            self.assertTrue(r["is_quota"], f"{text!r} 应判为配额错误")
+
+    def test_ep2_rate_limit_exceeded_not_quota(self):
+        """EP2: 'rate limit exceeded' 仍判限流, 不被 quota 误吃 (对齐后语义不变)"""
+        r = self.mod._parse_provider_error("Rate limit exceeded, retry-after: 30")
+        self.assertTrue(r["is_rate_limit"])
+        self.assertFalse(r["is_quota"])
 
 
 if __name__ == "__main__":

@@ -92,12 +92,15 @@ class TestMainLoopRejection(_MainLoopCase):
     """非对象消息的拒收行为"""
 
     def test_mr0_batch_array_rejected(self):
-        """MR0: JSON-RPC batch 数组 → -32600 (2025-06-18 起 server 必须拒绝)"""
+        """MR0: JSON-RPC batch 数组 → -32600, 且响应本身也是 batch 数组
+        (2025-06-18 起 server 必须拒绝; 整体 review P2-5 规范对齐)"""
         responses = self._run_main([
             json.dumps([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]),
         ])
         self.assertEqual(len(responses), 1)
-        self.assertEqual(responses[0]["error"]["code"], -32600)
+        self.assertIsInstance(responses[0], list, "batch 拒收响应应回 batch 数组")
+        self.assertEqual(len(responses[0]), 1)
+        self.assertEqual(responses[0][0]["error"]["code"], -32600)
 
     def test_mr1_bare_value_rejected(self):
         """MR1: 裸值 (非 dict) → -32600"""
@@ -166,6 +169,66 @@ class TestToolsListShape(_MainLoopCase):
         for t in self.mod.TOOLS:
             self.assertRegex(t["name"], r"^[A-Za-z0-9_\-.]{1,128}$",
                              f"{t['name']} 不符合命名规范")
+
+
+class TestInternalErrorMessage(_MainLoopCase):
+    """-32603 兜底回通用文案, 不把内部路径/异常细节泄露给 client (整体 review P1-5)"""
+
+    @staticmethod
+    def _boom(args):
+        raise RuntimeError("/Users/secret/internal-path exploded")
+
+    def test_ie0_legacy_tools_call_generic(self):
+        """IE0: legacy tools/call handler 抛异常 → -32603 通用文案"""
+        mod = self.mod
+        saved = mod.TOOL_HANDLERS["zcode_review"]
+        mod.TOOL_HANDLERS["zcode_review"] = self._boom
+        try:
+            resp = mod.handle_request(
+                {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                 "params": {"name": "zcode_review", "arguments": {}}})
+        finally:
+            mod.TOOL_HANDLERS["zcode_review"] = saved
+        self.assertEqual(resp["error"]["code"], -32603)
+        self.assertNotIn("secret", resp["error"]["message"],
+                         "异常细节不应回给 client")
+        self.assertIn("服务端日志", resp["error"]["message"])
+
+    def test_ie1_modern_tools_call_generic(self):
+        """IE1: modern tools/call handler 抛异常 → -32603 通用文案"""
+        mod = self.mod
+        saved = mod.TOOL_HANDLERS["zcode_review"]
+        mod.TOOL_HANDLERS["zcode_review"] = self._boom
+        try:
+            req = json.loads(_modern_req(
+                "tools/call", rid=8,
+                params={"name": "zcode_review", "arguments": {}}))
+            resp = mod.handle_modern_request(req)
+        finally:
+            mod.TOOL_HANDLERS["zcode_review"] = saved
+        self.assertEqual(resp["error"]["code"], -32603)
+        self.assertNotIn("secret", resp["error"]["message"])
+        self.assertIn("服务端日志", resp["error"]["message"])
+
+    def test_ie2_main_loop_generic(self):
+        """IE2: 主循环兜底 (handler 层之外炸) → -32603 通用文案"""
+        mod = self.mod
+        saved = mod.handle_request
+
+        def exploding(req):
+            raise RuntimeError("secret-main-loop-detail")
+
+        mod.handle_request = exploding
+        try:
+            responses = self._run_main([
+                json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+            ])
+        finally:
+            mod.handle_request = saved
+        self.assertEqual(responses[0]["error"]["code"], -32603)
+        self.assertNotIn("secret-main-loop-detail",
+                         responses[0]["error"]["message"])
+        self.assertIn("服务端日志", responses[0]["error"]["message"])
 
 
 def _modern_req(method, rid=1, params=None, version="2026-07-28"):
