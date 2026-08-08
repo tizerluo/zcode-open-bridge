@@ -266,14 +266,19 @@ def _find_mimosa_root():
     """定位 mimosa 插件根目录 (含 payload/dist/mcp/server.js 的那层)。
 
     ZCODE_BRIDGE_MIMOSA_ROOT 优先; 否则探测常见安装位 (独立副本 + zcode
-    插件缓存), 同目录多版本取路径排序最大者。找不到返回 None。
+    插件缓存), 同目录多版本取版本号最大者。找不到返回 None。
     """
     env_root = os.environ.get("ZCODE_BRIDGE_MIMOSA_ROOT")
     candidates = [env_root] if env_root else []
     home = Path.home()
     for pat in (".local/share/mimosa/*",
                 ".zcode/cli/plugins/cache/*/mimosa/*"):
-        candidates.extend(str(p) for p in sorted(home.glob(pat), reverse=True))
+        # 按版本号数值排序 (非字符串序, 防 1.10.0 < 1.9.0 误判; 狗食 review P2-1)
+        candidates.extend(
+            str(p) for p in sorted(
+                home.glob(pat), reverse=True,
+                key=lambda p: [int(x) if x.isdigit() else 0
+                               for x in p.name.split(".")]))
     for c in candidates:
         if c and (Path(c) / "payload" / "dist" / "mcp" / "server.js").exists():
             return c
@@ -314,7 +319,13 @@ class MimosaMcpClient:
         line = self._proc.stdout.readline()
         if not line:
             raise RuntimeError("mimosa MCP server 提前退出 (stdout EOF)")
-        return json.loads(line)
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError as e:
+            # 狗食 review P1-2: 裸 JSONDecodeError 冒泡会被调用方笼统包成
+            # "扫描失败", 吞掉"子进程输出损坏"这个真根因 → 转成带上下文的错误
+            raise RuntimeError(
+                f"mimosa MCP 返回非 JSON 行 (前80字符): {line[:80]!r}") from e
 
     def _request(self, method, params):
         self._id += 1
@@ -375,10 +386,20 @@ def _mimosa_quick_scan(root, scan_path):
     findings = []
     m = re.search(r"scanDir:\s*`([^`]+)`", body)
     if m:
-        findings_file = Path(m.group(1)) / "findings.json"
+        # 狗食 review P1-1: scanDir 是不可信输入 (子进程产物经文本协议传回,
+        # 属信任边界外) — 必须校验落在 mimosa 扫描历史根之下, 防路径注入
+        # 导致任意文件回读喂给 LLM。校验失败降级为仅用摘要文本。
+        scan_root = Path(os.environ.get(
+            "ZCODE_BRIDGE_MIMOSA_SCAN_ROOT",
+            str(Path.home() / ".mimosa" / "security-scans")))
         try:
-            with open(findings_file) as f:
-                findings = json.load(f).get("findings", [])
+            scan_dir = Path(m.group(1)).resolve()
+            resolved_root = scan_root.resolve()
+            if scan_dir == resolved_root or resolved_root in scan_dir.parents:
+                with open(scan_dir / "findings.json") as f:
+                    findings = json.load(f).get("findings", [])
+            else:
+                log(f"⚠ scanDir 越界 (不在 {resolved_root} 下), 跳过回读: {m.group(1)}")
         except Exception as e:
             log(f"⚠ findings.json 读取失败 ({e}), 仅用摘要文本")
     else:
@@ -595,7 +616,11 @@ def _review_timeout():
 
 
 def _write_temp(text, prefix):
-    """写临时文件并返回路径 (调用方负责清理)。"""
+    """写临时文件并返回路径 (调用方负责清理)。
+
+    内容是调用方自己的代码/scan findings (非凭证); POSIX 下 tempfile
+    默认 0600 仅属主可读, 权限足够 (狗食安全 review 存疑-1 已评估)。
+    """
     import tempfile
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, prefix=prefix)
     tmp.write(text)
@@ -661,6 +686,11 @@ def tool_zcode_security_review(args):
     scan_path = args.get("path") or args.get("cwd") or os.getcwd()
     focus = args.get("focus", "")
     cwd = args.get("cwd") or scan_path
+
+    if not os.path.isdir(scan_path):  # 狗食 review P2-8: 先校验, 错误信息明确
+        return {"content": [{"type": "text",
+                             "text": f"扫描目录不存在或不是目录: {scan_path}"}],
+                "isError": True}
 
     root = _find_mimosa_root()
     if not root:

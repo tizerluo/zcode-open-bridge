@@ -253,10 +253,13 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 |------|------|
 | `ZCODE_BRIDGE_MIMOSA_ROOT` | 指向 mimosa 插件根目录（含 `payload/dist/mcp/server.js` 的那层）；不设则自动探测 `~/.local/share/mimosa/*` 与 `~/.zcode/cli/plugins/cache/*/mimosa/*`，找不到会明确报错并建议改用 `zcode_review` |
 | `ZCODE_BRIDGE_MIMOSA_TIMEOUT` | mimosa `security_scan` 快扫超时（默认 180s） |
+| `ZCODE_BRIDGE_MIMOSA_SCAN_ROOT` | findings 回读的信任根（默认 `~/.mimosa/security-scans`）：从 mimosa 摘要解析出的 scanDir 必须落在其下才回读 `findings.json`，越界降级为仅用摘要（防路径注入导致任意文件回读） |
 
 > mimosa 的调用不依赖 zcode 插件体系：bridge 用自带极简 stdio MCP client 直接 spawn mimosa 的 `server.js`（env `ZCODE_PLUGIN_ROOT=<root>`、`MIMOSA_ENGINE=native`，cwd=被扫项目）。mimosa 快扫是确定性规则引擎、零 LLM 流量，故不走 review 文件锁。
 >
-> 实测备注（2026-08-08，GC-8G）：① 独立调用时 mimosa 也会在被扫项目写一个小会话状态文件（`.mimosa/hook-state/sess_*.continue.json`，约 200 字节，无害），除此之外 bridge 链路对被扫目录完全只读；② 从非登录 shell（systemd unit、cron、`sudo -u` 直调）启动时 PATH 可能不含 `~/.local/bin`，需显式 `export PATH="$HOME/.local/bin:$PATH"` 否则找不到 `zcode`。
+> 实测备注（2026-08-08，GC-8G）：① 独立调用时 mimosa 也会在被扫项目写一个小会话状态文件（`.mimosa/hook-state/sess_*.continue.json`，约 200 字节，无害）——即 bridge 自身的代码路径对被扫目录只读，但 mimosa 引擎会落这个状态文件，说"完全只读"不准确；② 从非登录 shell（systemd unit、cron、`sudo -u` 直调）启动时 PATH 可能不含 `~/.local/bin`，需显式 `export PATH="$HOME/.local/bin:$PATH"` 否则找不到 `zcode`。
+>
+> 并发与阻塞边界（狗食 review P2-4/P2-5）：mimosa 预扫**不在** review 文件锁内（确定性引擎无 LLM 限流问题），只有 zcode 复核阶段持锁——并发扫同一项目时 mimosa 的 hook-state 文件各写各的会话，无冲突。最坏阻塞时长估算：锁等待 300s + 单次调用 `ZCODE_BRIDGE_REVIEW_TIMEOUT`（默认 300s）×（1 + `ZCODE_BRIDGE_MAX_RETRIES` 默认 3）+ 限流退避，极端情况单次 tool 调用可阻塞约 20 分钟，调用方应把 MCP 超时设到相应量级。
 
 ### 聚焦审查 prompt 建议
 

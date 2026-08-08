@@ -69,7 +69,7 @@ class _EnvGuard(unittest.TestCase):
     """保存/恢复本文件用到的环境变量。"""
 
     ENV_KEYS = ("ZCODE_BRIDGE_REVIEW_LOCK", "ZCODE_BRIDGE_MIMOSA_ROOT",
-                "ZCODE_BRIDGE_REVIEW_TIMEOUT")
+                "ZCODE_BRIDGE_REVIEW_TIMEOUT", "ZCODE_BRIDGE_MIMOSA_SCAN_ROOT")
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in self.ENV_KEYS}
@@ -119,8 +119,10 @@ class TestReviewCmd(_EnvGuard):
         cmd, _ = self._capture_cmd()
         self.assertIn("--disallowed-tools", cmd)
         deny = cmd[cmd.index("--disallowed-tools") + 1]
-        for tool in ("Write", "Edit", "ApplyPatch", "Bash",
-                     "js", "mcp__node_repl__js"):
+        for tool in ("Write", "Edit", "MultiEdit", "ApplyPatch", "Bash",
+                     "js", "js_reset", "js_add_node_module_dir",
+                     "mcp__node_repl__js", "mcp__node_repl__js_reset",
+                     "mcp__node_repl__js_add_node_module_dir"):
             self.assertIn(tool, deny.split(), f"黑名单缺 {tool}")
 
     def test_rc2_json_output(self):
@@ -299,8 +301,10 @@ class TestMimosaQuickScan(_EnvGuard):
     def test_ms2_scandir_findings_read_back(self):
         """MS2: 摘要含 scanDir → 回读 findings.json 全量"""
         import tempfile
-        scan_dir = tempfile.mkdtemp(prefix="mimosa-scan-")
-        self.addCleanup(lambda: __import__("shutil").rmtree(scan_dir, ignore_errors=True))
+        scan_root = tempfile.mkdtemp(prefix="mimosa-scans-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(scan_root, ignore_errors=True))
+        scan_dir = os.path.join(scan_root, "project-x", "scan-1")
+        os.makedirs(scan_dir)
         findings_payload = {
             "schemaVersion": "mimosa-security-scan-findings/v1",
             "findings": [
@@ -312,6 +316,8 @@ class TestMimosaQuickScan(_EnvGuard):
         }
         with open(os.path.join(scan_dir, "findings.json"), "w") as f:
             json.dump(findings_payload, f)
+        # scanDir 校验要求落在扫描历史根下 (狗食 review P1-1), 用 env 指定测试根
+        os.environ["ZCODE_BRIDGE_MIMOSA_SCAN_ROOT"] = scan_root
 
         class ScanDirClient(_StubMimosaClient):
             response_text = f"**Mimosa deep security scan:**\n- scanDir: `{scan_dir}`\n- findings: 1"
@@ -319,6 +325,24 @@ class TestMimosaQuickScan(_EnvGuard):
         body, findings = self._run_scan(ScanDirClient)
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["severity"], "high")
+
+    def test_ms2b_scandir_outside_root_rejected(self):
+        """MS2b: scanDir 越界 (不在扫描历史根下) → 拒绝回读 (狗食 review P1-1)"""
+        import tempfile
+        outside = tempfile.mkdtemp(prefix="mimosa-outside-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(outside, ignore_errors=True))
+        with open(os.path.join(outside, "findings.json"), "w") as f:
+            json.dump({"findings": [{"severity": "high", "title": "不该被读到"}]}, f)
+        # scan root 指向另一个空目录 → outside 不在其下
+        scan_root = tempfile.mkdtemp(prefix="mimosa-scans-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(scan_root, ignore_errors=True))
+        os.environ["ZCODE_BRIDGE_MIMOSA_SCAN_ROOT"] = scan_root
+
+        class EvilClient(_StubMimosaClient):
+            response_text = f"**Mimosa**\n- scanDir: `{outside}`\n- findings: 1"
+
+        body, findings = self._run_scan(EvilClient)
+        self.assertEqual(findings, [], "越界 scanDir 不应回读任何 findings")
 
     def test_ms3_compact_projection(self):
         """MS3: _compact_findings 投影保留复核所需字段"""
@@ -348,12 +372,16 @@ class TestSecurityReviewTool(_EnvGuard):
 
     def _patch_common(self, summary="摘要: findings 1",
                       findings=None):
+        import tempfile
         mod = self.mod
         if findings is None:
             findings = [{"identity": {"publicClass": "sql-injection"},
                          "severity": "high", "cwe": ["CWE-89"],
                          "location": {"path": "app.py", "line": 11},
                          "title": "SQL 注入", "message": "拼接查询"}]
+        # 扫描目录真实存在 (P2-8 校验), 用临时目录充当被扫项目
+        proj = tempfile.mkdtemp(prefix="zcode-scan-proj-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(proj, ignore_errors=True))
         saved = {
             "find_root": mod._find_mimosa_root,
             "scan": mod._mimosa_quick_scan,
@@ -362,7 +390,7 @@ class TestSecurityReviewTool(_EnvGuard):
         mod._find_mimosa_root = lambda: "/fake/mimosa"
         mod._mimosa_quick_scan = lambda root, path: (summary, findings)
         os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
-        return mod, saved
+        return mod, saved, proj
 
     def _restore_common(self, mod, saved):
         mod._find_mimosa_root = saved["find_root"]
@@ -384,7 +412,7 @@ class TestSecurityReviewTool(_EnvGuard):
 
     def test_sr1_scan_failure_clean_error(self):
         """SR1: mimosa 扫描失败 → 明确报错, 不再调 zcode"""
-        mod, saved = self._patch_common()
+        mod, saved, proj = self._patch_common()
 
         def boom(root, path):
             raise RuntimeError("engine boom")
@@ -407,7 +435,7 @@ class TestSecurityReviewTool(_EnvGuard):
 
     def test_sr2_happy_path_pipeline(self):
         """SR2: 正常管线 — findings 作附件, zcode 只读复核, 返回提取的 response"""
-        mod, saved = self._patch_common()
+        mod, saved, proj = self._patch_common()
         captured = {}
 
         def fake_run(cmd, *a, **kw):
@@ -418,7 +446,7 @@ class TestSecurityReviewTool(_EnvGuard):
         mod.subprocess.run = fake_run
         try:
             result = mod.tool_zcode_security_review(
-                {"path": "/tmp/proj", "focus": "注入类"})
+                {"path": proj, "focus": "注入类"})
         finally:
             self._restore_common(mod, saved)
         self.assertNotIn("isError", result)
@@ -438,15 +466,22 @@ class TestSecurityReviewTool(_EnvGuard):
         self.assertIn("注入类", prompt)
         self.assertIn("绝对不要修改", prompt)
 
+    def test_sr3b_scan_path_missing_clean_error(self):
+        """SR3b: 扫描目录不存在 → 明确报错 (狗食 review P2-8), 不调 mimosa/zcode"""
+        mod = self.mod
+        result = mod.tool_zcode_security_review({"path": "/nonexistent/xyz"})
+        self.assertTrue(result.get("isError"))
+        self.assertIn("不存在", result["content"][0]["text"])
+
     def test_sr3_findings_tmpfile_cleaned(self):
         """SR3: findings 临时文件用后被清理"""
-        mod, saved = self._patch_common()
+        mod, saved, proj = self._patch_common()
         captured = {}
         mod.subprocess.run = lambda cmd, *a, **kw: (
             captured.update(cmd=cmd),
             _FakeCompletedProcess(0, "OK", ""))[1]
         try:
-            mod.tool_zcode_security_review({"path": "/tmp/proj"})
+            mod.tool_zcode_security_review({"path": proj})
         finally:
             self._restore_common(mod, saved)
         attach_path = captured["cmd"][captured["cmd"].index("--attach") + 1]
