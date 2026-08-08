@@ -310,7 +310,7 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 **已对齐 2025-11-25 的义务**：拒收 JSON-RPC batch（2025-06-18 起规范移除，回 `-32600`）、tools/list 确定性顺序、tool `title` + `annotations`（`readOnlyHint` 等）元数据、输入校验错误走 `isError: true` 而非协议错误。
 
-**路线图**：2026-07-28 新纪元（无握手无状态、`server/discover` 必实现、`resultType` 必填）将以 **dual-era** 形态评估接入——保留 initialize 旧路径服务存量 client，新增新协议路径（zcode 0.16.1 已是双纪元 client，可立即受益）。等 Claude Code / Kimi / Cursor 跟进新协议后再全面实施。
+**路线图**：~~2026-07-28 新纪元~~ **已完成（2026-08-08，dual-era 上线）**：server 同时服务两个纪元——`initialize` 开场走 legacy（2024-11-05~2025-11-25 协商），带 modern `_meta` 信封的请求走 2026-07-28 无状态新协议（`server/discover` 探针、信封缺失 `-32602`、版本不符 `-32022` 带 supported 列表、result 盖 `resultType`/`serverInfo` 戳、list 结果带 `ttlMs`/`cacheScope`）。已通过官方 Python SDK v2.0.0 client 互操作实测（`session.discover()` 协商出 2026-07-28，tools/list、tools/call 全程新协议）；zcode 0.16.1 的 auto 探测也会自动走新协议。MRTR/elicitation/tasks/subscriptions 按调研结论不实现（废弃或用不上）。
 
 ## Skill（驱动说明书）
 

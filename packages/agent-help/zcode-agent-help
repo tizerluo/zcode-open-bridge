@@ -518,7 +518,7 @@ ECOSYSTEM = {
             "role": "把 zcode 能力暴露为标准 MCP server",
             "maturity": "stable",
             "transport": "MCP over stdio (JSON-RPC 2.0)",
-            "protocol": "legacy 协商 2024-11-05..2025-11-25 (回显 client 版本); 2026-07-28 新纪元 dual-era 评估中",
+            "protocol": "dual-era: legacy 协商 2024-11-05..2025-11-25 (回显) + modern 2026-07-28 (server/discover + _meta 信封)",
             "tools_exposed": [
                 {"name": "get_zcode_capabilities", "description": "返回 zcode 能力清单 (调 agent-help)"},
                 {"name": "zcode_review", "description": "调 zcode 审查代码 (yolo+写工具物理禁用: 免授权只读)"},

@@ -46,10 +46,19 @@ SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-1
 _SUPPORTED_PV_SET = set(SUPPORTED_PROTOCOL_VERSIONS)  # 协商查表用 (list 保留给可读性/有序)
 PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]  # 我们支持的最高版本
 
+# 2026-07-28 新纪元 (无状态化): 每请求 _meta 信封 + server/discover 探针。
+# 双纪元路由在 main(): initialize → legacy; 带 modern 信封 → modern;
+# server/discover 任意时刻可答 (它是 modern client 的时代探针)。
+MODERN_PROTOCOL_VERSIONS = ["2026-07-28"]
+ALL_SUPPORTED_VERSIONS = MODERN_PROTOCOL_VERSIONS + SUPPORTED_PROTOCOL_VERSIONS
+_META_PV = "io.modelcontextprotocol/protocolVersion"
+_META_CAPS = "io.modelcontextprotocol/clientCapabilities"
+_META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+
 # 作为 MCP client 调 mimosa 时用的版本: mimosa 1.0.3 实测讲 2024-11-05,
 # 钉死该值 (它不回更高版; 我们不校验它的应答版本)。
 MIMOSA_CLIENT_PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "zcode-mcp-server", "version": "1.3.0"}
+SERVER_INFO = {"name": "zcode-mcp-server", "version": "1.4.0"}
 
 
 def log(msg):
@@ -1264,6 +1273,79 @@ def make_error(msg_id, code, message, data=None):
     return {"jsonrpc": "2.0", "id": msg_id, "error": err}
 
 
+# ============================================================
+# 2026-07-28 新纪元 (modern, 无状态) 请求处理
+# ------------------------------------------------------------
+# 与 legacy 的差异: 无 initialize 握手; 每个请求自带 _meta 信封
+# (protocolVersion + clientCapabilities 必填); 所有 result 带 resultType;
+# list 类结果带 ttlMs/cacheScope; server/discover 为时代探针。
+# 纪元路由在 main() 的读循环里 (initialize → legacy, modern 信封 → modern)。
+# ============================================================
+def _modern_result(payload, cacheable=False):
+    """modern 纪元 result 封装: resultType 必填 + serverInfo 戳 (+缓存提示)。"""
+    result = dict(payload)
+    result["resultType"] = "complete"
+    result.setdefault("_meta", {})[_META_SERVER_INFO] = dict(SERVER_INFO)
+    if cacheable:
+        result["ttlMs"] = 3_600_000     # 工具集/版本清单静态, 可缓存 1h
+        result["cacheScope"] = "public"  # 无用户特定数据
+    return result
+
+
+def _discover_result():
+    """server/discover 应答: 支持版本 + 能力 + serverInfo (modern 时代探针)。"""
+    return _modern_result({
+        "supportedVersions": ALL_SUPPORTED_VERSIONS,
+        "capabilities": {"tools": {"listChanged": False}},
+    }, cacheable=True)
+
+
+def handle_modern_request(req):
+    """处理一条 modern 纪元 (2026-07-28) 请求, 返回响应 dict 或 None。"""
+    msg_id = req.get("id")
+    method = req.get("method")
+
+    # notification (无 id) 静默吞掉 (cancelled 等); 信封校验只针对 request
+    if msg_id is None:
+        return None
+
+    # _meta 信封校验: protocolVersion + clientCapabilities 必填 (缺 → -32602)
+    meta = (req.get("params") or {}).get("_meta") or {}
+    pv = meta.get(_META_PV)
+    caps = meta.get(_META_CAPS)
+    if not isinstance(pv, str) or not isinstance(caps, dict):
+        return make_error(
+            msg_id, -32602,
+            "Invalid params: modern 请求缺少必需的 _meta 信封 "
+            "(io.modelcontextprotocol/protocolVersion + clientCapabilities)")
+    if pv not in MODERN_PROTOCOL_VERSIONS:
+        return make_error(
+            msg_id, -32022, f"Unsupported protocol version: {pv}",
+            data={"supported": ALL_SUPPORTED_VERSIONS, "requested": pv})
+
+    if method == "server/discover":
+        return make_response(msg_id, _discover_result())
+    if method == "tools/list":
+        return make_response(msg_id, _modern_result({"tools": TOOLS}, cacheable=True))
+    if method == "tools/call":
+        params = req.get("params", {})
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        if tool_name not in TOOL_HANDLERS:
+            return make_error(msg_id, -32601, f"未知 tool: {tool_name}")
+        try:
+            result = TOOL_HANDLERS[tool_name](arguments)
+            # isError 也是 complete (工具执行错误走 isError, 非协议错误)
+            return make_response(msg_id, _modern_result(result))
+        except Exception as e:
+            log(f"tool {tool_name} 异常: {e}")
+            return make_error(msg_id, -32603, f"tool 执行异常: {e}")
+
+    if method is not None:
+        return make_error(msg_id, -32601, f"未知 method: {method}")
+    return None
+
+
 def handle_request(req):
     """处理一条 JSON-RPC 请求,返回响应 dict (或 None 表示无需响应)"""
     msg_id = req.get("id")
@@ -1315,9 +1397,12 @@ def handle_request(req):
 
 
 def main():
-    log(f"启动 zcode-mcp-server (stdio), protocol {PROTOCOL_VERSION}")
+    log(f"启动 zcode-mcp-server (stdio), dual-era: legacy "
+        f"{SUPPORTED_PROTOCOL_VERSIONS[-1]}..{PROTOCOL_VERSION} + modern "
+        f"{MODERN_PROTOCOL_VERSIONS[0]}")
     log(f"暴露 tools: {[t['name'] for t in TOOLS]}")
 
+    era = None  # None=未判定 / "legacy" / "modern" (按 client 开场方式分流)
     # 按行读取 stdin
     for line in sys.stdin:
         line = line.strip()
@@ -1332,7 +1417,6 @@ def main():
 
         # 非对象消息拒收: batch 数组 (2025-03-26 加入、2025-06-18 移除,
         # ≥2025-06-18 的 server 必须拒绝) 和其他非 dict 形态, 统一 -32600。
-        # 注意: 对未知 method 回 -32601 是 zcode auto 探测依赖的回落信号, 别改。
         if not isinstance(req, dict):
             log("收到非 JSON-RPC 对象消息 (batch?), 拒绝")
             send_message(make_error(
@@ -1340,8 +1424,29 @@ def main():
                 "Invalid Request: 仅接受单个 JSON-RPC 对象"))
             continue
 
+        # ---- 纪元路由 (dual-era, 2026-08-08) ----
+        # initialize → legacy; 带 modern _meta 信封 → modern;
+        # server/discover 任意时刻可答 (modern client 的时代探针, 不定纪元);
+        # 首个无信封的非通知请求 → legacy (zcode auto 探测的回落语义)。
+        method = req.get("method")
+        meta = (req.get("params") or {}).get("_meta") or {}
+        is_notification = "id" not in req
+        if method == "initialize":
+            era = "legacy"
+        elif _META_PV in meta:
+            era = "modern"
+        elif method == "server/discover":
+            pass  # 探针不改纪元
+        elif era is None and not is_notification:
+            era = "legacy"
+
         try:
-            resp = handle_request(req)
+            if method == "server/discover":
+                resp = make_response(req.get("id"), _discover_result())
+            elif era == "modern":
+                resp = handle_modern_request(req)
+            else:
+                resp = handle_request(req)
             if resp is not None:
                 send_message(resp)
         except Exception as e:
