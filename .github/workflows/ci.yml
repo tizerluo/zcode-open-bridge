@@ -4,7 +4,7 @@
 # 三个 job:
 #   1. lint      — ruff 检查 (代码风格 + bug 类规则)
 #   2. test      — unittest 矩阵 (Python 3.11 / 3.13)
-#   3. perms     — 三个组件的可执行位校验 (本项目历史反复踩的坑:
+#   3. perms     — 四个组件的可执行位校验 (本项目历史反复踩的坑:
 #                  编辑器/工具常把 100755 改回 100644, 导致用户下载后
 #                  无法直接执行。CI 在此兜底拦截)
 #
@@ -32,11 +32,11 @@ jobs:
         with:
           python-version: "3.13"
 
-      # 只装 ruff; 运行时三个组件零第三方依赖
+      # 只装 ruff; 运行时四个组件零第三方依赖
       - name: Install ruff
         run: pip install ruff==0.15.17
 
-      # 注意: 三个组件是「无后缀单文件脚本」, ruff 默认只扫 .py,
+      # 注意: 四个组件是「无后缀单文件脚本」, ruff 默认只扫 .py,
       # 必须显式把组件路径传进去, 否则会漏检核心代码。
       - name: ruff check
         run: |
@@ -44,6 +44,7 @@ jobs:
             packages/acp-bridge/zcode-acp-bridge \
             packages/agent-help/zcode-agent-help \
             packages/mcp-server/zcode-mcp-server \
+            packages/review-gate/zcode-review-gate \
             shared/ \
             tests/
 
@@ -75,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 校验三个组件在 git 里保持可执行 (100755)。
+      # 校验四个组件在 git 里保持可执行 (100755)。
       # 历史上编辑器/Edit 类工具多次把权限改回 100644, 用户下载后
       # 无法直接 ./zcode-xxx 运行。这一步专门兜底。
       - name: Verify components are executable
@@ -85,7 +86,8 @@ jobs:
           for f in \
             packages/acp-bridge/zcode-acp-bridge \
             packages/agent-help/zcode-agent-help \
-            packages/mcp-server/zcode-mcp-server; do
+            packages/mcp-server/zcode-mcp-server \
+            packages/review-gate/zcode-review-gate; do
             mode=$(git ls-files --stage -- "$f" | awk '{print $1}')
             if [ "$mode" != "100755" ]; then
               echo "❌ $f 模式为 $mode, 应为 100755 (可执行)"

@@ -32,6 +32,7 @@ ZCode 是智谱 Z.AI 出品的 AI 编程 Agent，由 GLM 系列模型驱动。�
 | **zcode-agent-help** | 能力发现说明书：一次调用了解 ZCode 全部能力 | ✅ stable | [packages/agent-help](packages/agent-help) |
 | **zcode-mcp-server** | 把 ZCode 暴露为标准 MCP server，供 MCP client（Claude Code/Cursor/自身）调用 | ✅ stable | [packages/mcp-server](packages/mcp-server) |
 | **zcode-acp-bridge** | 把 ZCode 桥接为 ACP Agent，供 Zed/JetBrains 等编辑器调用 | ⚠️ experimental | [packages/acp-bridge](packages/acp-bridge) |
+| **zcode-review-gate** | PR 自动审查闸门：轮询 open PR，新 head 调 `zcode_pr_review` 审查并回贴 verdict 评论 | ⚠️ experimental | [packages/review-gate](packages/review-gate) |
 
 ## 快速开始
 
@@ -199,6 +200,14 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 > workspace 参数可三种方式传入：`workspace`（完整 dict）、`workspacePath`/`cwd`（路径字符串），或缺省时用 bridge 进程的 `cwd`。
 > Provider 管理类方法（upsert/remove/updateRegistry）的 `provider`/`registry` 可能含 `apiKey`，bridge 仅透传、不读取/打印其明文。
 
+### Review gate（`zcode-review-gate`）
+
+PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮询配置仓库的 open PR，对每个新 head sha 经 `zcode-mcp-server --call zcode_pr_review` 完成审查（锁/重试/只读护栏全部复用 bridge 同源路径），把带 verdict（✅ pass / ⚠️ concerns）的结果回贴为 PR 评论。同一 head sha 不重复审（state 文件去重），失败按指数退避重试，head 更新自动复活重审。token 不落盘（经 git≥2.31 的 `GIT_CONFIG_*` 环境变量进程内注入，不进 argv）。公开、通用，任何 GitHub 仓库可用。
+
+安装、配置参考、systemd 部署与运维详见 [packages/review-gate/README.md](packages/review-gate/README.md)。
+
+> 配套能力：mcp-server 新增 `--call TOOL '<json>'` 一次性调用模式（脚本化入口，exit 0/1/2 分别对应 成功 / 用法错误或 handler 异常 / tool 执行失败），stdio 模式行为不变。
+
 ## 会话存储
 
 `--prompt` 和 ACP bridge **共享同一套会话存储**（`~/.zcode/cli/db/db.sqlite`），互通互恢复：
@@ -359,7 +368,8 @@ zcode-open-bridge/
 ├── packages/
 │   ├── agent-help/      # 能力发现说明书 (stable)
 │   ├── mcp-server/      # MCP 桥接 (stable)
-│   └── acp-bridge/      # ACP 桥接 (experimental)
+│   ├── acp-bridge/      # ACP 桥接 (experimental)
+│   └── review-gate/     # PR 自动审查闸门 (experimental)
 ├── shared/
 │   └── credentials.py   # 凭证读取 (单一真相源)
 ├── skills/

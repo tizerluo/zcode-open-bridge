@@ -1581,5 +1581,48 @@ def main():
     log("stdin 关闭, 退出")
 
 
+def call_once(argv):
+    """一次性调用模式: --call TOOL_NAME '<json-args>' → 结果 JSON 打印到 stdout。
+
+    用途: 脚本化/守护进程 (如 packages/review-gate) 的单次调用入口 — 不用起
+    stdio MCP 会话, 直接拿一个 tool 的结果。锁/重试/yolo 只读护栏全走
+    TOOL_HANDLERS 路径, 与 stdio 模式完全同源 (不重造任何安全机制)。
+
+    退出码约定:
+      0 — 调用成功 ({"ok": true, "result": ...})
+      1 — 用法错误 (参数个数不对 / 未知 tool / JSON 解析失败 / handler 抛异常)
+      2 — tool 执行失败 (result 带 isError, 如目录不存在、diff 为空等)
+    """
+    if len(argv) != 2:
+        log("用法: zcode-mcp-server --call TOOL_NAME '<json-args>'")
+        return 1
+    tool_name, raw_args = argv
+    if tool_name not in TOOL_HANDLERS:
+        log(f"未知 tool: {tool_name} (可选: {sorted(TOOL_HANDLERS)})")
+        return 1
+    try:
+        arguments = json.loads(raw_args)
+    except json.JSONDecodeError as e:
+        log(f"args JSON 解析失败: {e}")
+        return 1
+    if not isinstance(arguments, dict):
+        log("args 必须是 JSON 对象")
+        return 1
+    try:
+        result = TOOL_HANDLERS[tool_name](arguments)
+    except Exception as e:
+        # 与 stdio 路径一致: 内部细节不外泄到 stdout, 只走 log (P1-5)
+        log(f"tool {tool_name} 异常: {e}")
+        print(json.dumps({"ok": False, "error": "内部错误, 详见 stderr 日志"},
+                         ensure_ascii=False))
+        return 1
+    out = {"ok": not result.get("isError"), "result": result}
+    print(json.dumps(out, ensure_ascii=False))
+    return 0 if out["ok"] else 2
+
+
 if __name__ == "__main__":
+    # argv 带 --call → 一次性调用模式; 无参数 → 原 stdio JSON-RPC 循环
+    if len(sys.argv) > 1 and sys.argv[1] == "--call":
+        sys.exit(call_once(sys.argv[2:]))
     main()

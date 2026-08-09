@@ -1,0 +1,38 @@
+# zcode-review-gate.service — systemd --user 单元模板
+#
+# 安装:
+#   mkdir -p ~/.config/systemd/user
+#   cp zcode-review-gate.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now zcode-review-gate
+#
+# 按需修改 (%h = 当前用户 home):
+#   - ExecStart 指向 zcode-review-gate 脚本的实际位置
+#     (下面假设 cp/ln 到 ~/.local/bin/zcode-review-gate)
+#   - --config 指向你的 config.json
+#   - GitHub token 经 Environment 注入 (二选一, 也可靠 `gh auth token` 级联):
+#       Environment=GITHUB_TOKEN=ghp_xxx
+#     更安全的方式是 `systemctl --user edit zcode-review-gate` 写 override,
+#     避免 token 进 unit 文件本体。
+
+[Unit]
+Description=ZCode Review Gate — PR 自动审查闸门 (zcode-open-bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/zcode-review-gate --config %h/.config/zcode-review-gate/config.json
+Restart=on-failure
+RestartSec=30
+# 长审查中的 stop: SIGTERM 后主循环在本轮边界退出, 给 mcp-server/zcode
+# 子进程留收敛时间; 超时仍 SIGKILL — 万一撞 ReviewFileLock 残锁,
+# mcp-server 侧 300s 锁超时兜底, 不会死锁。
+TimeoutStopSec=120
+# systemd --user 默认 PATH=/usr/local/bin:/usr/bin:/bin, 不含 ~/.local/bin
+# (GC-8G 实测踩坑), 而组件/git/zcode 通常就装在 ~/.local/bin — 默认带上
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
