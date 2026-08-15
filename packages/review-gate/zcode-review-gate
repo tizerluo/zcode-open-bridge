@@ -14,6 +14,9 @@ zcode-review-gate — PR 自动审查闸门守护进程 (zcode-open-bridge 第 4
     gave_up; head 更新 (force-push / 新 commit) 自动复活重审。
   - 审查前把 clone 工作区 checkout 到被审 head sha 并回读校验 (issue #17):
     mimosa 扫的是工作区文件, 不 checkout 会扫在旧代码上 (误报已修/漏报新引)。
+    checkout 前先 git clean -fdx 清 untracked 残留, 基线严格一致。
+  - 实例互斥: <state_file>.lock 非阻塞 flock, 同一部署只允许一个实例 —
+    checkout 在 bridge 锁外, 第二实例会在审查中途换掉工作区 (狗食 P1-1)。
   - token 不落盘: 只经 git≥2.31 的 GIT_CONFIG_COUNT/KEY/VALUE 环境变量
     逐命令进程内注入 http.extraHeader (env 只对本用户可见, 优于 argv);
     clone URL / .git/config / state / config 文件里都没有 token。
@@ -25,6 +28,7 @@ zcode-review-gate — PR 自动审查闸门守护进程 (zcode-open-bridge 第 4
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import re
@@ -417,10 +421,13 @@ def checkout_review_head(clone, token, head_sha):
 
     mimosa 扫描读的是工作区文件而非 git 对象库 — fetch 只更新对象、不动
     工作区, 不 checkout 会扫在上一轮的旧代码上 (误报已修复的问题 / 漏报
-    新引入的问题)。--detach 挂在 sha 上不动分支引用; --force 丢弃工作区
-    残留改动 (clone 为 gate 专有目录, 无并行修改者)。checkout 后 rev-parse
-    回读校验, 防浅 clone 缺对象等静默失败让扫描基线名不副实。
+    新引入的问题)。先 clean 再 checkout: --force 只丢弃 tracked 改动,
+    untracked 残留会跨轮存活 (狗食 review P2-1), clone 为 gate 专有目录,
+    --force -d -x 清到严格基线。--detach 挂在 sha 上不动分支引用。
+    checkout 后 rev-parse 回读校验, 防浅 clone 缺对象等静默失败让扫描
+    基线名不副实。
     """
+    git(["-C", clone, "clean", "--force", "-d", "-x"], token=token)
     git(["-C", clone, "checkout", "--force", "--detach", head_sha],
         token=token)
     actual = git(["-C", clone, "rev-parse", "HEAD"], token=token).strip()
@@ -429,6 +436,40 @@ def checkout_review_head(clone, token, head_sha):
             f"checkout 校验失败: 请求 {head_sha[:12]}, 工作区实际在 "
             f"{actual[:12]} (mimosa 会扫错代码, 拒绝继续)")
     return actual
+
+
+def acquire_instance_lock(state_file):
+    """实例互斥锁 (狗食 review P1-1, PR #18): 同一 state 文件只允许一个实例。
+
+    checkout 发生在 bridge 侧文件锁之外 — 第二个实例 (如守护进程跑长审查
+    期间手工 --once 调试) 会在第一个实例 mimosa 扫描中途换掉工作区
+    (TOCTOU), 静默扫错代码贴错 verdict。非阻塞 flock: 拿不到说明已有实例,
+    返回 None (调用方报错退出); 拿到则持有到进程退出 (崩溃时 OS 自动回收)。
+    锁文件固定 <state_file>.lock — state 路径即部署身份, 不同部署互不干扰。
+    """
+    path = os.path.expanduser(str(state_file)) + ".lock"
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        log(f"已有 gate 实例持有锁 ({path}), 本实例退出 — 禁止双实例共享 "
+            "同一 state/clone_root (审查中途换工作区会扫错代码)", "ERROR")
+        return None
+    return fd
+
+
+def release_instance_lock(fd):
+    """释放实例锁 (正常退出路径; 崩溃时 OS 回收, 不依赖此处)。"""
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 # ============================================================
@@ -936,20 +977,28 @@ def main(argv=None):
         return 2
     pr_filter = set(args.prs) or None
 
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT, _on_signal)
+    # 实例互斥 (狗食 review P1-1): checkout 在 bridge 锁外, 双实例共享
+    # state/clone_root 会在审查中途换工作区 — 拿不到锁直接退出
+    lock_fd = acquire_instance_lock(cfg.state_file)
+    if lock_fd is None:
+        return 2
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
 
-    if args.once:
-        run_once(cfg, pr_filter)
+        if args.once:
+            run_once(cfg, pr_filter)
+            return 0
+
+        log(f"进入守护循环: repos={cfg.repos} poll_interval={cfg.poll_interval}s "
+            f"state={cfg.state_file} clone_root={cfg.clone_root}")
+        while not _SHUTDOWN:
+            run_once(cfg, pr_filter)
+            _interruptible_sleep(cfg.poll_interval)
+        log("优雅退出")
         return 0
-
-    log(f"进入守护循环: repos={cfg.repos} poll_interval={cfg.poll_interval}s "
-        f"state={cfg.state_file} clone_root={cfg.clone_root}")
-    while not _SHUTDOWN:
-        run_once(cfg, pr_filter)
-        _interruptible_sleep(cfg.poll_interval)
-    log("优雅退出")
-    return 0
+    finally:
+        release_instance_lock(lock_fd)
 
 
 if __name__ == "__main__":

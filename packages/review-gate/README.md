@@ -164,7 +164,11 @@ zcode。
   pass/concerns；解析失败时 fail-safe 为 **concerns**（宁错拦不错放），
   评论里会标注"严重度分布解析失败，请人工核对"。
 - **单线程串行**：逐仓逐 PR 串行审查；并发安全靠 bridge mcp-server 侧的
-  跨进程文件锁兜底（多实例同时跑也不会并发打爆 zcode 限流）。
+  跨进程文件锁兜底（多实例同时跑也不会并发打爆 zcode 限流）。**同一
+  state 文件（同一部署）只允许一个 gate 实例**：启动时对
+  `<state_file>.lock` 非阻塞 flock，拿不到锁直接退出（exit 2）——checkout
+  发生在 bridge 锁之外，第二个实例会在第一个实例 mimosa 扫描中途换掉
+  工作区，静默扫错代码（狗食 review P1-1）。
 - **fork PR**：走 `refs/pull/{n}/head` 拉取，无需加 fork 远端；
   审查的是 PR head 快照本身。
 - token 不落盘：经 git≥2.31 的 `GIT_CONFIG_COUNT/KEY/VALUE` 环境变量逐
