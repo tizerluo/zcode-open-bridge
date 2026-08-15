@@ -2,27 +2,25 @@
 
 常驻轮询守护进程：监控配置仓库的 open PR，对每个新 head sha 调 bridge 的
 `zcode_pr_review` 完成审查（git diff + mimosa 深扫 + ZCode 只读复核），
-把带 verdict（pass / concerns）的结果回贴为 PR 评论。同一 head sha 不重复审
-（state 文件去重），失败按指数退避重试。公开、通用，任何 GitHub 仓库可用。
+把带 verdict（pass / concerns / 需人工核对）的结果回贴为 PR 评论。同一
+head sha 不重复审（state 文件去重），失败按指数退避重试。审查前会把
+clone 工作区 **checkout 到被审 head sha 并回读校验**——mimosa 扫的是
+工作区文件，不 checkout 会扫在旧代码上（issue #17）。公开、通用，任何
+GitHub 仓库可用。
 
 ```
-┌─────────────┐   轮询 open PR    ┌──────────────┐
-│  GitHub API │ ◄────────────── │              │
-└──────┬──────┘                  │              │
-       │ 新 head sha?            │ review-gate  │  (state 文件去重/退避)
-       ▼                         │              │
- git clone/fetch ──────────────► │              │
-       │                         └──────┬───────┘
-       ▼                                │ --call zcode_pr_review
-┌─────────────────┐                     ▼
-│ zcode-mcp-server│  (git diff + mimosa 深扫 + ZCode 只读复核,
-│  (子进程)        │   锁/重试/只读护栏全在 bridge 侧同源复用)
-└──────┬──────────┘
-       │ 报告 → 解析 P0/P1/P2 → verdict
-       ▼
-┌─────────────┐
-│  PR 评论     │  ✅ pass / ⚠️ concerns + 完整报告 (details 折叠)
-└─────────────┘
+GitHub API ──轮询 open PR──► review-gate (state 文件去重/指数退避)
+                               │ git clone/fetch
+                               ▼
+             checkout 到被审 head sha + rev-parse 回读校验 (issue #17)
+                               │ --call zcode_pr_review
+                               ▼
+             zcode-mcp-server 子进程 (git diff + mimosa 深扫 + ZCode 只读复核;
+                             锁/限流重试/只读护栏全在 bridge 侧同源复用)
+                               │ 报告 → 解析 P0/P1/P2 → verdict
+                               ▼
+             PR 评论: ✅ pass / ⚠️ concerns / ❓ 需人工核对
+                     + 完整报告 (details 折叠)
 ```
 
 ## 前置条件
