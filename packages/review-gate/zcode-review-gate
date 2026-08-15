@@ -70,12 +70,15 @@ MIN_COMMENT_BODY = 2000     # comment.max_body 下限 (小于模板开销的极�
 # [^\dP] 排除 P 是关键: "P0/P1/P2 各 0/0/2" 枚举格式里 P0 后面紧跟
 # "/P1", 若不排除 P 会把 P1 的数字算到 P0 头上 — 枚举格式统一解析失败
 # 回 None (评论标注"解析失败请人工核对"), 也不拿错数字。
+# \d{1,9} 位数上限 (狗食二轮 P2-4): 无界 \d+ 配 ≥4301 位数字会让 int()
+# 抛 ValueError (Python ≥3.11 整数转换上限), 整次审查作废并烧满重审;
+# 超长数字串一律不构成合法标记/计数 (finding 数到十亿不现实)。
 _RE_ZOB_VERDICT = re.compile(
-    r"<!-- zob-verdict:\{\"P0\":(\d+),\"P1\":(\d+),\"P2\":(\d+),"
+    r"<!-- zob-verdict:\{\"P0\":(\d{1,9}),\"P1\":(\d{1,9}),\"P2\":(\d{1,9}),"
     r"\"merge\":(true|false)\} -->")
-_RE_P0 = re.compile(r"P0[^\dP]{0,12}(\d+)(?!\d)")
-_RE_P1 = re.compile(r"P1[^\dP]{0,12}(\d+)(?!\d)")
-_RE_P2 = re.compile(r"P2[^\dP]{0,12}(\d+)(?!\d)")
+_RE_P0 = re.compile(r"P0[^\dP]{0,12}(\d{1,9})(?!\d)")
+_RE_P1 = re.compile(r"P1[^\dP]{0,12}(\d{1,9})(?!\d)")
+_RE_P2 = re.compile(r"P2[^\dP]{0,12}(\d{1,9})(?!\d)")
 
 _TRUNC_MARK = "\n\n[... 报告超长已截断 ...]"
 

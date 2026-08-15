@@ -423,6 +423,19 @@ class TestVerdict(_GateCase):
             self.mod.verdict_from_counts((0, 0, 5), merge_from_marker=None),
             "pass")
 
+    def test_huge_digit_marker_not_matched(self):
+        # 狗食二轮 P2-4: 超长数字 (≥4301 位炸 int()) 不构成合法标记 → None,
+        # 不烧整次审查
+        huge = "9" * 5000
+        text = (f'<!-- zob-verdict:{{"P0":{huge},"P1":0,"P2":0,'
+                f'"merge":true}} -->')
+        self.assertIsNone(self.mod.parse_severity_counts(text))
+
+    def test_huge_digit_prose_none(self):
+        # 狗食二轮 P2-4: prose 正则同样钳位数, 超长数字不匹配 → None
+        text = "P0: " + "9" * 5000 + " 条, P1: 0 条, P2: 1 条"
+        self.assertIsNone(self.mod.parse_severity_counts(text))
+
 
 # ============================================================
 # 评论 body
