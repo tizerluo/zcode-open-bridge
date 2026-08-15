@@ -1354,15 +1354,25 @@ _RE_FINAL_VERDICT = re.compile(
     re.IGNORECASE,
 )
 
-# 文末合法标记的完整形态 (狗食 review P1-1: 幂等只认"最后一行完整注释",
-# 正文里被复述/预埋的标记串不抑制追加)
-_RE_ZOB_MARK_TAIL = re.compile(
-    r"<!-- zob-verdict:\{\"P0\":\d+,\"P1\":\d+,\"P2\":\d+,"
-    r"\"merge\":(?:true|false)\} -->\s*\Z")
-# 正文中出现的完整注释形态标记 (被审代码可预埋) → 转写前消毒, 保证唯一
-# 可信来源是文末追加的真标记
+# 文末「VERDICT 行 + 标记行」的完整追加形态 (幂等只认这个形状 — 是本函数
+# 自己写出来的; 正文里被复述/预埋的孤立标记不算, 狗食 review P1-1)
+_RE_ZOB_MARK_LINE = re.compile(
+    r"^<!-- zob-verdict:\{\"P0\":\d+,\"P1\":\d+,\"P2\":\d+,"
+    r"\"merge\":(?:true|false)\} -->$")
+# 正文中出现的完整注释形态标记 (被审代码可预埋) → 无条件消毒, 保证到达
+# 下游的任何完整形态标记必然出自本文末追加 (狗食二轮 review P1-1: 兜底
+# 路径同样不放行)
 _RE_ZOB_MARK_ANY = re.compile(
     r"<!--\s*zob-verdict:\{[^>]*?\}\s*-->")
+
+
+def _ends_with_appended_marker(text):
+    """文末两行是「VERDICT 行 + 标记行」→ 已是本函数追加过的完整形态。"""
+    lines = [l for l in (text or "").rstrip().splitlines() if l.strip()]
+    if len(lines) < 2:
+        return False
+    return (_RE_FINAL_VERDICT.match(lines[-2]) is not None
+            and _RE_ZOB_MARK_LINE.match(lines[-1]) is not None)
 
 
 def _append_verdict_marker(text):
@@ -1371,28 +1381,33 @@ def _append_verdict_marker(text):
     review-gate 之前靠正则猜报告正文的 P0/P1/P2 汇总计数, 报告格式稍变即
     误读 (把表头/枚举句里的数字当计数) 或读不到 (fallback"解析失败")。
     prompt 已要求报告以严格单行 "VERDICT: P0=n P1=n P2=n MERGE=yes|no"
-    收尾; 这里自尾向头找该行, 命中则先给正文消毒 (把被审代码预埋/被复述
-    的完整注释形态标记改写掉, 狗食 review P1-1: 被审 PR 作者可在代码里
-    伪造标记骗过下游), 再在文末追加 HTML 注释标记 (GitHub 评论里不渲染,
-    人读无感):
+    收尾; 这里自尾向头找该行, 命中则在文末追加 HTML 注释标记 (GitHub 评论
+    里不渲染, 人读无感):
         <!-- zob-verdict:{"P0":0,"P1":2,"P2":3,"merge":false} -->
-    找不到该行 (模型没按格式输出) 原样返回 — 下游走旧正则兜底 + 人工核对
-    降级, 不编造。幂等只认"文末已是合法标记" (正文标记串不算)。
+
+    防伪造 (狗食 review P1-1, 被审 PR 作者可在代码里预埋标记骗下游):
+    - 消毒**无条件**执行 — 找没找到 VERDICT 行都先把正文里的完整注释形态
+      标记改写掉, 兜底路径同样不放行 (二轮 review 补: 只在命中分支消毒
+      时, 无 VERDICT 行的回退会把伪造标记原样透传给 review-gate)
+    - 幂等只认「VERDICT 行 + 标记行」的完整追加形态 (本函数写出的形状)
+
+    找不到 VERDICT 行时返回消毒后的正文 (不加标记) — 下游走旧正则兜底 +
+    人工核对降级, 不编造。
     """
-    if not text or _RE_ZOB_MARK_TAIL.search(text):
+    if not text or _ends_with_appended_marker(text):
         return text
-    for line in reversed(text.splitlines()):
+    body = _RE_ZOB_MARK_ANY.sub("[已消毒的 zob-verdict 引用]", text)
+    for line in reversed(body.splitlines()):
         m = _RE_FINAL_VERDICT.match(line)
         if m:
             p0, p1, p2 = int(m.group(1)), int(m.group(2)), int(m.group(3))
             merge = "true" if m.group(4).lower() == "yes" else "false"
             marker = (f'<!-- zob-verdict:{{"P0":{p0},"P1":{p1},"P2":{p2},'
                       f'"merge":{merge}}} -->')
-            body = _RE_ZOB_MARK_ANY.sub("[已消毒的 zob-verdict 引用]", text)
             log(f"verdict 标记已附注: P0={p0} P1={p1} P2={p2} merge={merge}"
                 f" (消毒正文标记引用 {len(_RE_ZOB_MARK_ANY.findall(text))} 处)")
             return body.rstrip("\n") + "\n" + marker
-    return text
+    return body
 
 
 def _env_int(name, default, maximum=None):
