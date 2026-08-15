@@ -1368,7 +1368,8 @@ _RE_ZOB_MARK_ANY = re.compile(
 
 def _ends_with_appended_marker(text):
     """文末两行是「VERDICT 行 + 标记行」→ 已是本函数追加过的完整形态。"""
-    lines = [l for l in (text or "").rstrip().splitlines() if l.strip()]
+    lines = [ln for ln in (text or "").rstrip().splitlines()
+              if ln.strip()]
     if len(lines) < 2:
         return False
     return (_RE_FINAL_VERDICT.match(lines[-2]) is not None
