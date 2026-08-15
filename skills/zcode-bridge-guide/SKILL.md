@@ -144,7 +144,7 @@ ANTHROPIC_API_KEY="$api_key" ZCODE_BASE_URL="$base_url" ZCODE_MODEL="$model" \
 1. **不支持 stdin 管道**：不能 `cat file | zcode --prompt`，必须用 `--attach`
 2. **无流式输出**（`--stream-json` 不支持）：turn 结束一次性返回
 3. **tool call 轮次不稳定**：duration 38s~100s+，有时不完成
-4. **自由 prompt 可能触发限流**：开放式 prompt 会 spawn 多个 explore 子代理，撞 z.ai 限流。修法：把证据塞进 `--attach`，prompt 写明「不要调用工具/不要 spawn 子代理，只基于附件推理」。MCP server 的 `zcode_review` / `zcode_security_review` 两个 tool 已内置此纪律（prompt 内置「只审不修」约束 + 写/执行工具物理禁用 + 证据走附件），走 MCP 调用时无需手工处理
+4. **自由 prompt 可能触发限流**：开放式 prompt 会 spawn 多个 explore 子代理，撞 z.ai 限流。修法：把证据塞进 `--attach`，prompt 写明「**除读附件外**不要调用工具、不要 spawn 子代理，只基于附件推理」。⚠️ 措辞必须留"读附件"口子——附件要靠 Read 工具读，裸写「不要调用工具」会让 ZCode 自我纠结浪费推理（2026-07-08 实测）。MCP server 的 review 类 tool（`zcode_review` / `zcode_security_review` / `zcode_pr_review`）已内置此纪律（prompt 内置「只审不修」约束 + 写/执行工具物理禁用 + 证据走附件），走 MCP 调用时无需手工处理
 
 ---
 
@@ -303,7 +303,7 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 
 ## 模式三：MCP tools（MCP client 内直接调用）
 
-MCP server 暴露三个标准 MCP tool，供 Claude Code / Cursor 等 MCP client 调用。
+MCP server 暴露四个标准 MCP tool，供 Claude Code / Cursor 等 MCP client 调用。
 
 ### 注册到 MCP client
 
