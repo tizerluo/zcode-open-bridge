@@ -162,9 +162,11 @@ zcode。
 - **评论 at-least-once**：评论请求发出后响应丢失（超时/连接断开）会按失败
   重试，而 GitHub issue comments 没有幂等键——极端情况下同一 head 可能
   出现重复评论，属已知限制（方向仍是宁多勿漏）。
-- **verdict 依赖报告文本解析**：从报告开头解析 `P0/P1/P2` 条数得出
-  pass/concerns；解析失败时 fail-safe 为 **concerns**（宁错拦不错放），
-  评论里会标注"严重度分布解析失败，请人工核对"。
+- **verdict 依赖报告文本解析**：优先读报告尾的 `zob-verdict` 结构化标记
+  （mcp-server 要求 zcode 以严格单行 `VERDICT: P0=n P1=n P2=n MERGE=yes|no`
+  收尾并转写成 HTML 注释，issue #16）；标记缺失时退回报告开头的正则解析。
+  两者都失败时 verdict 为 **需人工核对**（❓ unresolved）——不再误标
+  concerns：假红灯曾让下游把"可以合并"误读成"闸门卡死"。
 - **单线程串行**：逐仓逐 PR 串行审查；并发安全靠 bridge mcp-server 侧的
   跨进程文件锁兜底（多实例同时跑也不会并发打爆 zcode 限流）。
 - **fork PR**：走 `refs/pull/{n}/head` 拉取，无需加 fork 远端；

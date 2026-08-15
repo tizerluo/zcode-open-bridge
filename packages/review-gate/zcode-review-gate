@@ -15,7 +15,9 @@ zcode-review-gate — PR 自动审查闸门守护进程 (zcode-open-bridge 第 4
   - token 不落盘: 只经 git≥2.31 的 GIT_CONFIG_COUNT/KEY/VALUE 环境变量
     逐命令进程内注入 http.extraHeader (env 只对本用户可见, 优于 argv);
     clone URL / .git/config / state / config 文件里都没有 token。
-  - verdict 解析是确定性 fail-safe: 严重度分布解析不出来一律按 concerns。
+  - verdict 解析: 优先读报告尾 zob-verdict 结构化标记 (mcp-server 侧从
+    严格单行 VERDICT 结论转写), 无标记退正文正则; 都失败标 unresolved
+    ("需人工核对") 而非误标 concerns (issue #16: 假红灯曾致下游停工)。
 
 依赖: 仅 Python3 标准库 (零第三方依赖)
 日志: 全部走 stderr (带时间戳前缀)
@@ -56,12 +58,18 @@ PULLS_MAX_PAGES = 10        # 分页兜底: 单仓 open PR 超过 1000 个极罕
 VERDICT_SCAN_HEAD = 3000    # verdict 只扫报告前 N 字符 (汇总段在开头, 防正文干扰)
 MIN_COMMENT_BODY = 2000     # comment.max_body 下限 (小于模板开销的极端配置钳到这)
 
-# 严重度分布解析: 在报告开头找 "P0 ... <数字>" 三段。确定性 fail-safe:
-# 宁可解析失败按 concerns, 也不猜。P 必须大写 (不用 IGNORECASE),
+# 严重度分布解析 (issue #16): 优先读报告尾的 zob-verdict 结构化标记 —
+# 由 mcp-server 侧从严格单行 "VERDICT: P0=n P1=n P2=n MERGE=yes|no" 结论
+# 转写, 解析端直读不猜。无标记再退回正文正则 (下方三段)。
+# 正文正则: 在报告开头找 "P0 ... <数字>" 三段。确定性 fail-safe: 宁可
+# 解析失败标"需人工核对", 也不猜。P 必须大写 (不用 IGNORECASE),
 # 防正文里 "p0" 之类的偶然命中。
 # [^\dP] 排除 P 是关键: "P0/P1/P2 各 0/0/2" 枚举格式里 P0 后面紧跟
 # "/P1", 若不排除 P 会把 P1 的数字算到 P0 头上 — 枚举格式统一解析失败
 # 回 None (评论标注"解析失败请人工核对"), 也不拿错数字。
+_RE_ZOB_VERDICT = re.compile(
+    r"zob-verdict:\{\"P0\":(\d+),\"P1\":(\d+),\"P2\":(\d+),"
+    r"\"merge\":(?:true|false)\}")
 _RE_P0 = re.compile(r"P0[^\dP]{0,12}(\d+)(?!\d)")
 _RE_P1 = re.compile(r"P1[^\dP]{0,12}(\d+)(?!\d)")
 _RE_P2 = re.compile(r"P2[^\dP]{0,12}(\d+)(?!\d)")
@@ -498,7 +506,15 @@ def run_review(cfg, clone, base_ref, head_sha):
 # verdict 解析 (确定性, fail-safe)
 # ============================================================
 def parse_severity_counts(report):
-    """从报告前 VERDICT_SCAN_HEAD 字符解析 (P0, P1, P2) 条数; 任一缺失 → None。"""
+    """解析 (P0, P1, P2) 条数; 任一缺失 → None。
+
+    优先读报告尾的 zob-verdict 结构化标记 (issue #16: mcp-server 侧从
+    严格单行 VERDICT 结论转写, 全文搜索); 无标记退回正文前
+    VERDICT_SCAN_HEAD 字符的正则猜测 (自由 prose, 格式敏感, 仅兜底)。
+    """
+    m = _RE_ZOB_VERDICT.search(report or "")
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
     head = (report or "")[:VERDICT_SCAN_HEAD]
     counts = []
     for pattern in (_RE_P0, _RE_P1, _RE_P2):
@@ -510,9 +526,11 @@ def parse_severity_counts(report):
 
 
 def verdict_from_counts(counts):
-    """counts=None (解析失败) → concerns (fail-safe); P0/P1>0 → concerns; 否则 pass。"""
+    """counts=None (解析失败) → unresolved (issue #16: 表头标"需人工核对",
+    不再误标 concerns — 假红灯曾致下游指挥 agent 停工); P0/P1>0 →
+    concerns; 否则 pass。"""
     if counts is None:
-        return "concerns"
+        return "unresolved"
     return "concerns" if (counts[0] > 0 or counts[1] > 0) else "pass"
 
 
@@ -526,13 +544,16 @@ def build_comment_body(verdict, counts, head_sha, report, max_body):
     max_body = max(_as_int(max_body, 60000), MIN_COMMENT_BODY)
 
     def assemble(body_text):
-        icon = "✅ pass" if verdict == "pass" else "⚠️ concerns"
+        icon = {"pass": "✅ pass", "concerns": "⚠️ concerns"}.get(
+            verdict, "❓ 需人工核对")
         if counts is not None:
             sev = f"P0 × {counts[0]} · P1 × {counts[1]} · P2 × {counts[2]}"
         else:
-            sev = "解析失败（严重度分布解析失败，请人工核对）"
-        conclusion = ("未发现阻断问题，可以合并" if verdict == "pass"
-                      else "存在需关注的问题，合并前请处理")
+            sev = "解析失败（结构化标记与正文汇总均未解析出，请人工核对）"
+        conclusion = {
+            "pass": "未发现阻断问题，可以合并",
+            "concerns": "存在需关注的问题，合并前请处理",
+        }.get(verdict, "严重度分布未解析出，请人工核对报告正文")
         return (
             f"## ZCode Review Gate：{icon}\n\n"
             "| 项 | 值 |\n"
@@ -736,7 +757,7 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
         counts = parse_severity_counts(report)
         verdict = verdict_from_counts(counts)
         if counts is None:
-            log(f"{key}: verdict=concerns (严重度分布解析失败, fail-safe 请人工核对)")
+            log(f"{key}: verdict=unresolved (解析失败, 请人工核对)")
         else:
             log(f"{key}: verdict={verdict} "
                 f"(P0={counts[0]} P1={counts[1]} P2={counts[2]})")

@@ -1320,7 +1320,9 @@ def tool_zcode_pr_review(args):
             "规则: 绝对不要修改、创建或删除任何文件 (写/执行工具已被物理禁用);"
             "不要提出\"帮你修复\"的提议; 只输出审查报告。\n"
             "输出格式: 先给汇总 (P0/P1/P2 各几条 + findings 确认/误报/存疑各几条"
-            " + 能否合并的结论), 再逐条详述。用中文。"
+            " + 能否合并的结论), 再逐条详述。用中文。\n"
+            "报告最后一行必须是严格的单行结论 (供机器解析, 字段不得增删改名):\n"
+            "VERDICT: P0=<非负整数> P1=<非负整数> P2=<非负整数> MERGE=<yes|no>"
         )
         if focus:
             prompt += f"\n额外审查重点: {focus}。"
@@ -1330,13 +1332,51 @@ def tool_zcode_pr_review(args):
 
         log(f"调用 zcode PR 复核 (yolo+只读黑名单, {len(changed)} 个改动文件)")
         env = _merge_env_with_creds(load_zcode_credentials())
-        return _run_zcode_headless(cmd, env, _review_timeout())
+        result = _run_zcode_headless(cmd, env, _review_timeout())
+        # issue #16: 报告尾附机器可读 verdict 标记, 下游 (review-gate) 直读不猜
+        if not result.get("isError"):
+            result["content"][0]["text"] = _append_verdict_marker(
+                result["content"][0]["text"])
+        return result
     finally:
         if tmp_path:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+_RE_FINAL_VERDICT = re.compile(
+    r"^\s*VERDICT:\s*P0\s*=\s*(\d+)\s+P1\s*=\s*(\d+)\s+"
+    r"P2\s*=\s*(\d+)\s+MERGE\s*=\s*(yes|no)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _append_verdict_marker(text):
+    """PR 复核报告尾附机器可读 verdict 标记 (issue #16)。
+
+    review-gate 之前靠正则猜报告正文的 P0/P1/P2 汇总计数, 报告格式稍变即
+    误读 (把表头/枚举句里的数字当计数) 或读不到 (fallback"解析失败")。
+    prompt 已要求报告以严格单行 "VERDICT: P0=n P1=n P2=n MERGE=yes|no"
+    收尾; 这里自尾向头找该行, 命中则在文末追加 HTML 注释标记 (GitHub
+    评论里不渲染, 人读无感):
+        <!-- zob-verdict:{"P0":0,"P1":2,"P2":3,"merge":false} -->
+    找不到该行 (模型没按格式输出) 原样返回 — 下游走旧正则兜底 + 人工核对
+    降级, 不编造。已带标记 (重入) 不重复追加。
+    """
+    if not text or "zob-verdict:" in text:
+        return text
+    for line in reversed(text.splitlines()):
+        m = _RE_FINAL_VERDICT.match(line)
+        if m:
+            p0, p1, p2 = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            merge = "true" if m.group(4).lower() == "yes" else "false"
+            marker = (f'<!-- zob-verdict:{{"P0":{p0},"P1":{p1},"P2":{p2},'
+                      f'"merge":{merge}}} -->')
+            log(f"verdict 标记已附注: P0={p0} P1={p1} P2={p2} merge={merge}")
+            return text.rstrip("\n") + "\n" + marker
+    return text
 
 
 def _env_int(name, default, maximum=None):

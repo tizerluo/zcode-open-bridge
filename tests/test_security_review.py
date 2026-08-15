@@ -1028,9 +1028,10 @@ class TestPrReview(_EnvGuard):
         cls.mod = _load_mcp_module()
 
     def _patch(self, changed=None, diff_text="diff --git a/app.py b/app.py\n+new line\n",
-               rev_ok=True):
+               rev_ok=True, zcode_report="PR 报告"):
         """patch git/mimosa/zcode 三路。changed=None 表示非 git 仓库;
-        rev_ok=False 表示所有 rev 解析失败 (测 base 自动探测失败)。"""
+        rev_ok=False 表示所有 rev 解析失败 (测 base 自动探测失败);
+        zcode_report 控制假 zcode 返回的报告正文 (测 verdict 标记转写)。"""
         import tempfile
         mod = self.mod
         proj = tempfile.mkdtemp(prefix="zcode-pr-proj-")
@@ -1061,7 +1062,8 @@ class TestPrReview(_EnvGuard):
                     return _FakeCompletedProcess(0, diff_text, "")
             captured["cmd"] = cmd  # zcode 调用
             return _FakeCompletedProcess(
-                0, json.dumps({"response": "PR 报告"}, ensure_ascii=False), "")
+                0, json.dumps({"response": zcode_report}, ensure_ascii=False),
+                "")
 
         def fake_find_root():
             return "/fake/mimosa"
@@ -1218,6 +1220,66 @@ class TestPrReview(_EnvGuard):
         attach_path = captured["cmd"][captured["cmd"].index("--attach") + 1]
         self.assertIn("zcode-pr-review-", attach_path)
         self.assertFalse(os.path.exists(attach_path), "PR 附件临时文件应被清理")
+
+    def test_pr11_verdict_marker_appended(self):
+        """PR11: 报告以严格 VERDICT 行收尾 → 尾部转写 zob-verdict 标记
+        (issue #16: 下游 review-gate 直读标记, 不再正则猜正文)"""
+        report = ("汇总: P0: 0 条, P1: 1 条, P2: 2 条\n详述...\n"
+                  "VERDICT: P0=0 P1=1 P2=2 MERGE=no")
+        mod, saved, proj, _ = self._patch(changed=["a.py"], zcode_report=report)
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+        self.assertNotIn("isError", result)
+        text = result["content"][0]["text"]
+        self.assertIn(report, text)                      # 原文保留
+        self.assertIn('<!-- zob-verdict:{"P0":0,"P1":1,"P2":2,'
+                      '"merge":false} -->', text)        # 标记转写正确
+        self.assertTrue(text.rstrip().endswith("-->"))   # 标记在最尾
+
+    def test_pr12_no_verdict_line_unchanged(self):
+        """PR12: 报告没按格式输出 VERDICT 行 → 原样返回, 不编造标记
+        (下游走旧正则兜底 + 人工核对降级)"""
+        report = "汇总: P0: 0 条, P1: 0 条, P2: 2 条\n一切正常, 无 VERDICT 行"
+        mod, saved, proj, _ = self._patch(changed=["a.py"], zcode_report=report)
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+        self.assertEqual(result["content"][0]["text"], report)
+
+
+class TestVerdictMarker(_EnvGuard):
+    """_append_verdict_marker 单元行为 (issue #16)"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def test_yes_maps_to_true(self):
+        out = self.mod._append_verdict_marker(
+            "VERDICT: P0=0 P1=0 P2=0 MERGE=YES")   # 大小写不敏感
+        self.assertIn('"merge":true', out)
+
+    def test_verdict_line_found_from_tail(self):
+        # 正文里出现形似的 VERDICT 行 (带前缀文字不匹配行首), 只有真正的
+        # 独立单行才算; 取自尾向头的最后一个
+        report = "VERDICT: P0=9 P1=9 P2=9 MERGE=yes\n中间正文\n说明: VERDICT 不在此行\n"
+        out = self.mod._append_verdict_marker(report)
+        # 第一行是合法行, 但 reversed 先遇到的是 "说明: ..." (不匹配),
+        # 再往前 "中间正文" (不匹配), 最终命中第一行
+        self.assertIn('"P0":9', out)
+
+    def test_idempotent_no_duplicate(self):
+        once = self.mod._append_verdict_marker("VERDICT: P0=0 P1=0 P2=0 MERGE=yes")
+        twice = self.mod._append_verdict_marker(once)
+        self.assertEqual(once, twice)
+        self.assertEqual(twice.count("zob-verdict:"), 1)
+
+    def test_empty_and_none_safe(self):
+        self.assertEqual(self.mod._append_verdict_marker(""), "")
+        self.assertIsNone(self.mod._append_verdict_marker(None))
 
 
 class TestGitTimeouts(_EnvGuard):
