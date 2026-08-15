@@ -60,7 +60,10 @@ MIN_COMMENT_BODY = 2000     # comment.max_body 下限 (小于模板开销的极�
 
 # 严重度分布解析 (issue #16): 优先读报告尾的 zob-verdict 结构化标记 —
 # 由 mcp-server 侧从严格单行 "VERDICT: P0=n P1=n P2=n MERGE=yes|no" 结论
-# 转写, 解析端直读不猜。无标记再退回正文正则 (下方三段)。
+# 转写, 解析端直读不猜。只认完整注释形态 (<!-- ... -->) 且取**最后一个**
+# 匹配: 真标记由 mcp-server 恒定追加在文末, 正文里被复述/预埋的标记串
+# (狗食 review P1-1: 被审 PR 可伪造) 排在真标记之前, 不采信。
+# 无标记再退回正文正则 (下方三段)。
 # 正文正则: 在报告开头找 "P0 ... <数字>" 三段。确定性 fail-safe: 宁可
 # 解析失败标"需人工核对", 也不猜。P 必须大写 (不用 IGNORECASE),
 # 防正文里 "p0" 之类的偶然命中。
@@ -68,8 +71,8 @@ MIN_COMMENT_BODY = 2000     # comment.max_body 下限 (小于模板开销的极�
 # "/P1", 若不排除 P 会把 P1 的数字算到 P0 头上 — 枚举格式统一解析失败
 # 回 None (评论标注"解析失败请人工核对"), 也不拿错数字。
 _RE_ZOB_VERDICT = re.compile(
-    r"zob-verdict:\{\"P0\":(\d+),\"P1\":(\d+),\"P2\":(\d+),"
-    r"\"merge\":(?:true|false)\}")
+    r"<!-- zob-verdict:\{\"P0\":(\d+),\"P1\":(\d+),\"P2\":(\d+),"
+    r"\"merge\":(true|false)\} -->")
 _RE_P0 = re.compile(r"P0[^\dP]{0,12}(\d+)(?!\d)")
 _RE_P1 = re.compile(r"P1[^\dP]{0,12}(\d+)(?!\d)")
 _RE_P2 = re.compile(r"P2[^\dP]{0,12}(\d+)(?!\d)")
@@ -505,16 +508,31 @@ def run_review(cfg, clone, base_ref, head_sha):
 # ============================================================
 # verdict 解析 (确定性, fail-safe)
 # ============================================================
+def parse_verdict_marker(report):
+    """读 zob-verdict 标记, 返回 ((P0, P1, P2), merge) 或 None。
+
+    只认完整注释形态且取最后一个匹配 — 真标记由 mcp-server 恒定追加在
+    文末 (且 mcp-server 侧已对正文标记引用消毒), 正文靠前的伪造标记
+    不采信 (狗食 review P1-1)。
+    """
+    matches = list(_RE_ZOB_VERDICT.finditer(report or ""))
+    if not matches:
+        return None
+    m = matches[-1]
+    return ((int(m.group(1)), int(m.group(2)), int(m.group(3))),
+            m.group(4) == "true")
+
+
 def parse_severity_counts(report):
     """解析 (P0, P1, P2) 条数; 任一缺失 → None。
 
     优先读报告尾的 zob-verdict 结构化标记 (issue #16: mcp-server 侧从
-    严格单行 VERDICT 结论转写, 全文搜索); 无标记退回正文前
-    VERDICT_SCAN_HEAD 字符的正则猜测 (自由 prose, 格式敏感, 仅兜底)。
+    严格单行 VERDICT 结论转写, 取最后一个完整注释形态匹配); 无标记退回
+    正文前 VERDICT_SCAN_HEAD 字符的正则猜测 (自由 prose, 格式敏感, 仅兜底)。
     """
-    m = _RE_ZOB_VERDICT.search(report or "")
-    if m:
-        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    marker = parse_verdict_marker(report)
+    if marker:
+        return marker[0]
     head = (report or "")[:VERDICT_SCAN_HEAD]
     counts = []
     for pattern in (_RE_P0, _RE_P1, _RE_P2):
@@ -525,13 +543,19 @@ def parse_severity_counts(report):
     return tuple(counts)
 
 
-def verdict_from_counts(counts):
+def verdict_from_counts(counts, merge_from_marker=None):
     """counts=None (解析失败) → unresolved (issue #16: 表头标"需人工核对",
     不再误标 concerns — 假红灯曾致下游指挥 agent 停工); P0/P1>0 →
-    concerns; 否则 pass。"""
+    concerns; 否则 pass。结构化标记明说 merge=no 时即使全 0 计数也不给
+    pass (狗食 review P2-1: 表头"可以合并"与报告结论直接矛盾是 issue #16
+    抱怨的误导残余形态)。"""
     if counts is None:
         return "unresolved"
-    return "concerns" if (counts[0] > 0 or counts[1] > 0) else "pass"
+    if counts[0] > 0 or counts[1] > 0:
+        return "concerns"
+    if merge_from_marker is False:
+        return "concerns"
+    return "pass"
 
 
 def build_comment_body(verdict, counts, head_sha, report, max_body):
@@ -754,10 +778,14 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
             return
 
         report = payload
+        marker = parse_verdict_marker(report)
         counts = parse_severity_counts(report)
-        verdict = verdict_from_counts(counts)
+        verdict = verdict_from_counts(counts, marker[1] if marker else None)
         if counts is None:
             log(f"{key}: verdict=unresolved (解析失败, 请人工核对)")
+        elif marker is not None and not marker[1] and verdict == "concerns" \
+                and counts[0] == 0 and counts[1] == 0:
+            log(f"{key}: verdict=concerns (标记 merge=no, 全 0 计数不给 pass)")
         else:
             log(f"{key}: verdict={verdict} "
                 f"(P0={counts[0]} P1={counts[1]} P2={counts[2]})")
