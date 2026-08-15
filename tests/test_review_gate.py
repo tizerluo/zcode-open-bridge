@@ -19,6 +19,9 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
   - state 原子写 (os.replace 被调) + 损坏恢复 + 往返
   - 配置默认值 + env 覆盖 + 下限钳制
   - git: token 经 GIT_CONFIG_* env 注入且 argv 无 token / GitError 不带 token
+  - checkout_review_head: clean+checkout+rev-parse 回读校验 (issue #17:
+    mimosa 扫工作区文件, 基线必须与被审 head 严格一致) + 实例互斥锁
+    (狗食 review P1-1: 双实例退出码 2 不跑审查, 释放后可续跑)
   - ensure_clone: 半成品重建 / clone 失败清理 / web 宿主推导
   - run_review: 坏 JSON / 空报告 / OSError / TimeoutExpired / 超时透传 / stderr 尾部
   - mcp_server 解析: PATH 命中 / ~/.local/bin 回退 / 不可执行不用 / 原样兜底
@@ -33,6 +36,7 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
 
 import base64
 import email.message
+import fcntl
 import json
 import os
 import re
@@ -621,6 +625,63 @@ class TestGitTokenHeader(_GateCase):
 
 
 # ============================================================
+# checkout_review_head (issue #17: 扫描基线与被审 sha 严格一致)
+# ============================================================
+class TestCheckoutHead(_GateCase):
+    SHA = "a" * 40
+
+    def _run(self, revparse_sha=None, checkout_rc=0):
+        calls = []
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(list(cmd))
+            if "clean" in cmd:
+                return _CP(returncode=0, stdout="", stderr="")
+            if "checkout" in cmd:
+                return _CP(returncode=checkout_rc, stdout="", stderr="boom")
+            if "rev-parse" in cmd:
+                return _CP(returncode=0,
+                           stdout=(revparse_sha or self.SHA) + "\n", stderr="")
+            raise AssertionError(f"意外命令: {cmd}")
+
+        with mock.patch.object(self.mod.subprocess, "run", fake_run):
+            try:
+                out = self.mod.checkout_review_head("/tmp/clone", "tok", self.SHA)
+            except self.mod.GitError:
+                out = None
+        return out, calls
+
+    def test_ok_checkout_then_verify(self):
+        out, calls = self._run()
+        self.assertEqual(out, self.SHA)
+        # clean → checkout → rev-parse 回读, 三条命令都带 -C clone
+        # (clean 清 untracked 残留, 狗食 review P2-1: --force 只管 tracked)
+        self.assertEqual(calls[0], ["git", "-C", "/tmp/clone", "clean",
+                                    "--force", "-d", "-x"])
+        self.assertEqual(calls[1], ["git", "-C", "/tmp/clone", "checkout",
+                                    "--force", "--detach", self.SHA])
+        self.assertEqual(calls[2], ["git", "-C", "/tmp/clone",
+                                    "rev-parse", "HEAD"])
+
+    def test_revparse_mismatch_raises(self):
+        # checkout 声称成功但 HEAD 不在请求的 sha 上 → GitError 拒绝继续
+        # (防浅 clone 缺对象等静默失败让 mimosa 扫错代码)
+        out, _ = self._run(revparse_sha="b" * 40)
+        self.assertIsNone(out)
+
+    def test_checkout_failure_raises(self):
+        out, _ = self._run(checkout_rc=1)
+        self.assertIsNone(out)
+
+    def test_clean_precedes_checkout(self):
+        # 狗食 review P2-1: untracked 残留跨轮存活, mimosa 扫工作区文件
+        # → clean 必须先于 checkout
+        _, calls = self._run()
+        subs = [c[3] for c in calls]
+        self.assertLess(subs.index("clean"), subs.index("checkout"))
+
+
+# ============================================================
 # ensure_clone: 自愈 / 清理 / web 宿主推导
 # ============================================================
 class TestEnsureClone(_GateCase):
@@ -876,6 +937,13 @@ class TestOnceEndToEnd(_GateCase):
             if "clone" in cmd:
                 # 假 clone 也要建出 .git, 否则每轮都重复 clone
                 os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
+            if "checkout" in cmd:
+                # issue #17: 记住工作区切到的 sha, 供 rev-parse HEAD 回读
+                self.checked_out = cmd[-1]
+            if "rev-parse" in cmd and cmd[-1] == "HEAD":
+                return _CP(returncode=0,
+                           stdout=getattr(self, "checked_out", "") + "\n",
+                           stderr="")
             return _CP(returncode=0, stdout="", stderr="")
         if "--call" in cmd:
             idx = cmd.index("--call")
@@ -939,6 +1007,15 @@ class TestOnceEndToEnd(_GateCase):
         self.assertEqual(call_args["head"], "a" * 40)
         self.assertEqual(call_args["depth"], "deep")
         self.assertTrue(call_args["path"].endswith("octo__hello"))
+
+        # issue #17: 审查链路里出现了 checkout --force --detach 到被审 sha
+        # (process_pr 未接线则 git_calls 里不会有 checkout 命令)
+        checkout_cmds = [c for c, _ in self.git_calls if "checkout" in c]
+        self.assertEqual(len(checkout_cmds), 1)
+        self.assertIn("--force", checkout_cmds[0])
+        self.assertIn("--detach", checkout_cmds[0])
+        self.assertEqual(checkout_cmds[0][-1], "a" * 40)
+        self.assertEqual(checkout_cmds[0][-1], self.mcp_calls[0]["head"])
 
         # 评论体: pass + 严重度分布 + 署名
         body = posts[0][2]["body"]
@@ -1089,6 +1166,24 @@ class TestOnceEndToEnd(_GateCase):
         self.assertIn("issues/6/comments", posts[0][1])
         self.assertIn("octo/hello#6", self._state())
         self.assertNotIn("octo/hello#5", self._state())
+
+    def test_instance_lock_blocks_second_run(self):
+        """狗食 review P1-1 (PR #18): 已有实例持锁 → 第二实例退出码 2 且
+        不跑任何审查; 锁释放后同部署可正常续跑"""
+        cfg_path = self._write_config()
+        state = os.path.join(self.tmp, "state.json")
+        lock_path = state + ".lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            self.assertEqual(self._run_once(cfg_path), 2)
+            self.assertEqual(len(self.mcp_calls), 0)   # 没跑审查
+            self.assertEqual(len(self.api_calls), 0)   # 没拉 PR 列表
+        finally:
+            os.close(fd)                                # 释放锁
+        # 释放后同进程再跑 → 正常走完一轮
+        self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertEqual(len(self.mcp_calls), 1)
 
 
 if __name__ == "__main__":

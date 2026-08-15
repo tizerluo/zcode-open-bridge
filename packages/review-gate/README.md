@@ -2,27 +2,25 @@
 
 常驻轮询守护进程：监控配置仓库的 open PR，对每个新 head sha 调 bridge 的
 `zcode_pr_review` 完成审查（git diff + mimosa 深扫 + ZCode 只读复核），
-把带 verdict（pass / concerns）的结果回贴为 PR 评论。同一 head sha 不重复审
-（state 文件去重），失败按指数退避重试。公开、通用，任何 GitHub 仓库可用。
+把带 verdict（pass / concerns / 需人工核对）的结果回贴为 PR 评论。同一
+head sha 不重复审（state 文件去重），失败按指数退避重试。审查前会把
+clone 工作区 **checkout 到被审 head sha 并回读校验**——mimosa 扫的是
+工作区文件，不 checkout 会扫在旧代码上（issue #17）。公开、通用，任何
+GitHub 仓库可用。
 
 ```
-┌─────────────┐   轮询 open PR    ┌──────────────┐
-│  GitHub API │ ◄────────────── │              │
-└──────┬──────┘                  │              │
-       │ 新 head sha?            │ review-gate  │  (state 文件去重/退避)
-       ▼                         │              │
- git clone/fetch ──────────────► │              │
-       │                         └──────┬───────┘
-       ▼                                │ --call zcode_pr_review
-┌─────────────────┐                     ▼
-│ zcode-mcp-server│  (git diff + mimosa 深扫 + ZCode 只读复核,
-│  (子进程)        │   锁/重试/只读护栏全在 bridge 侧同源复用)
-└──────┬──────────┘
-       │ 报告 → 解析 P0/P1/P2 → verdict
-       ▼
-┌─────────────┐
-│  PR 评论     │  ✅ pass / ⚠️ concerns + 完整报告 (details 折叠)
-└─────────────┘
+GitHub API ──轮询 open PR──► review-gate (state 文件去重/指数退避)
+                               │ git clone/fetch
+                               ▼
+             checkout 到被审 head sha + rev-parse 回读校验 (issue #17)
+                               │ --call zcode_pr_review
+                               ▼
+             zcode-mcp-server 子进程 (git diff + mimosa 深扫 + ZCode 只读复核;
+                             锁/限流重试/只读护栏全在 bridge 侧同源复用)
+                               │ 报告 → 解析 P0/P1/P2 → verdict
+                               ▼
+             PR 评论: ✅ pass / ⚠️ concerns / ❓ 需人工核对
+                     + 完整报告 (details 折叠)
 ```
 
 ## 前置条件
@@ -181,7 +179,11 @@ zcode。
   评论可能不含标记（verdict 在截断前已解析，表头仍正确；未来若有下游从
   评论 HTML 反解标记需知此限制）。
 - **单线程串行**：逐仓逐 PR 串行审查；并发安全靠 bridge mcp-server 侧的
-  跨进程文件锁兜底（多实例同时跑也不会并发打爆 zcode 限流）。
+  跨进程文件锁兜底（多实例同时跑也不会并发打爆 zcode 限流）。**同一
+  state 文件（同一部署）只允许一个 gate 实例**：启动时对
+  `<state_file>.lock` 非阻塞 flock，拿不到锁直接退出（exit 2）——checkout
+  发生在 bridge 锁之外，第二个实例会在第一个实例 mimosa 扫描中途换掉
+  工作区，静默扫错代码（狗食 review P1-1）。
 - **fork PR**：走 `refs/pull/{n}/head` 拉取，无需加 fork 远端；
   审查的是 PR head 快照本身。
 - token 不落盘：经 git≥2.31 的 `GIT_CONFIG_COUNT/KEY/VALUE` 环境变量逐
