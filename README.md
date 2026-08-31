@@ -219,7 +219,7 @@ PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮�
 
 ### Model ID 格式（canonical）
 
-**canonical model id = `~/.zcode/v2/config.json` 里 `models` 的 key 原样**（如 `GLM-5.3`），**不加 provider 前缀**。`shared/credentials.py`、MCP server、ACP bridge 三处统一用原始 id。实测（0.16.1 时代）`zai/GLM-5.2` 前缀形式也兼容，但非 canonical，本项目不使用。
+**canonical model id = `~/.zcode/v2/config.json` 里 `models` 的 key 原样**（如 `GLM-5.3`），**不加 provider 前缀**。`shared/credentials.py`、MCP server、ACP bridge、agent-help 四处统一用原始 id。实测（0.16.1 时代）`zai/GLM-5.2` 前缀形式也兼容，但非 canonical，本项目不使用。
 
 模型面现状（0.16.5 实测）：当前 enabled provider（`builtin:zai-coding-plan`）的 models 为 `GLM-5.3` / `GLM-5.3-Flash` / `GLM-5-Turbo`。
 

@@ -46,7 +46,7 @@ c=json.load(open('$cfg'))
 for k,v in c['provider'].items():
     if v.get('enabled'):
         o=v['options']
-        print(f'export ZCODE_MODEL=\"{next(iter(v.get(\"models\",{}))) or \"GLM-5.2\"}\"')
+        print(f'export ZCODE_MODEL=\"{next(iter(v.get(\"models\",{}))) or \"GLM-5.3\"}\"')
         print(f'export ZCODE_BASE_URL=\"{o.get(\"baseURL\",\"\")}\"')
         print(f'export ANTHROPIC_API_KEY=\"{o.get(\"apiKey\",\"\")}\"')
         break
@@ -55,7 +55,7 @@ for k,v in c['provider'].items():
 }
 ```
 
-> ACP bridge 和 MCP server 内部已实现同样的凭证读取逻辑（`shared/credentials.py`），无需额外配置。
+> ACP bridge、MCP server 和 agent-help 内部已实现同样的凭证读取逻辑（`shared/credentials.py`），无需额外配置。
 
 ### ⚠️ 非交互 shell 坑（Codex/agent 编排注意）
 
@@ -129,9 +129,9 @@ cfg = json.loads((pathlib.Path.home() / ".zcode/v2/config.json").read_text())
 for pid, p in cfg.get("provider", {}).items():
     if p.get("enabled"):
         o = p["options"]
-        # canonical model id = config 里 models 的 key 原样 (如 GLM-5.2), 不加 provider 前缀。
+        # canonical model id = config 里 models 的 key 原样 (如 GLM-5.3), 不加 provider 前缀。
         # 实测 "zai/GLM-5.2" 也兼容, 但与本项目的权威实现 (shared/credentials.py) 不一致, 故统一用原始 id。
-        m = "GLM-5.2" if "GLM-5.2" in p.get("models", {}) else next(iter(p.get("models", {})), "")
+        m = next(iter(p.get("models", {})), "")
         print(m, o.get("baseURL", ""), o.get("apiKey", ""))
         break
 PY
