@@ -6,9 +6,8 @@
 
 ## 结论先行
 
-- 0.16.1 → 0.16.5 **协议面兼容**：ACP bridge / MCP server / agent-help / review-gate 均无需代码改动；仓库本轮仅做文档适配与兜底模型名更新。
-- 全部变化为**增量式**（新字段、新反向调用、新通知），无破坏性变更。
-- 唯一的方法删除是 `automation/*`（本项目从未实现，零损失）。
+- 0.16.1 → 0.16.5 **协议面兼容**：ACP bridge / MCP server / agent-help / review-gate 均无需代码改动；仓库本轮适配 = 文档更新（README）+ 代码兜底模型名 GLM-5.2→GLM-5.3（shared/credentials.py 及三处内嵌副本，随本 PR 系列落地）。
+- 协议变化以增量为主（新字段/新反向调用/新通知）；唯一删除是 `automation/*` 方法族（本项目从未实现，对桥面无破坏）。
 - MCP 用户级注册键位实测为 `mcp.servers`（README 注册指引已同步修正）。
 
 ## 实证环境
@@ -28,7 +27,7 @@
 ### 2. headless CLI
 
 - 仓库依赖的 `--prompt` / `--mode` / `--disallowed-tools` / `--no-color` / `--json` / `--attach` / `--resume` / `--target` 全部存在。
-- `--json` 顶层 keys = [eventCount, projection, response, sessionId, traceId, turnId, usage]（response/usage 形态不变，新增字段为增量）。
+- `--json` 顶层 keys = [eventCount, projection, response, sessionId, traceId, turnId, usage]（与 0.16.1 输出一致；eventCount/projection/traceId/turnId 系 0.16 新增，见规格书 §1）。
 - 带凭证 env 注入后实测 `response="OK"`。
 - ⚠️ **`--allowed-tools` 与 `--max-turns` 仍然只是帮助文案、未注册 parseArgs**（实测 `Unknown option`）——agent-help 的「勿用」警告继续有效，适用范围扩为 0.16.1–0.16.5。
 
@@ -45,14 +44,14 @@
 
 ### 4. 方法存在性探测（空 params：-32602=存活、-32601=已删）
 
-- **存活**：`session/fork`、`goal`、`compact`、`setModel`、`setMode`、`setThoughtLevel`、`cancelBackgroundTask`、`updateRuntimeModelConfig`、`list`、`resume`、`read`、`usage`、`subagents`、`messages`、`events`、`workspace/readState`、`generateText`、`setDefaultMode`、`upsertModelProvider`、`updateInteractionPreferences`、`mcp/list`。
-- **0.16.5 新删除**（0.16.1 尚存）：`automation/create`、`automation/list`、`automation/checkTaskBinding`（-32601）——仅影响 upgrade-0.16.1-spec 的 P3 增强候选，本项目从未实现，零损失。
+- **存活**：`session/fork`、`goal`、`compact`、`setModel`、`setMode`、`setThoughtLevel`、`cancelBackgroundTask`、`updateRuntimeModelConfig`、`list`、`resume`、`read`、`usage`、`subagents`、`messages`、`events`、`workspace/readState`、`generateText`、`setDefaultMode`、`setDefaultModel`、`setDefaultThoughtLevel`、`upsertModelProvider`、`removeModelProvider`、`updateProviderRegistry`、`updateInteractionPreferences`、`mcp/list`。
+- **0.16.5 新删除**（0.16.1 尚存）：`automation/*` 全族 5 方法——`automation/create`、`automation/update`、`automation/delete`、`automation/list`、`automation/checkTaskBinding`（均 -32601）——仅影响 upgrade-0.16.1-spec 的 P3 增强候选。
 - 0.16 已删方法（`session/new`、`prompt`、`cancel`、`steer`、`rewind`、`prompt/enhance`、`initialize`）在 0.16.5 仍为 -32601，无变化。
 
 ### 5. MCP 注册键位
 
 - `~/.zcode/cli/config.json` 用户级键位实测为 `mcp.servers`（嵌套 dict；bundle 含 `McpServers:"mcp.servers"` 配置键映射与 `mcp.servers must be a JSON object` 诊断串）。
-- 顶层 `mcpServers` 键不被用户配置读取（该字符串属 plugin manifest/请求载荷）。README 注册指引已同步修正。
+- 顶层 `mcpServers` 键不被用户配置读取（该字符串属 plugin manifest/请求载荷）。
 
 ### 6. 测试套件
 

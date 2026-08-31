@@ -86,9 +86,8 @@ for k,v in c['provider'].items():
 ./packages/agent-help/zcode-agent-help --pretty
 
 # ② MCP server (注册到 ~/.zcode/cli/config.json 的 mcp.servers)
-#    键位为嵌套结构：{"mcp": {"servers": {"<名字>": {"command": ..., "args": [...]}}}}
-#    （0.16.5 实测；顶层 mcpServers 键不被用户配置读取）
 #    或直接作为 stdio 进程运行
+#    {"mcp": {"servers": {"<名字>": {"command": ..., "args": [...]}}}}（0.16.5 实测；顶层 mcpServers 键不被读取）
 ./packages/mcp-server/zcode-mcp-server
 
 # ③ ACP bridge (配置进 Zed/JetBrains 的 Agent 设置)
@@ -141,7 +140,7 @@ zcode --prompt "继续" --resume sess_xxxx
 | plan（任务清单）| ⚠️ 代码就位，数据驱动 |
 | diff（文件变更）| ⚠️ 仅文件名，无 diff 内容 |
 
-> **0.16 协议变更（bridge 内部适配，ACP 面不变）**：0.16 的真正断点是——新增 server→client 反向调用 `session/requestRuntimePreferences` 必须应答、事件模型调整、`steer`/`rewind*`/`prompt/enhance*` 移除。信封不再接受 `jsonrpc` 字段、核心方法更名 `session/create`（参数从 `cwd` 改为 `workspace`）/`session/send`/`session/stop`、`subscribe` 必传 `deliveryKind` 同为 0.16 协议事实（新接入者必读），但桥对内本就用这套调用面（无 `jsonrpc` 信封 + `create`/`send`/`stop` + `deliveryKind`），并非全断原因（准确史实见[规格书勘误](docs/upgrade-0.16.1-spec.md)）。上表是编辑器侧看到的标准 ACP 方法名，**不变**；rename 由 bridge 内部翻译。0.16.5 复测兼容——新增反向调用 `interaction/requestOfficialMcpAuthHeaders`（桥对未知反向调用统一回 -32601，安全降级，官方鉴权类 MCP 在桥内不可用）、新增通知 `computer-use/operation-event`（走通用通知队列，正确丢弃）、`session/create` 的 sessionId 嵌套于 `result.session.sessionId`（桥 1321-1322 行已兼容）、`subscribe` 返回新增 `eventSeq`/`events` 字段（增量），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。
+> **0.16 协议变更（bridge 内部适配，ACP 面不变）**：0.16 的真正断点是——新增 server→client 反向调用 `session/requestRuntimePreferences` 必须应答、事件模型调整、`steer`/`rewind*`/`prompt/enhance*` 移除。信封不再接受 `jsonrpc` 字段、核心方法更名 `session/create`（参数从 `cwd` 改为 `workspace`）/`session/send`/`session/stop`、`subscribe` 必传 `deliveryKind` 同为 0.16 协议事实（新接入者必读），但桥对内本就用这套调用面（无 `jsonrpc` 信封 + `create`/`send`/`stop` + `deliveryKind`），并非全断原因（准确史实见[规格书勘误](docs/upgrade-0.16.1-spec.md)）。上表是编辑器侧看到的标准 ACP 方法名，**不变**；rename 由 bridge 内部翻译。0.16.5 复测兼容（新增反向调用/通知/字段均为增量，桥无需改动），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。
 
 #### 双模式（真流式 / 轮询降级）
 
@@ -222,7 +221,7 @@ PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮�
 
 **canonical model id = `~/.zcode/v2/config.json` 里 `models` 的 key 原样**（如 `GLM-5.3`），**不加 provider 前缀**。`shared/credentials.py`、MCP server、ACP bridge 三处统一用原始 id。实测（0.16.1 时代）`zai/GLM-5.2` 前缀形式也兼容，但非 canonical，本项目不使用。
 
-模型面现状（0.16.5 实测）：当前 enabled provider（`zai-coding-plan`）的 models 为 `GLM-5.3` / `GLM-5.3-Flash` / `GLM-5-Turbo`。
+模型面现状（0.16.5 实测）：当前 enabled provider（`builtin:zai-coding-plan`）的 models 为 `GLM-5.3` / `GLM-5.3-Flash` / `GLM-5-Turbo`。
 
 ### 凭证注入：显式环境变量优先
 
