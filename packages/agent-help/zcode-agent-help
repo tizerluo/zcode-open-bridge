@@ -358,13 +358,12 @@ NATIVE_CLI = {
         {"category": "permission", "name": "permission-mode", "supported": True,
          "description": "Legacy 权限模式别名: default / build / edit / plan / yolo",
          "arg": "--permission-mode <mode>",
-         "note": "--mode 的 legacy 别名 (行为等价, 值域多一个 default)",
+         "note": "--mode 的 legacy 别名, 行为等价 (自 help 文案推断)",
          "since": "0.16.5"},
         {"category": "permission", "name": "allow-main-worktree-yolo", "supported": False,
          "description": "仅为兼容旧版 headless launcher 而接受, 无功能效果 (accepted no-op)",
          "arg": "--allow-main-worktree-yolo",
-         "note": "兼容保留: 传入被接受不报错 (区别于 --allowed-tools 的 Unknown option), "
-                 "但不产生任何效果, 勿依赖",
+         "note": "区别于 --allowed-tools (Unknown option): 被接受但无功能效果, 勿依赖",
          "since": "0.16.5"},
     ],
     # 子命令 (zcode <command>, 实测自 0.16.5 --help; 9 个子命令逐一核对, 与 0.16.1 相比无新增/删除)
@@ -418,10 +417,10 @@ NATIVE_CLI = {
         {"command": "/goal [action]", "description": "查看或设置当前 session 目标"},
         {"command": "/side", "description": "辅助对话 (side conversation)",
          "since": "App 3.6.5",
-         "note": "未列入 0.16.1 CLI --help, 出自 3.6.5 changelog, TUI 内可用"},
+         "note": "未列入 0.16.1/0.16.5 CLI --help, 出自 3.6.5 changelog, TUI 内可用"},
         {"command": "/btw", "description": "辅助对话 (随手插话)",
          "since": "App 3.6.5",
-         "note": "未列入 0.16.1 CLI --help, 出自 3.6.5 changelog, TUI 内可用"},
+         "note": "未列入 0.16.1/0.16.5 CLI --help, 出自 3.6.5 changelog, TUI 内可用"},
     ],
     "known_limitations": [
         "不支持 stdin 管道输入",
