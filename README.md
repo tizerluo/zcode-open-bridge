@@ -13,7 +13,7 @@ ZCode 是智谱 Z.AI 出品的 AI 编程 Agent，由 GLM 系列模型驱动。�
 
 ```
                     ┌─────────────────────────────────────────┐
-                    │            ZCode (GLM-5.2)              │
+                    │            ZCode (GLM-5.3)              │
                     │       智谱 Z.AI 的 Agentic CLI           │
                     └───────────────┬─────────────────────────┘
                                     │
@@ -68,7 +68,7 @@ c=json.load(open('$cfg'))
 for k,v in c['provider'].items():
     if v.get('enabled'):
         o=v['options']
-        print('export ZCODE_MODEL=' + shlex.quote(next(iter(v.get('models',{}))) or 'GLM-5.2'))
+        print('export ZCODE_MODEL=' + shlex.quote(next(iter(v.get('models',{}))) or 'GLM-5.3'))
         print('export ZCODE_BASE_URL=' + shlex.quote(o.get('baseURL','')))
         print('export ANTHROPIC_API_KEY=' + shlex.quote(o.get('apiKey','')))
         break
@@ -85,8 +85,9 @@ for k,v in c['provider'].items():
 # ① 能力发现
 ./packages/agent-help/zcode-agent-help --pretty
 
-# ② MCP server (注册到 ~/.zcode/cli/config.json 的 mcpServers)
+# ② MCP server (注册到 ~/.zcode/cli/config.json 的 mcp.servers)
 #    或直接作为 stdio 进程运行
+#    {"mcp": {"servers": {"<名字>": {"command": ..., "args": [...]}}}}（0.16.5 实测；顶层 mcpServers 键不被读取）
 ./packages/mcp-server/zcode-mcp-server
 
 # ③ ACP bridge (配置进 Zed/JetBrains 的 Agent 设置)
@@ -139,7 +140,7 @@ zcode --prompt "继续" --resume sess_xxxx
 | plan（任务清单）| ⚠️ 代码就位，数据驱动 |
 | diff（文件变更）| ⚠️ 仅文件名，无 diff 内容 |
 
-> **0.16 协议变更（bridge 内部适配，ACP 面不变）**：0.16 的真正断点是——新增 server→client 反向调用 `session/requestRuntimePreferences` 必须应答、事件模型调整、`steer`/`rewind*`/`prompt/enhance*` 移除。信封不再接受 `jsonrpc` 字段、核心方法更名 `session/create`（参数从 `cwd` 改为 `workspace`）/`session/send`/`session/stop`、`subscribe` 必传 `deliveryKind` 同为 0.16 协议事实（新接入者必读），但桥对内本就用这套调用面（无 `jsonrpc` 信封 + `create`/`send`/`stop` + `deliveryKind`），并非全断原因（准确史实见[规格书勘误](docs/upgrade-0.16.1-spec.md)）。上表是编辑器侧看到的标准 ACP 方法名，**不变**；rename 由 bridge 内部翻译。
+> **0.16 协议变更（bridge 内部适配，ACP 面不变）**：0.16 的真正断点是——新增 server→client 反向调用 `session/requestRuntimePreferences` 必须应答、事件模型调整、`steer`/`rewind*`/`prompt/enhance*` 移除。信封不再接受 `jsonrpc` 字段、核心方法更名 `session/create`（参数从 `cwd` 改为 `workspace`）/`session/send`/`session/stop`、`subscribe` 必传 `deliveryKind` 同为 0.16 协议事实（新接入者必读），但桥对内本就用这套调用面（无 `jsonrpc` 信封 + `create`/`send`/`stop` + `deliveryKind`），并非全断原因（准确史实见[规格书勘误](docs/upgrade-0.16.1-spec.md)）。上表是编辑器侧看到的标准 ACP 方法名，**不变**；rename 由 bridge 内部翻译。0.16.5 复测兼容（新增反向调用/通知/字段均为增量，桥无需改动），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。
 
 #### 双模式（真流式 / 轮询降级）
 
@@ -218,14 +219,16 @@ PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮�
 
 ### Model ID 格式（canonical）
 
-**canonical model id = `~/.zcode/v2/config.json` 里 `models` 的 key 原样**（如 `GLM-5.2`），**不加 provider 前缀**。`shared/credentials.py`、MCP server、ACP bridge 三处统一用原始 id。实测 `zai/GLM-5.2` 也兼容，但非 canonical，本项目不使用。
+**canonical model id = `~/.zcode/v2/config.json` 里 `models` 的 key 原样**（如 `GLM-5.3`），**不加 provider 前缀**。`shared/credentials.py`、MCP server、ACP bridge 三处统一用原始 id。实测（0.16.1 时代）`zai/GLM-5.2` 前缀形式也兼容，但非 canonical，本项目不使用。
+
+模型面现状（0.16.5 实测）：当前 enabled provider（`builtin:zai-coding-plan`）的 models 为 `GLM-5.3` / `GLM-5.3-Flash` / `GLM-5-Turbo`。
 
 ### 凭证注入：显式环境变量优先
 
 三个组件注入凭证的合并顺序为 `{**config_creds, **os.environ}`——**已显式设置的环境变量覆盖 config 读出的值**。便于不改 config 临时调试/覆盖：
 
 ```bash
-# 临时用另一个模型跑 ACP bridge（覆盖 config 的 GLM-5.2）
+# 临时用另一个模型跑 ACP bridge（覆盖 config 的 GLM-5.3）
 ZCODE_MODEL=GLM-5-Turbo ./packages/acp-bridge/zcode-acp-bridge
 
 # 临时覆盖 MCP server 的 baseURL
@@ -303,6 +306,7 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 
 | ZCode CLI 版本 | 支持情况 | ACP bridge 流式 | 扩展方法 |
 |:--------------:|:--------:|:---------------:|:--------:|
+| **0.16.5**（App 3.10.2） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（与 0.16.1 同面；`automation/*` 未实现不受其删除影响） |
 | **0.16.1**（App 3.6.5） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（`steer`/`rewind*`/`prompt/enhance*` 已于 0.16 移除；`updateRuntimeModelConfig` 存活但 `runtimeModel.revision` 必填） |
 | **0.15.x**（App 3.5.x） | ✅ 完整 | **真流式**（事件驱动） | ✅ 全部（协议面同 0.15.0 行；App 功能面：3.5.2 内置网页应用、PDF 预览，见规格书 changelog） |
 | **0.15.x**（App 3.4.x） | ✅ 完整 | **真流式**（事件驱动） | ✅ 全部（协议面同 0.15.0 行；App 功能面：3.4.2 定时任务 cron、Kimi K3，见规格书 changelog） |
@@ -312,7 +316,7 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 | **0.14.5 ~ 0.14.7** | ✅ 兼容 | 伪流式（自动降级轮询） | ❌（旧版协议未实现） |
 | **< 0.14.5** | ⚠️ 未测 | — | — |
 
-> 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改——真正断点是反向调用必须应答、事件模型调整、删除 steer/rewind/enhance（信封去 `jsonrpc`/方法 rename/`deliveryKind` 必填同为协议事实，但桥对内本就用这套调用面），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)（含勘误）。
+> 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改——真正断点是反向调用必须应答、事件模型调整、删除 steer/rewind/enhance（信封去 `jsonrpc`/方法 rename/`deliveryKind` 必填同为协议事实，但桥对内本就用这套调用面），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)（含勘误）。0.16.5 已于 2026-09-01 全链路复测（协议面兼容、桥无需代码改动），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。
 
 **降级行为**：
 - 轮询降级**仅限 legacy（< 0.16）协议模式**：旧版下 `session/subscribe` 不可用时自动切换到轮询 `session/read`（伪流式）。**0.16+ 不再自动降级**——新协议模式下 subscribe 失败直接报错 `-32603`（"0.16+ 必须走事件订阅；轮询降级仅限旧协议模式"）。
@@ -355,7 +359,7 @@ cp -r skills/zcode-bridge-guide ~/.zcode/skills/
 2. **工具调用 turn 不稳定**：ZCode app-server 的工具调用 turn 时长在 38s～100s+ 波动，有时不完成。
 3. **流式输出**：ZCode CLI ≥ 0.14.8 支持事件推送（`session/subscribe`），ACP bridge 在此版本下实现**真流式**（逐段推送）；旧版自动降级为伪流式（turn 完成后整段发）。
 4. **diff 无内容**：ZCode 协议层不暴露 oldText/newText，只能列文件名。
-5. **GLM-5.2 无推理输出**：思考过程（agent_thought_chunk）在 GLM-5.2 下不触发，需 GLM-5-Turbo。
+5. **GLM-5.2 无推理输出**：思考过程（agent_thought_chunk）在 GLM-5.2 下不触发，需 GLM-5-Turbo（GLM-5.2 为旧默认模型；GLM-5.3 行为未复测）。
 6. **TUI 不可用**：0.16.1 起 CLI 帮助虽列出 `tui` 命令（无参数即进入 TUI），但独立终端实测仍报错（`Cannot find package '@zcode/tui'`），仅 headless 模式可用。
 7. **⚠️ ACP bridge 默认 `mode=yolo`（权限风险）**：为避免工具调用 turn 卡在权限确认，ACP bridge 的 `session/new` 强制以 `mode=yolo` 创建会话（见 `zcode-acp-bridge` 的 `_on_session_new`）。这意味着任意 prompt 都可能触发**无确认的文件修改和命令执行**。作为编辑器集成时请知悉此风险；现可用 `ZCODE_ACP_DEFAULT_MODE=build` 收紧默认值，且 bridge 启动日志（stderr）会对当前默认 mode 打显眼告警。更完整的方案是实现 ACP↔ZCode 的 permission 转发（本项目 P4b 未实现）。
 8. **⚠️ Provider 管理方法涉及 apiKey**：`workspace/upsertModelProvider`、`workspace/updateProviderRegistry` 的 `provider`/`registry` 参数会携带 `apiKey`（可能为 `{source:"inline", value:"sk-..."}` 明文）。ACP bridge 仅整体透传给 ZCode 后端、不读取也不在日志打印其明文；但调用方应自行确保传输通道（stdio）可信，并避免在日志中回显原始参数。
