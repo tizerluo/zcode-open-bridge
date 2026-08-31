@@ -37,7 +37,7 @@ def load_zcode_credentials(config_path=None):
     """从 ~/.zcode/v2/config.json 动态读取凭证。
 
     读取第一个 enabled 的 provider, 返回环境变量 dict:
-      ZCODE_MODEL:       模型 ID (如 GLM-5.2)
+      ZCODE_MODEL:       模型 ID (如 GLM-5.3)
       ZCODE_BASE_URL:    API 端点
       ANTHROPIC_API_KEY: API 密钥 (provider kind 为 anthropic)
 
@@ -56,7 +56,7 @@ def load_zcode_credentials(config_path=None):
             if p.get("enabled"):
                 opts = p.get("options", {})
                 models = p.get("models", {})
-                model_id = next(iter(models)) if models else "GLM-5.2"
+                model_id = next(iter(models)) if models else "GLM-5.3"
                 return {
                     "ZCODE_MODEL": model_id,
                     "ZCODE_BASE_URL": opts.get("baseURL", ""),

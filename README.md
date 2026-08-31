@@ -391,7 +391,7 @@ zcode-open-bridge/
 └── README.md
 ```
 
-每个组件都是**单文件、零依赖**，复制一个文件即可独立运行（`shared/credentials.py` 的逻辑已内嵌到 mcp-server/acp-bridge）。
+每个组件都是**单文件、零依赖**，复制一个文件即可独立运行（`shared/credentials.py` 的逻辑已内嵌到 mcp-server/acp-bridge/agent-help）。
 
 ## 开发
 

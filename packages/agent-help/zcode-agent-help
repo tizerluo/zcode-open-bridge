@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 
 ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 
-# 模型 ID 的 canonical 格式: config 里 models 的 key 原样 (如 GLM-5.2), 不加 provider 前缀。
+# 模型 ID 的 canonical 格式: config 里 models 的 key 原样 (如 GLM-5.3), 不加 provider 前缀。
 # 实测 "zai/GLM-5.2" 也兼容, 但与 shared/credentials.py 权威实现不一致, 故统一用原始 id。
 ZCODE_CREDS_PATH = Path.home() / ".zcode" / "v2" / "config.json"
 
@@ -49,7 +49,7 @@ def _load_creds_internal(config_path=None):
             if p.get("enabled"):
                 opts = p.get("options", {})
                 models = p.get("models", {})
-                model_id = next(iter(models)) if models else "GLM-5.2"
+                model_id = next(iter(models)) if models else "GLM-5.3"
                 return {
                     "ZCODE_MODEL": model_id,
                     "ZCODE_BASE_URL": opts.get("baseURL", ""),
@@ -199,7 +199,7 @@ NATIVE_CLI = {
     "name": "原生 Headless CLI",
     "binary": "zcode",
     "env_required": {
-        "ZCODE_MODEL": {"description": "模型 ID, 如 GLM-5.2", "example": "GLM-5.2"},
+        "ZCODE_MODEL": {"description": "模型 ID, 如 GLM-5.3", "example": "GLM-5.3"},
         "ZCODE_BASE_URL": {"description": "API 端点", "example": "https://api.z.ai/api/anthropic"},
         "ANTHROPIC_API_KEY": {"description": "API 密钥 (provider kind 为 anthropic)", "example": "<your-key>"},
     },

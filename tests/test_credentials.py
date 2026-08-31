@@ -6,7 +6,7 @@ test_credentials.py — 凭证读取与 env 优先级单测
 
   C0  正常读取: 返回第一个 enabled provider 的 model/baseURL/apiKey
   C1  model id 是原始格式 (config 里 models 的 key 原样, 如 GLM-5.2, 不加 zai/ 前缀)
-  C2  models 为空 → 兜底 GLM-5.2
+  C2  models 为空 → 兜底 GLM-5.3
   C3  无 enabled provider → 返回 {}
   C4  config 文件缺失 → 返回 {} (不崩)
   C5  config JSON 损坏 → 返回 {} (不崩)
@@ -105,9 +105,9 @@ class TestCredentials(unittest.TestCase):
 
     # ---------- C2: models 为空兜底 ----------
     def test_c2_empty_models_fallback(self):
-        """C2: models 为空 → 兜底 GLM-5.2"""
+        """C2: models 为空 → 兜底 GLM-5.3"""
         c = self._creds(_config_with_provider(models={}))
-        self.assertEqual(c["ZCODE_MODEL"], "GLM-5.2")
+        self.assertEqual(c["ZCODE_MODEL"], "GLM-5.3")
 
     # ---------- C3: 无 enabled provider ----------
     def test_c3_no_enabled_provider(self):
