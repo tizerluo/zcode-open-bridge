@@ -303,7 +303,7 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 
 ## 模式三：MCP tools（MCP client 内直接调用）
 
-MCP server 暴露四个标准 MCP tool，供 Claude Code / Cursor 等 MCP client 调用。
+MCP server 暴露四个标准 MCP tool，供 Claude Code / Cursor 等 MCP client 及 zcode 自身调用。
 
 ### 注册到 MCP client
 
