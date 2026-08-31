@@ -162,10 +162,10 @@ def print_injected_env(config_path=None):
 # ============================================================
 OVERVIEW = {
     "tool": "zcode",
-    "version_described": "0.16.1 (App 3.6.5)",
+    "version_described": "0.16.5 (App 3.10.2)",
     # 整体 review P2-6: version_described 是"静态清单基于该版本实测"的意思;
     # 实际安装版本以 environment.zcode_version (动态探测) 为准, 两者可能不一致。
-    "tested_against": "0.16.1 (App 3.6.5)",
+    "tested_against": "0.16.5 (App 3.10.2)",
     "what_it_is": (
         "ZCode 是智谱(Z.AI)的 Agentic Coding CLI, 由 GLM 系列模型驱动。"
         "它能自主完成代码编写/审查/调试/分析等任务, 可调用工具(读写文件、"
@@ -271,7 +271,13 @@ NATIVE_CLI = {
          "output_schema": {
              "sessionId": "string — 会话 ID (sess_...), 可用于续接",
              "response": "string — 回答内容",
-             "usage": {"inputTokens": "number", "outputTokens": "number"},
+             "usage": {
+                 "cacheReadTokens": "number", "cacheWriteTokens": "number",
+                 "inputTokens": "number", "modelRequestCount": "number",
+                 "outputTokens": "number", "reasoningTokens": "number",
+                 "source": "string", "totalTokens": "number",
+                 "webFetchRequests": "number", "webSearchRequests": "number",
+             },
              "traceId": "string", "turnId": "string", "eventCount": "number",
              "projection": "object — 会话状态投影 (0.16.1 新增, 向后兼容式)",
          },
@@ -319,12 +325,12 @@ NATIVE_CLI = {
         # 自主性
         {"category": "agency", "name": "autonomous-tools", "supported": True,
          "description": "自主调用工具: 读写文件、Bash、Grep、Web 搜索等",
-         "limitations": {"tool_allowlist": "0.16.1 帮助文案宣称 --allowed-tools, 实测未注册 parseArgs (Unknown option)",
+         "limitations": {"tool_allowlist": "帮助文案有 --allowed-tools, 0.16.1–0.16.5 实测均未接线 (Unknown option)",
                          "tool_denylist": "0.16.1+ 实测可用 (--disallowed-tools, 工具集级物理移除, yolo 也绕不过)",
-                         "max_turns": "0.16.1 帮助文案宣称 --max-turns, 实测未注册 parseArgs (Unknown option)",
+                         "max_turns": "帮助文案有 --max-turns, 0.16.1–0.16.5 实测均未接线 (Unknown option)",
                          "max_budget": "不支持"}},
         {"category": "agency", "name": "tool-allowlist", "supported": False,
-         "description": "工具白名单 — 帮助文案有但 0.16.1 未接线 (实测 Unknown option), 勿用",
+         "description": "工具白名单 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 (Unknown option), 勿用",
          "arg": "--allowed-tools <list>",
          "since": "0.16.1 (仅文案)"},
         {"category": "agency", "name": "tool-denylist", "supported": True,
@@ -335,11 +341,33 @@ NATIVE_CLI = {
          "example": "zcode --prompt \"整理代码\" --disallowed-tools \"Bash(git *) Edit\"",
          "since": "0.16.1"},
         {"category": "agency", "name": "max-turns", "supported": False,
-         "description": "最大模型轮次 — 帮助文案有但 0.16.1 未接线 (实测 Unknown option), 勿用",
+         "description": "最大模型轮次 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 (Unknown option), 勿用",
          "arg": "--max-turns <n>",
          "since": "0.16.1 (仅文案)"},
+        # 以下 5 项 0.16.5 help 实测在列, 引入版本未考, since 记 0.16.5
+        {"category": "input", "name": "positional-prompt", "supported": True,
+         "description": "以位置参数运行一次性 prompt, 不打开 TUI", "arg": "-p, --print",
+         "since": "0.16.5"},
+        {"category": "output", "name": "surface", "supported": True,
+         "description": "headless prompt / app-server 的呈现表面: terminal 或 desktop",
+         "arg": "--surface <surface>", "since": "0.16.5"},
+        {"category": "provider", "name": "force-mcs", "supported": True,
+         "description": "对 Anthropic 供应商强制启用会话中 system 投影 "
+                        "(mid-conversation system projection)",
+         "arg": "--force-mcs", "since": "0.16.5"},
+        {"category": "permission", "name": "permission-mode", "supported": True,
+         "description": "Legacy 权限模式别名: default / build / edit / plan / yolo",
+         "arg": "--permission-mode <mode>",
+         "note": "--mode 的 legacy 别名 (行为等价, 值域多一个 default)",
+         "since": "0.16.5"},
+        {"category": "permission", "name": "allow-main-worktree-yolo", "supported": False,
+         "description": "仅为兼容旧版 headless launcher 而接受, 无功能效果 (accepted no-op)",
+         "arg": "--allow-main-worktree-yolo",
+         "note": "兼容保留: 传入被接受不报错 (区别于 --allowed-tools 的 Unknown option), "
+                 "但不产生任何效果, 勿依赖",
+         "since": "0.16.5"},
     ],
-    # 子命令 (zcode <command>, 实测自 0.16.1 --help)
+    # 子命令 (zcode <command>, 实测自 0.16.5 --help; 9 个子命令逐一核对, 与 0.16.1 相比无新增/删除)
     "subcommands": [
         {"name": "tui", "usage": "zcode tui",
          "description": "打开全屏 TUI (无参数直接运行 zcode 同效)",
@@ -365,7 +393,8 @@ NATIVE_CLI = {
         {"name": "version", "usage": "zcode version",
          "description": "打印 CLI 版本"},
     ],
-    # slash 命令 (TUI 会话内使用; /side /btw 未见于 0.16.1 --help, 出自 App 3.6.5 changelog)
+    # slash 命令 (TUI 会话内使用; /side /btw 未见于 0.16.1/0.16.5 --help, 出自 App 3.6.5 changelog;
+    # 0.16.5 help 实测 slash 列表 14 个, 与本清单除 /side /btw 外完全一致, 无需增删)
     "slash_commands": [
         {"command": "/help [command]", "description": "slash 命令帮助"},
         {"command": "/login", "description": "Z.AI OAuth 登录", "since": "0.16.1"},

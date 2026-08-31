@@ -558,7 +558,7 @@ class TestAgentHelp(unittest.TestCase):
     def test_c12i_overview_tested_against(self):
         """C12i: OVERVIEW 带 tested_against 语义注记 (P2-6)"""
         self.assertIn("tested_against", self.ah.OVERVIEW)
-        self.assertIn("0.16.1", self.ah.OVERVIEW["tested_against"])
+        self.assertIn("0.16.5", self.ah.OVERVIEW["tested_against"])
 
     def test_c12j_stale_env_diagnosed(self):
         """C12j: 残留 env 在 --print-injected-env 里被标注 🚫 (P1-1 行为级)"""

@@ -55,7 +55,7 @@
 
 ### 6. 测试套件
 
-`python3 -m pytest tests/ -q` → 413 passed, 14 subtests passed。
+`python3 -m pytest tests/ -q` → 413 passed, 14 subtests passed（本 PR 系列新增 C13 兜底对拍用例后为 414）。
 
 ## 复测方法（可复现）
 
