@@ -6,7 +6,7 @@ test_credentials.py — 凭证读取与 env 优先级单测
 
   C0  正常读取: 返回第一个 enabled provider 的 model/baseURL/apiKey
   C1  model id 是原始格式 (config 里 models 的 key 原样, 如 GLM-5.2, 不加 zai/ 前缀)
-  C2  models 为空 → 兜底 GLM-5.2
+  C2  models 为空 → 兜底 GLM-5.3
   C3  无 enabled provider → 返回 {}
   C4  config 文件缺失 → 返回 {} (不崩)
   C5  config JSON 损坏 → 返回 {} (不崩)
@@ -105,9 +105,9 @@ class TestCredentials(unittest.TestCase):
 
     # ---------- C2: models 为空兜底 ----------
     def test_c2_empty_models_fallback(self):
-        """C2: models 为空 → 兜底 GLM-5.2"""
+        """C2: models 为空 → 兜底 GLM-5.3"""
         c = self._creds(_config_with_provider(models={}))
-        self.assertEqual(c["ZCODE_MODEL"], "GLM-5.2")
+        self.assertEqual(c["ZCODE_MODEL"], "GLM-5.3")
 
     # ---------- C3: 无 enabled provider ----------
     def test_c3_no_enabled_provider(self):
@@ -335,8 +335,14 @@ def _isolated_env(test_case, home, **env):
 
 
 def _write_isolated_config(home, enabled_url="https://api.z.ai/api/anthropic",
-                           stale_url="https://zcode.z.ai/api/v1/zcode-plan/anthropic"):
-    """在隔离 HOME 里写两 provider 的 config (enabled + 一个 disabled 的 stale), 返回路径。"""
+                           stale_url="https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+                           models=None):
+    """在隔离 HOME 里写两 provider 的 config (enabled + 一个 disabled 的 stale), 返回路径。
+
+    models: 可选, 覆盖两个 provider 的 models (默认合成数据 GLM-5.2; C13 传 {} 走兜底分支)。
+    """
+    if models is None:
+        models = {"GLM-5.2": {}}
     cfg_dir = os.path.join(home, ".zcode", "v2")
     os.makedirs(cfg_dir, exist_ok=True)
     cfg_path = os.path.join(cfg_dir, "config.json")
@@ -346,12 +352,12 @@ def _write_isolated_config(home, enabled_url="https://api.z.ai/api/anthropic",
                 "builtin:zai-coding-plan": {
                     "enabled": True,
                     "options": {"baseURL": enabled_url, "apiKey": "sk-good-key-123456"},
-                    "models": {"GLM-5.2": {}},
+                    "models": models,
                 },
                 "builtin:zai-start-plan": {
                     "enabled": False,
                     "options": {"baseURL": stale_url, "apiKey": "jwt-stale"},
-                    "models": {"GLM-5.2": {}},
+                    "models": models,
                 },
             }
         }, f)
@@ -563,6 +569,53 @@ class TestAgentHelp(unittest.TestCase):
             rc = self.ah.print_injected_env(config_path=cfg_path)
         self.assertEqual(rc, 0)
         self.assertIn("🚫 残留", out.getvalue())
+
+
+# ============================================================
+# C13: models={} 兜底分支对拍 (双审遗漏项)
+#   C11/C12 的对拍 fixture models 均非空, 兜底分支在三副本上无自动化对拍,
+#   四处兜底字面量此前只靠手工 grep 保证一致。本用例在 models={} fixture 上
+#   断言权威版与三副本的兜底 ZCODE_MODEL 相等, 且等于权威版锚点字面量 —
+#   未来模型升级只需改 shared/credentials.py + 此处锚点, 漏改任一副本即测试红。
+# ============================================================
+ACP_BRIDGE_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "packages", "acp-bridge", "zcode-acp-bridge"
+)
+
+
+class TestEmptyModelsFallbackParity(unittest.TestCase):
+    """C13: models={} 时四处兜底一致 (权威版锚点 + 三内嵌副本对拍)。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mcp = _load_single_file_module(MCP_SERVER_PATH, "zcode_mcp_server_c13")
+        cls.acp = _load_single_file_module(ACP_BRIDGE_PATH, "zcode_acp_bridge_c13")
+        cls.ah = _load_single_file_module(AGENT_HELP_PATH, "zcode_agent_help_c13")
+
+    def test_c13_empty_models_fallback_parity(self):
+        """C13: models={} → 权威版/三副本兜底 ZCODE_MODEL 相等, 且权威版 == "GLM-5.3\""""
+        with tempfile.TemporaryDirectory() as home:
+            cfg_path = _write_isolated_config(home, models={})  # 空 models → 兜底分支
+            _isolated_env(self, home)  # mcp 副本用 Path.home() 定位 config
+            ref = load_zcode_credentials(config_path=cfg_path)
+            mcp_creds = self.mcp.load_zcode_credentials()
+            # acp 副本的 config 路径是模块级常量 (exec 时绑定), 指到临时 config
+            # (与 test_app_server_methods.RV10 的 patch 方式一致)
+            orig_path = self.acp.ZCODE_CREDS_PATH
+            try:
+                self.acp.ZCODE_CREDS_PATH = cfg_path
+                acp_creds = self.acp.load_zcode_credentials()
+            finally:
+                self.acp.ZCODE_CREDS_PATH = orig_path
+            ah_creds = self.ah._load_creds_internal(cfg_path)
+        # 权威锚点: 兜底值本身 (与 shared/credentials.py 的字面量同步维护)
+        self.assertEqual(ref.get("ZCODE_MODEL"), "GLM-5.3",
+                         "权威版兜底应为 GLM-5.3 (当前默认模型)")
+        # 三副本不各自硬编码断言, 只对拍权威版 — 漏改任一副本即在此暴露
+        for name, creds in (("mcp-server", mcp_creds), ("acp-bridge", acp_creds),
+                            ("agent-help", ah_creds)):
+            self.assertEqual(creds.get("ZCODE_MODEL"), ref.get("ZCODE_MODEL"),
+                             f"models 为空时 {name} 副本兜底与权威版不一致 (四处漏改?)")
 
 
 if __name__ == "__main__":

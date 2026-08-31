@@ -84,7 +84,7 @@ def load_zcode_credentials():
             if p.get("enabled"):
                 opts = p.get("options", {})
                 models = p.get("models", {})
-                model_id = next(iter(models)) if models else "GLM-5.2"
+                model_id = next(iter(models)) if models else "GLM-5.3"
                 return {
                     "ZCODE_MODEL": model_id,
                     "ZCODE_BASE_URL": opts.get("baseURL", ""),

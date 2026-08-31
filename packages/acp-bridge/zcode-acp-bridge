@@ -2,7 +2,7 @@
 """
 zcode-acp-bridge — 把 headless ZCode 桥接为 ACP (Agent Client Protocol) Agent
 
-让 Zed / JetBrains 等 ACP 兼容编辑器能通过标准 ACP 协议调用 zcode (GLM-5.2)。
+让 Zed / JetBrains 等 ACP 兼容编辑器能通过标准 ACP 协议调用 zcode (GLM-5.3)。
 
 工作原理 (双模式自动选择):
   ACP Client (编辑器)            zcode-acp-bridge              zcode app-server
@@ -91,7 +91,7 @@ from urllib.parse import urlparse
 # 配置
 # ============================================================
 ACP_PROTOCOL_VERSION = 1
-BRIDGE_INFO = {"name": "zcode-acp-bridge", "title": "ZCode (GLM-5.2)", "version": "1.0.0"}
+BRIDGE_INFO = {"name": "zcode-acp-bridge", "title": "ZCode (GLM-5.3)", "version": "1.0.0"}
 ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 ZCODE_CREDS_PATH = Path.home() / ".zcode" / "v2" / "config.json"
 
@@ -140,7 +140,7 @@ def load_zcode_credentials():
                 opts = p.get("options", {})
                 models = p.get("models", {})
                 return {
-                    "ZCODE_MODEL": next(iter(models)) if models else "GLM-5.2",
+                    "ZCODE_MODEL": next(iter(models)) if models else "GLM-5.3",
                     "ZCODE_BASE_URL": opts.get("baseURL", ""),
                     "ANTHROPIC_API_KEY": opts.get("apiKey", ""),
                 }
