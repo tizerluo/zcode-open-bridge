@@ -303,11 +303,13 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 
 ## 模式三：MCP tools（MCP client 内直接调用）
 
-MCP server 暴露四个标准 MCP tool，供 Claude Code / Cursor 等 MCP client 调用。
+MCP server 暴露四个标准 MCP tool，供 Claude Code / Cursor 等 MCP client 及 zcode 自身调用。
 
 ### 注册到 MCP client
 
-在 MCP client 的配置（如 `~/.zcode/cli/config.json` 的 `mcpServers`）中添加：
+按注册目标分两种场景，配置键位不同：
+
+**A. 通用 MCP client（Claude Code / Cursor 等）**——用 MCP client 自身格式（如 Claude Code 的 `.mcp.json` / Cursor 配置），顶层 `mcpServers` 键：
 
 ```json
 {
@@ -320,7 +322,22 @@ MCP server 暴露四个标准 MCP tool，供 Claude Code / Cursor 等 MCP client
 }
 ```
 
-> ✅ `~/.zcode/cli/config.json` 的 `mcpServers` 键（即上例写法）在 CLI 0.16.1 实测仍受支持。
+**B. zcode 自身（`~/.zcode/cli/config.json`）**——键位是嵌套 `mcp.servers`，不是顶层 `mcpServers`：
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "zcode-mcp": {
+        "command": "/path/to/zcode-open-bridge/packages/mcp-server/zcode-mcp-server",
+        "args": []
+      }
+    }
+  }
+}
+```
+
+> 📌 zcode 用户配置以 `mcp.servers` 为准（0.16.5 实测 + bundle 佐证；与 README 口径一致）：bundle 中设置键位映射（`McpServers:"mcp.servers"`）、分层配置合并与诊断代码均只读 `mcp.servers`，顶层 `mcpServers` 键不被用户配置读取（该字符串仅见于 plugin manifest / 请求载荷）。早期版本此处称「`mcpServers` 键在 CLI 0.16.1 实测仍受支持」，与 0.16.5 bundle 证据矛盾且已无法复核，弃用该说法。
 
 ### 可用 tools
 
