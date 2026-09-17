@@ -27,7 +27,8 @@ session/requestRuntimePreferences (§3)、subscribe 必传 deliveryKind + 新事
   D   已删方法降级: steer/rewind/rewindCascade → -32601「该版本不支持」文案
       (prompt/enhance* 的降级见 test_prompt_enhance.py); D4-D6: App 3.12.3 的
       同号 0.16.5 构建删 workspace/* 7/8 与 updateRuntimeModelConfig 后,
-      降级泛化为「透传方法后端 -32601 一律『已移除』文案, 非 -32601 不翻译」
+      降级泛化为「透传方法后端 -32601 一律『已移除』文案, 非 -32601 不翻译」;
+      D7: 核心路径 (session/create) 的 -32601 属深度异常, 不套「已移除」文案
   Z   未知方法仍 -32601 (bridge 自身文案, 与降级文案区分)
 
 事实注记 (reviewer-1 0.16.1 真机抓帧, 对规格书 §4 信封描述的勘误): 事件判别
@@ -1350,6 +1351,25 @@ class TestAppServerMethods(unittest.TestCase):
                               f"{m} 应保持「已移除」文案, 实际: {resp['error']['message']}")
                 self.assertIn(m, resp["error"]["message"],
                               f"{m} 文案应含完整方法名, 实际: {resp['error']['message']}")
+
+    def test_d7_core_path_32601_not_masked(self):
+        """D7: 核心路径 (session/create) 后端 -32601 不被「已移除」文案掩盖
+
+        泛化的边界不变量: 只有透传/扩展方法走 _passthrough_error; 核心协议路径
+        (create/send/stop/list/resume) 的 -32601 属深度异常 (session/create 不在
+        后端都意味着桥的协议纪元判定已失效), 必须保留原始错误信息 — 本用例
+        钉死 session/new 在该场景下仍返回 -32603 + "zcode create failed" 原文,
+        不套「已移除」文案 (此前只有代码结构保证, 无测试拦截)。
+        """
+        bridge, _ = self._new_bridge({"session/create": {"response": {
+            "error": {"code": -32601, "message": "Method not found"}}}})
+        resp = self._call(bridge, "session/new", {"cwd": "/p"})
+        self._assert_error_code(resp, -32603,
+                                "核心路径 -32601 应保持 -32603 透传, 不得换码")
+        self.assertIn("zcode create failed", resp["error"]["message"],
+                      f"应保留 create failed 原文形态, 实际: {resp['error']['message']}")
+        self.assertNotIn("已移除", resp["error"]["message"],
+                         "核心路径 -32601 属深度异常, 不得套「已移除」文案")
 
     # ---------- Z: 未知方法 ----------
     def test_z1_unknown_method_32601(self):

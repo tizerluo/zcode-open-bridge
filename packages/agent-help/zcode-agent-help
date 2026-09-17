@@ -566,7 +566,9 @@ APP_SERVER = {
     "part_types": {
         "text": "Agent 文本回复",
         "tool": "工具调用 (含 callID/tool/state.{status,input,output})",
-        "reasoning": "推理过程 (仅 GLM-5-Turbo 产出, GLM-5.2 无)",
+        "reasoning": "推理过程 (仅 GLM-5-Turbo 产出, GLM-5.2 无; "
+                     "GLM-5-Turbo 已于 App 3.12.3 时代由服务端从 coding-plan provider "
+                     "下线, 此为历史观察)",
         "patch": "文件变更清单 (含 hash + files[], 但无 diff 内容)",
         "step-start": "步骤开始标记",
         "step-finish": "步骤结束 (含 cost/tokens)",
@@ -630,7 +632,9 @@ ECOSYSTEM = {
                 {"event": "tool_call/tool_call_update", "status": "✅ 实时 (事件驱动)"},
                 {"event": "usage_update", "status": "✅ 已验证"},
                 {"event": "agent_message_chunk", "status": "✅ 真流式 (model.streaming text_delta)"},
-                {"event": "agent_thought_chunk", "status": "✅ 流式 (GLM-5-Turbo reasoning_delta)"},
+                {"event": "agent_thought_chunk",
+                 "status": "✅ 流式 (GLM-5-Turbo reasoning_delta; 该模型已于 App 3.12.3 "
+                           "时代由服务端从 coding-plan provider 下线, 此为历史观察)"},
                 {"event": "plan", "status": "⚠️ 代码就位, 数据驱动"},
                 {"event": "diff (文件列表)", "status": "⚠️ 仅文件名无内容"},
             ],

@@ -1202,8 +1202,8 @@ class ACPBridge:
         message = err.get("message", "")
         if redact:
             message = self._redact_secret(message)
-        short = zcode_method.split("/", 1)[-1].replace("/", " ") \
-            if "/" in zcode_method else zcode_method
+        # split 的 [-1] 在无 "/" 时本就返回原串, 无需三元分支
+        short = zcode_method.split("/", 1)[-1].replace("/", " ")
         return self._error(msg_id, -32603,
                            f"zcode {short} failed: {message}")
 
