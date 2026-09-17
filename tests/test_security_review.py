@@ -1034,6 +1034,17 @@ def _mk_finding(path, anchor, title="SQL 注入", line=11):
             "title": title, "message": "拼接查询"}
 
 
+def _git_quote(path):
+    """模拟 git core.quotePath=true 的 C 引用转义 (非 ASCII → 八进制字节)。
+
+    简化: 只要缺 -c core.quotePath=false 就整体加引号 (真实 git 只引需
+    转义的路径) — 对回归钉子是更严的方向: ASCII 路径被误引同样失配,
+    假想回归 (flag 被删) 会在任何 PR 用例上显形, 不止中文路径。
+    """
+    return '"' + "".join(
+        f"\\{b:03o}" if b > 127 else chr(b) for b in path.encode("utf-8")) + '"'
+
+
 class TestPrReview(_EnvGuard):
     """tool_zcode_pr_review: git diff + mimosa 聚焦 + zcode 复核"""
 
@@ -1072,6 +1083,7 @@ class TestPrReview(_EnvGuard):
                 if changed is None:  # 非 git 仓库
                     return _FakeCompletedProcess(128, "", "not a git repository")
                 # ["git", "-C", repo, [-c core.quotePath=false,] <sub>, ...]
+                # 假设子命令前至多一对 -c (当前仅 _pr_diff 用单对); argv 再变需同步
                 sub = cmd[5] if cmd[3] == "-c" else cmd[3]
                 if sub == "rev-parse" and "--git-dir" in cmd:
                     return _FakeCompletedProcess(0, ".git\n", "")  # 仓库探测恒过
@@ -1080,8 +1092,13 @@ class TestPrReview(_EnvGuard):
                         return _FakeCompletedProcess(1, "", "unknown revision")
                     return _FakeCompletedProcess(0, "ok\n", "")
                 if sub == "diff" and "--name-only" in cmd:
+                    if "core.quotePath=false" in cmd:
+                        return _FakeCompletedProcess(
+                            0, "".join(f + "\n" for f in changed), "")
+                    # 缺 flag 时模拟 git 默认引用转义 — 让 quotePath 回归
+                    # 在 fake 层显形 (路径变 C 引用形态, 过滤失配 → pr24 挂)
                     return _FakeCompletedProcess(
-                        0, "".join(f + "\n" for f in changed), "")
+                        0, "".join(_git_quote(f) + "\n" for f in changed), "")
                 if sub == "diff":
                     return _FakeCompletedProcess(0, diff_text, "")
             captured["cmd"] = cmd  # zcode 调用
@@ -1532,7 +1549,10 @@ class TestPrReview(_EnvGuard):
     def test_pr24_cjk_path_survives_filter(self):
         """PR24: 中文路径端到端命中过滤 (审查 P1 回归) — _pr_diff 关掉
         quotePath (GT1) 后 changed 与 location.path 同为真实 UTF-8,
-        normpath 直接对上, 不再被引用转义形态静默吞掉"""
+        normpath 直接对上, 不再被引用转义形态静默吞掉。
+        行为级回归: fake git 在 argv 缺 -c core.quotePath=false 时回 C 引用
+        转义形态 (见 _patch), flag 被误删 → 转义路径过滤失配 → 本用例挂,
+        不依赖 GT1 的 argv 钉子"""
         cjk = "doc/指南.md"
         kept = _mk_finding(cjk, "sha256:cjk")
         # 纯函数层: 双侧真实 UTF-8 输入 (转义发生在 git 输出侧, 由 -c 关掉)
@@ -1565,6 +1585,26 @@ class TestPrReview(_EnvGuard):
         att = captured["attachment"]
         self.assertIn("全仓 1 条均为已知基线 finding", att)
         self.assertNotIn("diff 触及文件内", att)
+
+    def test_pr26_duplicate_fingerprint_same_scan_counted(self):
+        """PR26: 同扫内同指纹两条 finding → 附件各列一条, 基线单条目 count=2
+        (count 是出现次数不是轮次, 与 known 刷新口径一致)"""
+        dup_a = _mk_finding("app.py", "sha256:same", title="重复问题")
+        dup_b = _mk_finding("app.py", "sha256:same", title="重复问题")
+        mod, saved, proj, captured = self._patch(changed=["app.py"],
+                                                 findings=[dup_a, dup_b])
+        bl_path = mod._baseline_path(os.path.abspath(proj))
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+        self.assertNotIn("isError", result)
+        self.assertEqual(captured["attachment"].count("重复问题"), 2,
+                         "两条重复 finding 应各自进附件")
+        with open(bl_path) as fh:
+            entries = json.load(fh)["entries"]
+        self.assertEqual(len(entries), 1, "同指纹只占一个基线条目")
+        self.assertEqual(entries[mod._finding_fingerprint(dup_a)]["count"], 2)
 
 
 class TestFindingFingerprint(_EnvGuard):
@@ -1720,6 +1760,7 @@ class TestGitTimeouts(_EnvGuard):
 
         def fake_run(cmd, *a, **kw):
             # ["git", "-C", repo, [-c core.quotePath=false,] <sub>, ...]
+            # 假设子命令前至多一对 -c (当前仅 _pr_diff 用单对); argv 再变需同步
             sub = cmd[5] if cmd[3] == "-c" else cmd[3]
             seen.append((sub, kw.get("timeout")))
             if sub == "diff" and "--name-only" in cmd:

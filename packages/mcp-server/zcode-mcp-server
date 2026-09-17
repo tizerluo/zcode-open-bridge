@@ -351,6 +351,9 @@ class MimosaMcpClient:
             ["node", str(server_js)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, cwd=cwd, env=env,
+            # 同类编码洞收口: 通道是 JSON (含中文 path/title), text=True 默认
+            # locale 编码在非 UTF-8 环境会读写失败 — 钉 UTF-8 (node 侧同)
+            encoding="utf-8",
         )
         self.timeout = timeout
         self._id = 0
@@ -740,12 +743,17 @@ def _git(repo, *git_args, timeout=15):
 
     timeout 分档 (整体 review P2-6): 元数据类 (rev-parse/symbolic-ref) 15s 充裕;
     diff 类在超大仓/慢磁盘下可能超 30s, 由 _pr_diff 传 timeout=60。
+    encoding="utf-8": text=True 默认按 locale 解码, quotePath=false 后 git
+    输出原始 UTF-8 字节 (中文路径), 非 UTF-8 locale 下会乱码 (findings 过滤
+    静默匹配不上) 或抛 UnicodeDecodeError — 显式钉 UTF-8; 解码失败也按
+    "git 失败" 返回而非抛出, 保住本函数"不抛异常"的契约 (调用方 isError 收口)。
     """
     try:
         r = subprocess.run(["git", "-C", repo, *git_args],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           encoding="utf-8")
         return r.returncode, r.stdout, r.stderr
-    except (OSError, subprocess.TimeoutExpired) as e:
+    except (OSError, subprocess.TimeoutExpired, UnicodeError) as e:
         return 128, "", str(e)
 
 
@@ -999,7 +1007,7 @@ def tool_get_zcode_capabilities(args):
     if section:
         cmd += ["--section", section]
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=30
+        cmd, capture_output=True, text=True, timeout=30, encoding="utf-8"
     )
     if result.returncode != 0:
         return {"content": [{"type": "text", "text": f"错误: {result.stderr}"}],
@@ -1060,7 +1068,8 @@ def _run_zcode_headless(cmd, env, timeout):
             for attempt in range(max_retries + 1):
                 try:
                     result = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=timeout, env=env
+                        cmd, capture_output=True, text=True, timeout=timeout,
+                        env=env, encoding="utf-8"
                     )
                     output = result.stdout
                     # 错误判定: 只解析 stderr (Claude review P1-1: 若把 stdout 审查正文
@@ -1133,9 +1142,12 @@ def _write_temp(text, prefix):
 
     内容是调用方自己的代码/scan findings (非凭证); POSIX 下 tempfile
     默认 0600 仅属主可读, 权限足够 (狗食安全 review 存疑-1 已评估)。
+    encoding="utf-8": 附件含中文标题与 (quotePath 修复后) 中文路径,
+    ASCII locale 下裸 mode="w" 会让 write 抛 UnicodeEncodeError 反杀整次审查。
     """
     import tempfile
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, prefix=prefix)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False,
+                                      prefix=prefix, encoding="utf-8")
     tmp.write(text)
     tmp.close()
     return tmp.name
@@ -1571,11 +1583,12 @@ def tool_zcode_pr_review(args):
             # 写入时机守卫 (安全关键): 仅 zcode 复核成功返回 (非 isError 且
             # 无异常) 才落基线。失败/isError/异常路径绝不写 — 否则 gate 对
             # 同 head 重试时这些 finding 已变"已知" → 假"无新增" → 假 pass。
-            # 落盘失败也不反杀已成功的审查 (基线只是降噪优化, 宁可下轮重报)
+            # 落盘失败也不反杀已成功的审查 (基线只是降噪优化, 宁可下轮重报);
+            # UnicodeError 兜孤立代理字对的理论路径 (与"不反杀"注释对齐)
             if pending_baseline is not None:
                 try:
                     _save_baseline(baseline_file, pending_baseline)
-                except OSError as e:
+                except (OSError, UnicodeError) as e:
                     log(f"⚠ 基线落盘失败 (下轮将重报这些 finding): {e}")
         return result
     finally:
