@@ -692,6 +692,25 @@ def _empty_baseline():
     return {"schemaVersion": _BASELINE_SCHEMA, "entries": {}}
 
 
+def _baseline_entry(finding, now):
+    """新 finding 首次入库的 entry 构造 (字段面见上方 schema 注释块)。
+
+    供 PR 审查的 staging 与测试的 _preset_baseline 复用 — 同一 schema
+    手写两处迟早漂移, 以此函数为唯一定义点。
+    """
+    return {
+        "path": (finding.get("location") or {}).get("path"),
+        "anchor": (finding.get("identity") or {}).get("anchor"),
+        "findingId": finding.get("findingId"),
+        "publicClass": (finding.get("identity") or {}).get("publicClass"),
+        "severity": finding.get("severity"),
+        "title": finding.get("title"),
+        "firstSeen": now,
+        "lastSeen": now,
+        "count": 1,
+    }
+
+
 def _load_baseline(path):
     """读基线库; 缺失/损坏/形状非法 → 空库 + log WARNING, 绝不抛。
 
@@ -1433,9 +1452,8 @@ def tool_zcode_pr_review(args):
         return {"content": [{"type": "text", "text": f"mimosa 扫描失败: {e}"}],
                 "isError": True}
 
-    # ③ findings 两级过滤 (issue #26/#27): 先按 diff 触及文件, 再按已知基线。
-    # mimosa 静态引擎永远全仓扫, 不过滤时历史仓的存量 findings 会淹没本次
-    # PR 真正新引入的问题; 两级开关均可 env 回滚 (见 README 运维节)。
+    # ③ findings 两级过滤 (issue #26/#27): 先按 diff 触及文件, 再按已知基线
+    # (存量淹没的动因见 _filter_findings_by_files); 两级开关均可 env 回滚。
     total = len(findings)
     # 一级 (文件): ZCODE_BRIDGE_PR_FINDINGS_SCOPE=all 恢复全量进附件的旧行为
     scope_all = os.environ.get("ZCODE_BRIDGE_PR_FINDINGS_SCOPE", "diff") == "all"
@@ -1478,17 +1496,7 @@ def tool_zcode_pr_review(args):
                     # 附件仍逐条列 — 与 known 刷新的计数口径一致
                     staged[fp]["count"] += 1
                 else:
-                    staged[fp] = {
-                        "path": (f.get("location") or {}).get("path"),
-                        "anchor": (f.get("identity") or {}).get("anchor"),
-                        "findingId": f.get("findingId"),
-                        "publicClass": (f.get("identity") or {}).get("publicClass"),
-                        "severity": f.get("severity"),
-                        "title": f.get("title"),
-                        "firstSeen": now,
-                        "lastSeen": now,
-                        "count": 1,
-                    }
+                    staged[fp] = _baseline_entry(f, now)
                 new_findings.append(f)
         entries.update(staged)
         findings = new_findings
@@ -1518,12 +1526,9 @@ def tool_zcode_pr_review(args):
     elif in_scope:
         # diff 过滤命中但全被基线滤掉 — 如实说明, 不沿用下面"未取到"文案。
         # scope=all 没做文件过滤 (in_scope==total), 不能误称"diff 触及文件内"
-        if scope_all:
-            attachment += (f"\n# mimosa findings\n(全仓 {in_scope} 条均为已知"
-                           "基线 finding, 已过滤, 本轮无需逐条核实)\n")
-        else:
-            attachment += (f"\n# mimosa findings\n(diff 触及文件内 {in_scope} 条均为"
-                           f"已知基线 finding, 已过滤, 本轮无需逐条核实)\n")
+        scope_word = "全仓" if scope_all else "diff 触及文件内"
+        attachment += (f"\n# mimosa findings\n({scope_word} {in_scope} 条均为已知"
+                       "基线 finding, 已过滤, 本轮无需逐条核实)\n")
     elif total:
         # 扫描确有产出但都不在改动文件内 — 区别于"未取到结构化 findings"
         # (后者会被误读为扫描失败), 如实说明过滤原因

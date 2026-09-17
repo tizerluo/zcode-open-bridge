@@ -160,6 +160,7 @@ systemd 用 `systemctl --user edit zcode-review-gate` 加 `Environment=` 行）�
 |---|---|---|
 | `ZCODE_BRIDGE_PR_FINDINGS_SCOPE` | `diff` | findings 附件范围：`diff`（只含改动文件内）/ `all`（不按文件过滤；配合 `ZCODE_BRIDGE_PR_BASELINE=off` 才完全回到旧行为——默认基线开着时 `all` 仍会剔除已知 finding） |
 | `ZCODE_BRIDGE_PR_BASELINE` | `on` | 已知基线去重：`off` 关闭（不读不写基线，回滚到过滤前行为） |
+| `ZCODE_BRIDGE_BASELINE_DIR` | `~/.local/state/zcode-mcp-server/baselines/` | 基线库存放目录（文件名按仓库 clone 绝对路径哈希派生，分仓隔离） |
 
 全量回滚（疑似过滤误伤时排查用）：`ZCODE_BRIDGE_PR_FINDINGS_SCOPE=all`
 + `ZCODE_BRIDGE_PR_BASELINE=off`，两者独立可组合。
@@ -218,8 +219,7 @@ zcode。
 - **确认未修复的真漏洞首次详报后仅进 known 计数**（issue #27 基线去重的
   取舍）：finding 指纹 = 文件路径 + mimosa 内容锚（anchor），代码内容不变
   则指纹不变，下轮 PR 只在报告头行计入"已过滤"不再逐条详报；被审文件
-  一行代码改动即指纹失效、作为新增重报。要看存量全量：删该仓基线文件
-  （见运维节）或手动跑 `zcode_security_review` 深扫（不经过滤/基线）。
+  一行代码改动即指纹失效、作为新增重报。要看存量全量见运维节。
 - **基线键绑定 clone 绝对路径**：换机、迁移或改名 clone root 会让
   `~/.local/state/zcode-mcp-server/baselines/` 下的旧键失配，等效基线
   重置——一轮存量噪音回潮后重新收敛，无害（方向宁多报不漏报）。

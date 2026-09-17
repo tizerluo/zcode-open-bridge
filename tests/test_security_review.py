@@ -1297,14 +1297,9 @@ class TestPrReview(_EnvGuard):
         bl_path = mod._baseline_path(os.path.abspath(proj))
         entries = {}
         for f in known_findings:
-            entries[mod._finding_fingerprint(f)] = {
-                "path": f["location"]["path"],
-                "anchor": f["identity"].get("anchor"),
-                "findingId": f.get("findingId"),
-                "publicClass": f["identity"]["publicClass"],
-                "severity": f["severity"], "title": f["title"],
-                "firstSeen": "2026-01-01T00:00:00",
-                "lastSeen": "2026-01-01T00:00:00", "count": 1}
+            # entry 形态与生产 staging 同源 (_baseline_entry), 防两处 schema 漂移
+            entries[mod._finding_fingerprint(f)] = mod._baseline_entry(
+                f, "2026-01-01T00:00:00")
         os.makedirs(os.path.dirname(bl_path), exist_ok=True)
         with open(bl_path, "w") as fh:
             json.dump({"schemaVersion": "zcode-pr-review-baseline/v1",
