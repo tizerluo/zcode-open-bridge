@@ -1,7 +1,8 @@
 # zcode-review-gate — PR 自动审查闸门
 
 常驻轮询守护进程：监控配置仓库的 open PR，对每个新 head sha 调 bridge 的
-`zcode_pr_review` 完成审查（git diff + mimosa 深扫 + ZCode 只读复核），
+`zcode_pr_review` 完成审查（git diff + mimosa 深扫 + findings 按 diff
+文件过滤/已知基线去重 + ZCode 只读复核），
 把带 verdict（pass / concerns / 需人工核对）的结果回贴为 PR 评论。同一
 head sha 不重复审（state 文件去重），失败按指数退避重试。审查前会把
 clone 工作区 **checkout 到被审 head sha 并回读校验**——mimosa 扫的是
@@ -15,7 +16,8 @@ GitHub API ──轮询 open PR──► review-gate (state 文件去重/指数�
              checkout 到被审 head sha + rev-parse 回读校验 (issue #17)
                                │ --call zcode_pr_review
                                ▼
-             zcode-mcp-server 子进程 (git diff + mimosa 深扫 + ZCode 只读复核;
+             zcode-mcp-server 子进程 (git diff + mimosa 深扫 + findings 按 diff
+                             文件过滤/已知基线去重 + ZCode 只读复核;
                              锁/限流重试/只读护栏全在 bridge 侧同源复用)
                                │ 报告 → 解析 P0/P1/P2 → verdict
                                ▼
@@ -135,6 +137,34 @@ zcode-review-gate --once --repo owner/repo --pr 5
 zcode-review-gate --once --log-level DEBUG
 ```
 
+### findings 基线（issue #26/#27）
+
+`zcode_pr_review` 的 mimosa findings 会先按本 PR 改动文件过滤、再按已知
+基线去重，只有**新增** finding 进 ZCode 复核；已知 finding 以报告开头一行
+`> 基线过滤: …` 计数说明，不进 P0/P1/P2 计数。基线文件按 clone 绝对路径
+哈希存于仓外 `~/.local/state/zcode-mcp-server/baselines/`（gate 每轮
+`git clean --force -d -x`，仓内存活不了），仅在复核成功后落盘。
+
+```bash
+# 重置某仓基线 (下一轮所有 finding 按新增重报): 删对应文件
+rm ~/.local/state/zcode-mcp-server/baselines/<hash>.json   # 或整个目录
+
+# 手动全量深扫 (绕过 PR 过滤/基线, 存量问题全量可见)
+zcode-mcp-server --call zcode_security_review '{"path":"<repo>","depth":"deep"}'
+```
+
+两个 env 开关（gate 经 `dict(os.environ)` 透传给 mcp-server 子进程；
+systemd 用 `systemctl --user edit zcode-review-gate` 加 `Environment=` 行）：
+
+| env | 默认 | 说明 |
+|---|---|---|
+| `ZCODE_BRIDGE_PR_FINDINGS_SCOPE` | `diff` | findings 附件范围：`diff`（只含改动文件内）/ `all`（不按文件过滤；配合 `ZCODE_BRIDGE_PR_BASELINE=off` 才完全回到旧行为——默认基线开着时 `all` 仍会剔除已知 finding） |
+| `ZCODE_BRIDGE_PR_BASELINE` | `on` | 已知基线去重：`off` 关闭（不读不写基线，回滚到过滤前行为） |
+| `ZCODE_BRIDGE_BASELINE_DIR` | `~/.local/state/zcode-mcp-server/baselines/` | 基线库存放目录（文件名按仓库 clone 绝对路径哈希派生，分仓隔离） |
+
+全量回滚（疑似过滤误伤时排查用）：`ZCODE_BRIDGE_PR_FINDINGS_SCOPE=all`
++ `ZCODE_BRIDGE_PR_BASELINE=off`，两者独立可组合。
+
 state 文件（默认 `~/.local/state/zcode-review-gate/state.json`）记录每个 PR 的
 审查状态：`head_sha` / `status` / `verdict` / `counts` / `report` /
 `attempts` / `next_retry_at` / `comment_url` / `error`。
@@ -186,6 +216,16 @@ zcode。
   工作区，静默扫错代码（狗食 review P1-1）。
 - **fork PR**：走 `refs/pull/{n}/head` 拉取，无需加 fork 远端；
   审查的是 PR head 快照本身。
+- **确认未修复的真漏洞首次详报后仅进 known 计数**（issue #27 基线去重的
+  取舍）：finding 指纹 = 文件路径 + mimosa 内容锚（anchor），代码内容不变
+  则指纹不变，下轮 PR 只在报告头行计入"已过滤"不再逐条详报；被审文件
+  一行代码改动即指纹失效、作为新增重报。要看存量全量见运维节。
+- **基线键绑定 clone 绝对路径**：换机、迁移或改名 clone root 会让
+  `~/.local/state/zcode-mcp-server/baselines/` 下的旧键失配，等效基线
+  重置——一轮存量噪音回潮后重新收敛，无害（方向宁多报不漏报）。
+- **基线 entries 永不清理**：代码删除/重命名后旧指纹条目会永久残留
+  （体量上界 = 该仓历史 distinct 指纹数，纯计数元数据，无安全影响）；
+  需要瘦身就删该仓基线文件重置（见运维节 `rm` 命令）。
 - token 不落盘：经 git≥2.31 的 `GIT_CONFIG_COUNT/KEY/VALUE` 环境变量逐
   命令注入 `http.extraHeader`（env 只对本用户可见，优于 argv），
   clone URL / git config / state 文件里都不会有 token。
