@@ -443,21 +443,24 @@ class TestVerdict(_GateCase):
     def test_baseline_header_line_does_not_disturb_parsing(self):
         # issue #27: mcp-server 会把基线过滤头行 (纯中文, 不含 P0/P1/P2 字面
         # token) 拼在报告正文开头 — 钉住标记路径与 prose 兜底路径的解析结果
-        # 都与无头行时一致 (gate 不受新报告形态影响)
+        # 都与无头行时一致 (gate 不受新报告形态影响)。
+        # 断言直接钉具体值而非只比对两形态相等 — 两侧同为 None 的整体回归
+        # 也会让相等断言通过 (审查 P3-5)
         marker = '<!-- zob-verdict:{"P0":0,"P1":0,"P2":2,"merge":true} -->'
         plain = "汇总: P0: 0 条, P1: 0 条, P2: 2 条\n详情...\n" + marker
         headed = ("> 基线过滤: 已过滤 3 条已知 finding, 本轮新增 1 条进入复核\n"
                   + plain)
         self.assertEqual(self.mod.parse_verdict_marker(headed),
+                         ((0, 0, 2), True))
+        self.assertEqual(self.mod.parse_verdict_marker(headed),
                          self.mod.parse_verdict_marker(plain))
-        self.assertEqual(self.mod.parse_severity_counts(headed),
-                         self.mod.parse_severity_counts(plain), (0, 0, 2))
+        self.assertEqual(self.mod.parse_severity_counts(headed), (0, 0, 2))
         # 无标记时的 prose 兜底路径同样不受头行影响 (头行无 P0/P1/P2 token)
         prose = "汇总: P0: 0 条, P1: 0 条, P2: 2 条\n详情..."
         self.assertEqual(
             self.mod.parse_severity_counts("> 基线过滤: 已过滤 3 条已知 finding"
                                            ", 本轮新增 1 条进入复核\n" + prose),
-            self.mod.parse_severity_counts(prose))
+            (0, 0, 2))
 
 
 # ============================================================

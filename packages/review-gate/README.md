@@ -158,7 +158,7 @@ systemd 用 `systemctl --user edit zcode-review-gate` 加 `Environment=` 行）�
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `ZCODE_BRIDGE_PR_FINDINGS_SCOPE` | `diff` | findings 附件范围：`diff`（只含改动文件内）/ `all`（回滚到全量进附件的旧行为） |
+| `ZCODE_BRIDGE_PR_FINDINGS_SCOPE` | `diff` | findings 附件范围：`diff`（只含改动文件内）/ `all`（不按文件过滤；配合 `ZCODE_BRIDGE_PR_BASELINE=off` 才完全回到旧行为——默认基线开着时 `all` 仍会剔除已知 finding） |
 | `ZCODE_BRIDGE_PR_BASELINE` | `on` | 已知基线去重：`off` 关闭（不读不写基线，回滚到过滤前行为） |
 
 全量回滚（疑似过滤误伤时排查用）：`ZCODE_BRIDGE_PR_FINDINGS_SCOPE=all`
@@ -223,6 +223,9 @@ zcode。
 - **基线键绑定 clone 绝对路径**：换机、迁移或改名 clone root 会让
   `~/.local/state/zcode-mcp-server/baselines/` 下的旧键失配，等效基线
   重置——一轮存量噪音回潮后重新收敛，无害（方向宁多报不漏报）。
+- **基线 entries 永不清理**：代码删除/重命名后旧指纹条目会永久残留
+  （体量上界 = 该仓历史 distinct 指纹数，纯计数元数据，无安全影响）；
+  需要瘦身就删该仓基线文件重置（见运维节 `rm` 命令）。
 - token 不落盘：经 git≥2.31 的 `GIT_CONFIG_COUNT/KEY/VALUE` 环境变量逐
   命令注入 `http.extraHeader`（env 只对本用户可见，优于 argv），
   clone URL / git config / state 文件里都不会有 token。

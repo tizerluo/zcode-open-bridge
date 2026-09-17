@@ -1071,7 +1071,8 @@ class TestPrReview(_EnvGuard):
             if cmd[0] == "git":
                 if changed is None:  # 非 git 仓库
                     return _FakeCompletedProcess(128, "", "not a git repository")
-                sub = cmd[3]  # ["git", "-C", repo, <sub>, ...]
+                # ["git", "-C", repo, [-c core.quotePath=false,] <sub>, ...]
+                sub = cmd[5] if cmd[3] == "-c" else cmd[3]
                 if sub == "rev-parse" and "--git-dir" in cmd:
                     return _FakeCompletedProcess(0, ".git\n", "")  # 仓库探测恒过
                 if sub == "rev-parse" or sub == "symbolic-ref":
@@ -1307,7 +1308,7 @@ class TestPrReview(_EnvGuard):
             self._restore(mod, saved)
         self.assertNotIn("isError", result)
         att = captured["attachment"]
-        self.assertIn("# mimosa findings (diff 触及文件内, 1/2 条)", att)
+        self.assertIn("# mimosa findings (本轮新增 1, 全仓 2 条)", att)
         self.assertIn("改动内问题", att)
         self.assertNotIn("存量噪音", att, "未落在改动文件内的 finding 应被过滤")
 
@@ -1336,7 +1337,7 @@ class TestPrReview(_EnvGuard):
         finally:
             self._restore(mod, saved)
         self.assertNotIn("isError", result)
-        self.assertIn("(diff 触及文件内, 1/1 条)", captured["attachment"])
+        self.assertIn("(本轮新增 1, 全仓 1 条)", captured["attachment"])
 
     def test_pr16_baseline_filters_known(self):
         """PR16: 预置基线 → known finding 排除出附件, 报告头行注入 known 计数
@@ -1378,14 +1379,22 @@ class TestPrReview(_EnvGuard):
             self.assertIn(mod._finding_fingerprint(fresh), entries)
         finally:
             self._restore(mod, saved)
-        # isError 路径: zcode 调用失败 → 基线文件不落
+        # isError 路径: zcode 调用失败 → 基线不落; 预置含 known entry 的基线
+        # 必须字节级原样 — 只断言"新文件不存在"捕获不了"失败路径仍刷新
+        # known/写入 new"的假想 bug (审查 P3-4)
+        known = _mk_finding("app.py", "sha256:known", title="旧问题")
         mod, saved, proj, _ = self._patch(
-            changed=["app.py"], findings=[fresh], zcode_rc=1, zcode_stderr="boom")
-        bl_path = mod._baseline_path(os.path.abspath(proj))
+            changed=["app.py"], findings=[fresh, known],
+            zcode_rc=1, zcode_stderr="boom")
+        bl_path = self._preset_baseline(mod, proj, [known])
+        with open(bl_path) as fh:
+            preset_bytes = fh.read()
         try:
             result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
             self.assertTrue(result.get("isError"))
-            self.assertFalse(os.path.exists(bl_path), "isError 不应落基线")
+            with open(bl_path) as fh:
+                self.assertEqual(fh.read(), preset_bytes,
+                                 "isError 路径不得刷新 known 或写入 new")
         finally:
             self._restore(mod, saved)
         # 异常路径: mimosa 扫描抛错 (更早返回) → 同样不落
@@ -1417,7 +1426,7 @@ class TestPrReview(_EnvGuard):
         finally:
             self._restore(mod, saved)
         self.assertNotIn("isError", result)
-        self.assertIn("(diff 触及文件内, 1/1 条)", captured["attachment"])
+        self.assertIn("(本轮新增 1, 全仓 1 条)", captured["attachment"])
         # 成功后损坏库被合法基线覆写, 下轮起恢复正常去重
         with open(bl_path) as fh:
             entries = json.load(fh)["entries"]
@@ -1460,7 +1469,7 @@ class TestPrReview(_EnvGuard):
             self._restore(mod, saved)
         self.assertNotIn("isError", result)
         # 不读: finding 未被基线吞, 报告无基线头行
-        self.assertIn("(diff 触及文件内, 1/1 条)", captured["attachment"])
+        self.assertIn("(本轮新增 1, 全仓 1 条)", captured["attachment"])
         self.assertNotIn("基线过滤", result["content"][0]["text"])
         # 不写: 预置条目原样 (count 未被刷新)
         with open(bl_path) as fh:
@@ -1519,6 +1528,43 @@ class TestPrReview(_EnvGuard):
         self.assertIn('<!-- zob-verdict:{"P0":0,"P1":1,"P2":2,'
                       '"merge":false} -->', text)
         self.assertTrue(text.rstrip().endswith("-->"), "标记必须仍是最后一行")
+
+    def test_pr24_cjk_path_survives_filter(self):
+        """PR24: 中文路径端到端命中过滤 (审查 P1 回归) — _pr_diff 关掉
+        quotePath (GT1) 后 changed 与 location.path 同为真实 UTF-8,
+        normpath 直接对上, 不再被引用转义形态静默吞掉"""
+        cjk = "doc/指南.md"
+        kept = _mk_finding(cjk, "sha256:cjk")
+        # 纯函数层: 双侧真实 UTF-8 输入 (转义发生在 git 输出侧, 由 -c 关掉)
+        k, dropped = self.mod._filter_findings_by_files([kept], [cjk])
+        self.assertEqual((len(k), dropped), (1, 0))
+        mod, saved, proj, captured = self._patch(changed=[cjk, "app.py"],
+                                                 findings=[kept])
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+        self.assertNotIn("isError", result)
+        att = captured["attachment"]
+        self.assertIn("(本轮新增 1, 全仓 1 条)", att)
+        self.assertIn("指南", att, "中文路径 finding 应进入附件")
+
+    def test_pr25_scope_all_all_known_wording(self):
+        """PR25: scope=all 且全为已知 → 措辞用"全仓 N 条", 不误称
+        "diff 触及文件内" (该模式没做文件过滤, in_scope==total)"""
+        os.environ["ZCODE_BRIDGE_PR_FINDINGS_SCOPE"] = "all"
+        known = _mk_finding("other.py", "sha256:known", title="旧问题")
+        mod, saved, proj, captured = self._patch(
+            changed=["app.py"], findings=[known])
+        self._preset_baseline(mod, proj, [known])
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            self._restore(mod, saved)
+        self.assertNotIn("isError", result)
+        att = captured["attachment"]
+        self.assertIn("全仓 1 条均为已知基线 finding", att)
+        self.assertNotIn("diff 触及文件内", att)
 
 
 class TestFindingFingerprint(_EnvGuard):
@@ -1673,11 +1719,12 @@ class TestGitTimeouts(_EnvGuard):
         seen = []
 
         def fake_run(cmd, *a, **kw):
-            sub = cmd[3]  # ["git", "-C", repo, <sub>, ...]
+            # ["git", "-C", repo, [-c core.quotePath=false,] <sub>, ...]
+            sub = cmd[5] if cmd[3] == "-c" else cmd[3]
             seen.append((sub, kw.get("timeout")))
             if sub == "diff" and "--name-only" in cmd:
                 return _FakeCompletedProcess(0, "a.py\n", "")
-            return _FakeCompletedProcess(0, "ok", "")
+            return _FakeCompletedProcess(0, "ok\n", "")
 
         saved = mod.subprocess.run
         mod.subprocess.run = fake_run
@@ -1689,6 +1736,34 @@ class TestGitTimeouts(_EnvGuard):
         self.assertEqual(seen[0], ("rev-parse", 15), "元数据类默认 15s")
         diff_timeouts = [t for sub, t in seen if sub == "diff"]
         self.assertEqual(diff_timeouts, [60, 60], "diff 类应 60s")
+
+    def test_gt1_diff_disables_quotepath(self):
+        """GT1: 两次 diff 都带 -c core.quotePath=false 且在子命令之前 —
+        git 默认引用转义会把中文路径变成 "doc/\\346..." 八进制形态,
+        normpath 不解引用, findings 过滤永远匹配不上 → 中文文件 finding
+        被静默丢弃 (漏报方向, 审查 P1)"""
+        mod = self.mod
+        cmds = []
+
+        def fake_run(cmd, *a, **kw):
+            cmds.append(cmd)
+            if "diff" in cmd and "--name-only" in cmd:
+                return _FakeCompletedProcess(0, "a.py\n", "")
+            return _FakeCompletedProcess(0, "ok\n", "")
+
+        saved = mod.subprocess.run
+        mod.subprocess.run = fake_run
+        try:
+            mod._pr_diff("/r", "main", "HEAD")
+        finally:
+            mod.subprocess.run = saved
+        diff_cmds = [c for c in cmds if "diff" in c]
+        self.assertEqual(len(diff_cmds), 2, "name-only + 全文两次 diff")
+        for c in diff_cmds:
+            self.assertIn("-c", c)
+            i = c.index("-c")
+            self.assertEqual(c[i + 1], "core.quotePath=false")
+            self.assertLess(i, c.index("diff"), "-c 必须在子命令 diff 之前")
 
 
 class TestEmbeddedCreds(_EnvGuard):

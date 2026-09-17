@@ -642,7 +642,8 @@ def _filter_findings_by_files(findings, changed_files):
 # 基线 schema: {"schemaVersion": "zcode-pr-review-baseline/v1", "repo": "<abs>",
 #               "updatedAt": "<iso>", "entries": {"<指纹>": {path, anchor,
 #               findingId, publicClass, severity, title, firstSeen, lastSeen,
-#               count}}}
+#               count}}} — count 是出现次数不是轮次: 每轮复核成功按本轮
+#               出现次数 +1, 同扫内同指纹的重复 finding 各自 +1。
 _BASELINE_SCHEMA = "zcode-pr-review-baseline/v1"
 
 
@@ -693,13 +694,17 @@ def _load_baseline(path):
 
     基线是降噪优化不是正确性依赖: 读不到就当全量新 finding 重报, 方向
     宁多报不漏报 (与 gate verdict 的 fail-safe 取舍一致)。
+    显式 encoding="utf-8" + 捕 UnicodeError: 基线含中文 title
+    (ensure_ascii=False 落盘), 非 UTF-8 locale 下裸 open 会抛
+    UnicodeDecodeError (ValueError 子类, 不是 JSONDecodeError), 不捕就
+    违反本函数"绝不抛"的契约。
     """
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         return _empty_baseline()  # 首轮审查, 正常路径, 不刷日志
-    except (json.JSONDecodeError, OSError) as e:
+    except (json.JSONDecodeError, OSError, UnicodeError) as e:
         log(f"⚠ 基线文件 {path} 损坏, 按空基线处理: {e}")
         return _empty_baseline()
     if not isinstance(data.get("entries"), dict):
@@ -713,13 +718,16 @@ def _save_baseline(path, baseline):
 
     os.replace 同目录换名是原子的 — 中途断电最多丢本轮更新, 不会留半个
     JSON 让下轮 _load_baseline 整库作废。
+    显式 encoding="utf-8": 基线含中文 title, ASCII locale 下裸 open("w")
+    会让 ensure_ascii=False 的 json.dump 抛 UnicodeEncodeError (ValueError,
+    调用点的 except OSError 捕不住) → 反杀已成功的审查。
     """
     baseline["updatedAt"] = datetime.now().isoformat(timespec="seconds")
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(baseline, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
 
@@ -763,14 +771,21 @@ def _pr_diff(repo, base, head):
     返回 (changed_files, diff_text); 失败抛 RuntimeError。
     base/head 需先过 _validate_rev; 这里再加 --end-of-options 双保险,
     末尾 -- 隔离 pathspec。
+    diff 一律带 -c core.quotePath=false: git 默认引用转义会把含非 ASCII/
+    引号/反斜杠的路径变成 "doc/\\346\\214\\207.md" 八进制形态, normpath
+    不解引用, 与 mimosa location.path (真实 UTF-8) 永远匹配不上 → 中文
+    文件里的 finding 被过滤静默丢弃 (漏报方向)。该输出在 main 侧只喂
+    focus_files (优先级提示, 无害), 本分支起是 findings 过滤的正确性依赖。
     """
     range_spec = f"{base}...{head}"
-    rc, files_out, err = _git(repo, "diff", "--name-only", "--end-of-options",
+    rc, files_out, err = _git(repo, "-c", "core.quotePath=false",
+                              "diff", "--name-only", "--end-of-options",
                               range_spec, "--", timeout=60)
     if rc != 0:
         raise RuntimeError(f"git diff {range_spec} 失败: {err.strip()[:200]}")
     changed = [ln.strip() for ln in files_out.splitlines() if ln.strip()]
-    rc, diff_text, err = _git(repo, "diff", "--end-of-options", range_spec, "--",
+    rc, diff_text, err = _git(repo, "-c", "core.quotePath=false",
+                              "diff", "--end-of-options", range_spec, "--",
                               timeout=60)
     if rc != 0:
         raise RuntimeError(f"git diff {range_spec} 失败: {err.strip()[:200]}")
@@ -1446,17 +1461,22 @@ def tool_zcode_pr_review(args):
                 entry["lastSeen"] = now
                 known_count += 1
             else:
-                staged[fp] = {
-                    "path": (f.get("location") or {}).get("path"),
-                    "anchor": (f.get("identity") or {}).get("anchor"),
-                    "findingId": f.get("findingId"),
-                    "publicClass": (f.get("identity") or {}).get("publicClass"),
-                    "severity": f.get("severity"),
-                    "title": f.get("title"),
-                    "firstSeen": now,
-                    "lastSeen": now,
-                    "count": 1,
-                }
+                if fp in staged:
+                    # 同扫内同指纹重复 finding: count 再 +1 (是次数不是轮次),
+                    # 附件仍逐条列 — 与 known 刷新的计数口径一致
+                    staged[fp]["count"] += 1
+                else:
+                    staged[fp] = {
+                        "path": (f.get("location") or {}).get("path"),
+                        "anchor": (f.get("identity") or {}).get("anchor"),
+                        "findingId": f.get("findingId"),
+                        "publicClass": (f.get("identity") or {}).get("publicClass"),
+                        "severity": f.get("severity"),
+                        "title": f.get("title"),
+                        "firstSeen": now,
+                        "lastSeen": now,
+                        "count": 1,
+                    }
                 new_findings.append(f)
         entries.update(staged)
         findings = new_findings
@@ -1475,16 +1495,23 @@ def tool_zcode_pr_review(args):
         if scope_all:
             heading = f"\n# findings 清单 ({len(compact)} 条)\n"
         else:
-            heading = (f"\n# mimosa findings (diff 触及文件内, "
-                       f"{len(compact)}/{total} 条)\n")
+            # 口径: 列出数 X 是两级过滤后的本轮新增 (不含已知基线), Y 是全仓
+            # 扫描产出 — "X/Y 条"字面会让人把基线滤除也算进分母, 直接写明
+            heading = (f"\n# mimosa findings (本轮新增 {len(compact)}, "
+                       f"全仓 {total} 条)\n")
         attachment += heading + json.dumps(compact, ensure_ascii=False, indent=1)
         if known_count:
             attachment += (f"\n\n(另有已知基线 finding {known_count} 条已过滤, "
                            "未列入本次核实)\n")
     elif in_scope:
-        # diff 过滤命中但全被基线滤掉 — 如实说明, 不沿用下面"未取到"文案
-        attachment += (f"\n# mimosa findings\n(diff 触及文件内 {in_scope} 条均为"
-                       f"已知基线 finding, 已过滤, 本轮无需逐条核实)\n")
+        # diff 过滤命中但全被基线滤掉 — 如实说明, 不沿用下面"未取到"文案。
+        # scope=all 没做文件过滤 (in_scope==total), 不能误称"diff 触及文件内"
+        if scope_all:
+            attachment += (f"\n# mimosa findings\n(全仓 {in_scope} 条均为已知"
+                           "基线 finding, 已过滤, 本轮无需逐条核实)\n")
+        else:
+            attachment += (f"\n# mimosa findings\n(diff 触及文件内 {in_scope} 条均为"
+                           f"已知基线 finding, 已过滤, 本轮无需逐条核实)\n")
     elif total:
         # 扫描确有产出但都不在改动文件内 — 区别于"未取到结构化 findings"
         # (后者会被误读为扫描失败), 如实说明过滤原因
