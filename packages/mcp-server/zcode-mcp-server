@@ -9,7 +9,8 @@ Claude Code、Cursor 等) 能标准化地发现并调用 headless zcode。
   1. get_zcode_capabilities  — 返回 headless zcode 完整能力清单 (JSON)
   2. zcode_review            — 调 zcode 审查代码 (yolo + 写工具物理禁用, 免授权且只读)
   3. zcode_security_review   — mimosa 规则引擎预扫 + zcode 只读逐条复核 (安全专项)
-  4. zcode_pr_review         — PR 审查: git diff + mimosa 聚焦深扫 + zcode 复核报告
+  4. zcode_pr_review         — PR 审查: git diff + mimosa 聚焦深扫 (findings
+                              按 diff 文件过滤+基线去重) + zcode 复核报告
 
 协议: MCP over stdio (JSON-RPC 2.0, 每行一条消息)
 日志: 全部走 stderr (绝不污染 stdout 协议流)
@@ -18,6 +19,7 @@ Claude Code、Cursor 等) 能标准化地发现并调用 headless zcode。
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -26,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -60,7 +63,7 @@ _META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 # 作为 MCP client 调 mimosa 时用的版本: mimosa 1.0.3 实测讲 2024-11-05,
 # 钉死该值 (它不回更高版; 我们不校验它的应答版本)。
 MIMOSA_CLIENT_PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "zcode-mcp-server", "version": "1.4.0"}
+SERVER_INFO = {"name": "zcode-mcp-server", "version": "1.5.0"}
 
 
 def log(msg):
@@ -612,6 +615,115 @@ def _compact_findings(findings):
     return out
 
 
+def _filter_findings_by_files(findings, changed_files):
+    """按 PR 改动文件过滤 mimosa findings (issue #26)。返回 (kept, dropped_count)。
+
+    mimosa 静态引擎永远全仓扫 (focus_files 只是优先级提示, 见
+    _mimosa_deep_scan docstring 实测结论), 历史仓的存量 findings 会淹没
+    本次 PR 真正新引入的问题 — 只有 location.path 落在 diff 触及文件内的
+    才值得进 zcode 逐条核实。双侧 os.path.normpath 归一后精确匹配:
+    findings 路径与 git diff --name-only 同为仓库相对路径, 但任一侧都可能
+    带 ./ 前缀 (normpath 消掉); 不做子串/后缀匹配, 防误吞同名文件。
+    """
+    changed_set = {os.path.normpath(f) for f in changed_files if f}
+    kept = [f for f in findings
+            if os.path.normpath((f.get("location") or {}).get("path") or "")
+            in changed_set]
+    dropped = len(findings) - len(kept)
+    if dropped:
+        log(f"findings 文件过滤: 保留 {len(kept)}, 丢弃 {dropped} "
+            "(未落在本次 diff 触及文件内)")
+    return kept, dropped
+
+
+# ============================================================
+# finding 指纹与已知基线库 (issue #27)
+# ============================================================
+# 基线 schema: {"schemaVersion": "zcode-pr-review-baseline/v1", "repo": "<abs>",
+#               "updatedAt": "<iso>", "entries": {"<指纹>": {path, anchor,
+#               findingId, publicClass, severity, title, firstSeen, lastSeen,
+#               count}}}
+_BASELINE_SCHEMA = "zcode-pr-review-baseline/v1"
+
+
+def _finding_fingerprint(finding):
+    """finding 指纹: sha256(normpath(path) + NUL + identity.anchor) 十六进制。
+
+    identity.anchor 是 mimosa 的内容锚定哈希 — 实测跨扫描稳定、不含路径
+    语义、代码内容变则变, 正适合做基线键: 同一 finding 重扫同指纹 (行号
+    漂移不炸指纹), 被审代码一行改动即换指纹 (作为新增重新进入复核)。
+    path 参与哈希: anchor 只锚定代码内容, 同段代码复制到新文件是新的
+    finding, 不能被旧文件的基线条目吞掉。缺 anchor 时退化为
+    path+publicClass+title 的弱指纹并 log 警告 — 弱指纹的跨版本稳定性
+    没有 anchor 的实测背书, 仅兜底防炸。
+    """
+    path = os.path.normpath((finding.get("location") or {}).get("path") or "")
+    identity = finding.get("identity") or {}
+    anchor = identity.get("anchor")
+    if anchor:
+        material = f"{path}\0{anchor}"
+    else:
+        log(f"⚠ finding 缺 identity.anchor, 退化为弱指纹 (path+publicClass"
+            f"+title): {path} {identity.get('publicClass')}")
+        material = f"{path}\0{identity.get('publicClass') or ''}\0{finding.get('title') or ''}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _baseline_path(repo_abs_path):
+    """基线文件路径: <ZCODE_BRIDGE_BASELINE_DIR>/<sha256(repo绝对路径)前16hex>.json。
+
+    基线必须放仓外 — review-gate 每轮 git clean --force -d -x 会把仓内
+    未跟踪文件清掉, 放仓内等于每轮重置。键取 repo 绝对路径哈希前 16 hex:
+    不同 clone 目录天然分仓隔离 (代价: 换机/改 clone root 会重置基线,
+    一轮噪音回潮, 无害 — 见 review-gate README 限制节)。
+    """
+    base_dir = os.environ.get("ZCODE_BRIDGE_BASELINE_DIR") or os.path.expanduser(
+        "~/.local/state/zcode-mcp-server/baselines/")
+    key = hashlib.sha256(repo_abs_path.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(base_dir, f"{key}.json")
+
+
+def _empty_baseline():
+    """空基线骨架 (缺失/损坏时的 fail-safe 返回值)。"""
+    return {"schemaVersion": _BASELINE_SCHEMA, "entries": {}}
+
+
+def _load_baseline(path):
+    """读基线库; 缺失/损坏/形状非法 → 空库 + log WARNING, 绝不抛。
+
+    基线是降噪优化不是正确性依赖: 读不到就当全量新 finding 重报, 方向
+    宁多报不漏报 (与 gate verdict 的 fail-safe 取舍一致)。
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return _empty_baseline()  # 首轮审查, 正常路径, 不刷日志
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"⚠ 基线文件 {path} 损坏, 按空基线处理: {e}")
+        return _empty_baseline()
+    if not isinstance(data.get("entries"), dict):
+        log(f"⚠ 基线文件 {path} 形状非法 (entries 非对象), 按空基线处理")
+        return _empty_baseline()
+    return data
+
+
+def _save_baseline(path, baseline):
+    """基线库原子落盘: 同目录 tmp + os.replace (仿 gate StateStore.save)。
+
+    os.replace 同目录换名是原子的 — 中途断电最多丢本轮更新, 不会留半个
+    JSON 让下轮 _load_baseline 整库作废。
+    """
+    baseline["updatedAt"] = datetime.now().isoformat(timespec="seconds")
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(baseline, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
 # ============================================================
 # PR 审查: git diff 计算 + base 自动探测
 # ============================================================
@@ -819,6 +931,9 @@ TOOLS = [
         "description": (
             "PR 审查模式: 自动算 git diff (base...HEAD, merge-base 语义) 得到改动清单,"
             "mimosa 全仓扫描 + 业务逻辑复核优先聚焦改动文件 (focus_files),"
+            "findings 按本 PR 改动文件过滤并按已知基线去重 (只复核新增;"
+            "ZCODE_BRIDGE_PR_FINDINGS_SCOPE=all 恢复全量附件, "
+            "ZCODE_BRIDGE_PR_BASELINE=off 关闭基线),"
             "ZCode 拿着 diff+findings 出 PR 复核报告 (P0/P1/P2 分级 + 能否合并结论)。"
             "全程只读: yolo+写工具物理禁用, 免人工授权。需要本机装有 mimosa 插件。"
         ),
@@ -1204,7 +1319,11 @@ def tool_zcode_pr_review(args):
 
     ① git diff base...head (merge-base 语义) 算改动清单与完整 diff;
     ② mimosa 全仓扫描 (focus_files=改动文件, deep 档业务逻辑投研聚焦改动);
-    ③ diff+findings 作附件喂 zcode 出 PR 复核报告 (P0/P1/P2 + 能否合并)。
+    ③ findings 两级过滤 (issue #26/#27): 按 diff 触及文件 → 按已知基线
+       (基线文件在仓外 ~/.local/state/zcode-mcp-server/baselines/, 指纹 =
+       path+内容锚 anchor, 代码不变则视为已知不重报);
+    ④ diff+过滤后 findings 作附件喂 zcode 出 PR 复核报告 (P0/P1/P2 +
+       能否合并); 仅复核成功后才把本轮 finding 并入基线落盘。
     全程只读: 写工具物理禁用; git/mimosa 都是只读调用。
     """
     scan_path = args.get("path") or args.get("cwd") or os.getcwd()
@@ -1287,7 +1406,63 @@ def tool_zcode_pr_review(args):
         return {"content": [{"type": "text", "text": f"mimosa 扫描失败: {e}"}],
                 "isError": True}
 
-    # ③ 附件 = PR 元信息 + diff + mimosa 摘要 + findings
+    # ③ findings 两级过滤 (issue #26/#27): 先按 diff 触及文件, 再按已知基线。
+    # mimosa 静态引擎永远全仓扫, 不过滤时历史仓的存量 findings 会淹没本次
+    # PR 真正新引入的问题; 两级开关均可 env 回滚 (见 README 运维节)。
+    total = len(findings)
+    # 一级 (文件): ZCODE_BRIDGE_PR_FINDINGS_SCOPE=all 恢复全量进附件的旧行为
+    scope_all = os.environ.get("ZCODE_BRIDGE_PR_FINDINGS_SCOPE", "diff") == "all"
+    if findings and not scope_all:
+        findings, _dropped = _filter_findings_by_files(findings, changed)
+    in_scope = len(findings)
+
+    # 二级 (基线): ZCODE_BRIDGE_PR_BASELINE=off 完全不读不写基线。
+    # known 项只刷新 lastSeen/count, new 项先在内存里建 entry — 落盘统一
+    # 押后到 zcode 复核成功之后 (见下方 pending_baseline 的安全说明)。
+    known_count = 0
+    pending_baseline = None   # 非 None = 本轮启用了基线, 成功后需落盘
+    baseline_file = None
+    if findings and os.environ.get("ZCODE_BRIDGE_PR_BASELINE", "on") != "off":
+        repo_abs = os.path.abspath(scan_path)
+        baseline_file = _baseline_path(repo_abs)
+        baseline = _load_baseline(baseline_file)
+        baseline["repo"] = repo_abs
+        entries = baseline["entries"]
+        now = datetime.now().isoformat(timespec="seconds")
+        new_findings = []
+        staged = {}  # 新 entry 先存这里, 循环后再并入 — 防同指纹的重复
+        # finding 在循环内被刚 stage 的 entry 误判成 known
+        for f in findings:
+            fp = _finding_fingerprint(f)
+            entry = entries.get(fp)
+            if entry is not None:
+                # 已知 finding: 上一轮已详报过, 本轮只计数不进复核。
+                # count 可能被手改成非数字 — 基线是降噪优化, 解析失败重置
+                # 计数即可, 不能反杀整次审查 (与 _load_baseline 的 fail-safe 对齐)
+                try:
+                    entry["count"] = int(entry.get("count") or 0) + 1
+                except (TypeError, ValueError):
+                    entry["count"] = 1
+                entry["lastSeen"] = now
+                known_count += 1
+            else:
+                staged[fp] = {
+                    "path": (f.get("location") or {}).get("path"),
+                    "anchor": (f.get("identity") or {}).get("anchor"),
+                    "findingId": f.get("findingId"),
+                    "publicClass": (f.get("identity") or {}).get("publicClass"),
+                    "severity": f.get("severity"),
+                    "title": f.get("title"),
+                    "firstSeen": now,
+                    "lastSeen": now,
+                    "count": 1,
+                }
+                new_findings.append(f)
+        entries.update(staged)
+        findings = new_findings
+        pending_baseline = baseline
+
+    # 附件 = PR 元信息 + diff + mimosa 摘要 + findings (只含两级过滤后的新增)
     attachment = (
         f"# PR 信息\n- base: {base} → head: {head}\n"
         f"- 改动文件 ({len(changed)} 个):\n"
@@ -1297,13 +1472,32 @@ def tool_zcode_pr_review(args):
     )
     if findings:
         compact = _compact_findings(findings)
-        attachment += (
-            f"\n# findings 清单 ({len(compact)} 条)\n"
-            + json.dumps(compact, ensure_ascii=False, indent=1)
-        )
+        if scope_all:
+            heading = f"\n# findings 清单 ({len(compact)} 条)\n"
+        else:
+            heading = (f"\n# mimosa findings (diff 触及文件内, "
+                       f"{len(compact)}/{total} 条)\n")
+        attachment += heading + json.dumps(compact, ensure_ascii=False, indent=1)
+        if known_count:
+            attachment += (f"\n\n(另有已知基线 finding {known_count} 条已过滤, "
+                           "未列入本次核实)\n")
+    elif in_scope:
+        # diff 过滤命中但全被基线滤掉 — 如实说明, 不沿用下面"未取到"文案
+        attachment += (f"\n# mimosa findings\n(diff 触及文件内 {in_scope} 条均为"
+                       f"已知基线 finding, 已过滤, 本轮无需逐条核实)\n")
+    elif total:
+        # 扫描确有产出但都不在改动文件内 — 区别于"未取到结构化 findings"
+        # (后者会被误读为扫描失败), 如实说明过滤原因
+        attachment += (f"\n# mimosa findings\n(diff 触及文件内 0 条, 全仓共 "
+                       f"{total} 条已按改动文件过滤, 无需逐条核实; "
+                       "如摘要显示有发现, 可按你的判断抽查改动文件)\n")
     else:
         attachment += ("\n# findings 清单\n(未取到结构化 findings, 以摘要为准;"
                        "如摘要显示 0 发现, 也请按你的判断抽查关键代码)\n")
+
+    # prompt 同步过滤措辞; scope=all 回滚时不提, 免得与全量清单自相矛盾
+    findings_scope_note = (
+        "" if scope_all else ", findings 已按本 PR 改动文件过滤")
 
     tmp_path = None
     try:
@@ -1311,7 +1505,7 @@ def tool_zcode_pr_review(args):
         prompt = (
             "你是资深安全审查专家。这是一次 PR 审查: 附件含 ① 本 PR 的完整 diff "
             f"(base={base} → {head}, 改动 {len(changed)} 个文件) ② mimosa 安全扫描结果"
-            f"(depth={depth}, 业务逻辑复核优先聚焦本次改动文件)。\n"
+            f"(depth={depth}, 业务逻辑复核优先聚焦本次改动文件{findings_scope_note})。\n"
             "任务:\n"
             "1. 审查 diff 中新引入的问题, 按 P0(阻断合并)/P1(应修)/P2(建议) 分级,"
             "每个问题含文件位置/判定依据/修复建议。重点是'新引入';"
@@ -1337,8 +1531,25 @@ def tool_zcode_pr_review(args):
         result = _run_zcode_headless(cmd, env, _review_timeout())
         # issue #16: 报告尾附机器可读 verdict 标记, 下游 (review-gate) 直读不猜
         if not result.get("isError"):
+            # 基线头行先拼在正文开头再转写标记 — 纯中文不含 P0/P1/P2 字面
+            # token, gate 的 prose 兜底正则 (只按这些 token 匹配) 不会误读;
+            # 拼在开头也不动尾部, _append_verdict_marker 的位置契约不受影响
+            if known_count:
+                result["content"][0]["text"] = (
+                    f"> 基线过滤: 已过滤 {known_count} 条已知 finding, "
+                    f"本轮新增 {len(findings)} 条进入复核\n"
+                    + result["content"][0]["text"])
             result["content"][0]["text"] = _append_verdict_marker(
                 result["content"][0]["text"])
+            # 写入时机守卫 (安全关键): 仅 zcode 复核成功返回 (非 isError 且
+            # 无异常) 才落基线。失败/isError/异常路径绝不写 — 否则 gate 对
+            # 同 head 重试时这些 finding 已变"已知" → 假"无新增" → 假 pass。
+            # 落盘失败也不反杀已成功的审查 (基线只是降噪优化, 宁可下轮重报)
+            if pending_baseline is not None:
+                try:
+                    _save_baseline(baseline_file, pending_baseline)
+                except OSError as e:
+                    log(f"⚠ 基线落盘失败 (下轮将重报这些 finding): {e}")
         return result
     finally:
         if tmp_path:
