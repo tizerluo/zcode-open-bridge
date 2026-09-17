@@ -162,10 +162,13 @@ def print_injected_env(config_path=None):
 # ============================================================
 OVERVIEW = {
     "tool": "zcode",
-    "version_described": "0.16.5 (App 3.10.2)",
+    "version_described": "0.16.5",
     # 整体 review P2-6: version_described 是"静态清单基于该版本实测"的意思;
     # 实际安装版本以 environment.zcode_version (动态探测) 为准, 两者可能不一致。
-    "tested_against": "0.16.5 (App 3.10.2)",
+    # App 3.12.3 起 --version 同为 0.16.5 但构建内容漂移 (workspace/* 7 个与
+    # updateRuntimeModelConfig 被删, 见 key_methods 各 ❌ 注记), 故不再绑定具体
+    # App 版本号 — 描述对象是 CLI 能力面 (0.16.5), 可用性以各条目注记为准。
+    "tested_against": "0.16.5 (App 3.10.2 / 3.12.3 复测)",
     "what_it_is": (
         "ZCode 是智谱(Z.AI)的 Agentic Coding CLI, 由 GLM 系列模型驱动。"
         "它能自主完成代码编写/审查/调试/分析等任务, 可调用工具(读写文件、"
@@ -325,12 +328,15 @@ NATIVE_CLI = {
         # 自主性
         {"category": "agency", "name": "autonomous-tools", "supported": True,
          "description": "自主调用工具: 读写文件、Bash、Grep、Web 搜索等",
-         "limitations": {"tool_allowlist": "帮助文案有 --allowed-tools, 0.16.1–0.16.5 实测均未接线 (Unknown option)",
+         "limitations": {"tool_allowlist": "帮助文案有 --allowed-tools, 0.16.1–0.16.5 实测均未接线 "
+                                           "(Unknown option)",
                          "tool_denylist": "0.16.1+ 实测可用 (--disallowed-tools, 工具集级物理移除, yolo 也绕不过)",
-                         "max_turns": "帮助文案有 --max-turns, 0.16.1–0.16.5 实测均未接线 (Unknown option)",
+                         "max_turns": "帮助文案有 --max-turns, 0.16.1–0.16.5 实测均未接线 "
+                                      "(Unknown option)",
                          "max_budget": "不支持"}},
         {"category": "agency", "name": "tool-allowlist", "supported": False,
-         "description": "工具白名单 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 (Unknown option), 勿用",
+         "description": "工具白名单 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 "
+                        "(Unknown option), 勿用",
          "arg": "--allowed-tools <list>",
          "since": "0.16.1 (仅文案)"},
         {"category": "agency", "name": "tool-denylist", "supported": True,
@@ -341,7 +347,8 @@ NATIVE_CLI = {
          "example": "zcode --prompt \"整理代码\" --disallowed-tools \"Bash(git *) Edit\"",
          "since": "0.16.1"},
         {"category": "agency", "name": "max-turns", "supported": False,
-         "description": "最大模型轮次 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 (Unknown option), 勿用",
+         "description": "最大模型轮次 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 "
+                        "(Unknown option), 勿用",
          "arg": "--max-turns <n>",
          "since": "0.16.1 (仅文案)"},
         # 以下 5 项 0.16.5 help 实测在列, 引入版本未考, since 记 0.16.5
@@ -445,6 +452,10 @@ APP_SERVER = {
         "新增 server→client 反向调用 session/requestRuntimePreferences (client 必须应答, 否则卡住); "
         "session/subscribe 新增必填 deliveryKind。下列 key_methods 已更新到 0.16.1 实况: "
         "steer/rewind/rewindCascade/prompt/enhance* 均已移除 (调用返 -32601 Method not found)。"
+        "⚠ App 3.12.3 的内嵌 CLI --version 仍为 0.16.5 但构建内容漂移 (2026-09-17 实测, "
+        "详见 docs/recheck-3.12.3.md): workspace/* 8 删 7 (仅 generateText 存活) 与 "
+        "session/updateRuntimeModelConfig 被删 (返 -32601), 另新增 startup/storageState 通知 — "
+        "--version 不能作为唯一兼容性判据, 方法存疑时以活体探测为准。"
     ),
     "description": (
         "长驻 stdio 服务, 支持多会话/多轮。ZCode 桌面 App 和 ACP 桥接器都用它。"
@@ -501,7 +512,8 @@ APP_SERVER = {
          "note": "0.15.0+: 设置思考强度 (动态值, 按模型 reasoning 能力; 实测 GLM-5.2: max/high/nothink)"},
         {"method": "session/updateRuntimeModelConfig", "params": "sessionId, runtimeModel, applyModelSelection?",
          "note": "0.15.0+: 运行时覆盖模型配置 (含 provider/providerOptions/thoughtLevel); "
-                 "0.16.1 存活, 但 schema 新要求 runtimeModel.revision (string) 必填"},
+                 "0.16.1 存活, 但 schema 新要求 runtimeModel.revision (string) 必填; "
+                 "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (2026-09-17 实测返 -32601)"},
         {"method": "session/rewindCascade", "params": "sessionId, target?, scope?, expectedRevision?",
          "note": "❌ 0.16 已移除 (调用返 -32601); 原为 0.15.0+ 级联回退 (与 rewind 同 schema)"},
         {"method": "session/setMode", "params": "sessionId, mode",
@@ -510,21 +522,29 @@ APP_SERVER = {
                  "mode.auto.unimplemented 拒绝, 勿当'智能自动批准'用"},
         # ----- 0.15.0 (App 3.2.0) 新增 workspace/* 方法 (按工作区定位, 非 session) -----
         {"method": "workspace/readState", "params": "workspace:{workspacePath,workspaceKey}, runtimeModel?",
-         "note": "0.15.0+: 读工作区状态 (settings/modelCatalog/slashCommands)"},
+         "note": "0.15.0+: 读工作区状态 (settings/modelCatalog/slashCommands); "
+                 "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (2026-09-17 实测返 -32601, 未搬家到 session/)"},
         {"method": "workspace/generateText", "params": "workspace, modelRef, prompt, querySource, maxOutputTokens?, temperature?",
-         "note": "0.15.0+: 一次性文本生成 (不建会话, 无 messages/tools)"},
+         "note": "0.15.0+: 一次性文本生成 (不建会话, 无 messages/tools); "
+                 "App 3.12.3 的 0.16.5 构建实测仍存活 (workspace/* 8 删 7 中唯一幸存)"},
         {"method": "workspace/setDefaultModel", "params": "workspace, model, runtimeModel?, expectedWorkspaceRevision?",
-         "note": "0.15.0+: 设工作区默认模型 (持久化, 乐观锁)"},
+         "note": "0.15.0+: 设工作区默认模型 (持久化, 乐观锁); "
+                 "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (实测返 -32601)"},
         {"method": "workspace/setDefaultMode", "params": "workspace, mode, expectedWorkspaceRevision?",
-         "note": "0.15.0+: 设工作区默认权限模式 (持久化)"},
+         "note": "0.15.0+: 设工作区默认权限模式 (持久化); "
+                 "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (实测返 -32601)"},
         {"method": "workspace/setDefaultThoughtLevel", "params": "workspace, thoughtLevel, expectedWorkspaceRevision?",
-         "note": "0.15.0+: 设工作区默认思考强度 (持久化)"},
+         "note": "0.15.0+: 设工作区默认思考强度 (持久化); "
+                 "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (实测返 -32601)"},
         {"method": "workspace/upsertModelProvider", "params": "workspace, provider, expectedWorkspaceRevision?",
-         "note": "0.15.0+: 新增/更新模型供应商 (provider 含 apiKey, 敏感)"},
+         "note": "0.15.0+: 新增/更新模型供应商 (provider 含 apiKey, 敏感); "
+                 "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (实测返 -32601)"},
         {"method": "workspace/removeModelProvider", "params": "workspace, providerId, expectedWorkspaceRevision?",
-         "note": "0.15.0+: 移除模型供应商"},
+         "note": "0.15.0+: 移除模型供应商; "
+                 "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (实测返 -32601)"},
         {"method": "workspace/updateProviderRegistry", "params": "workspace, registry, includeWorkspaceState?",
-         "note": "0.15.0+: 批量更新供应商注册表 (registry.providers 含 apiKey, 敏感)"},
+         "note": "0.15.0+: 批量更新供应商注册表 (registry.providers 含 apiKey, 敏感); "
+                 "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (实测返 -32601)"},
         # ----- App 3.3.0 新增 prompt/* 方法 (提示词增强); 0.16 已整族移除 -----
         {"method": "prompt/enhance", "params": "workspace:{workspacePath,workspaceKey}, sessionId?, prompt, context?",
          "result": "{enhanced}",
@@ -546,7 +566,9 @@ APP_SERVER = {
     "part_types": {
         "text": "Agent 文本回复",
         "tool": "工具调用 (含 callID/tool/state.{status,input,output})",
-        "reasoning": "推理过程 (仅 GLM-5-Turbo 产出, GLM-5.2 无)",
+        "reasoning": "推理过程 (仅 GLM-5-Turbo 产出, GLM-5.2 无; "
+                     "GLM-5-Turbo 已于 App 3.12.3 时代由服务端从 coding-plan provider "
+                     "下线, 此为历史观察)",
         "patch": "文件变更清单 (含 hash + files[], 但无 diff 内容)",
         "step-start": "步骤开始标记",
         "step-finish": "步骤结束 (含 cost/tokens)",
@@ -610,7 +632,9 @@ ECOSYSTEM = {
                 {"event": "tool_call/tool_call_update", "status": "✅ 实时 (事件驱动)"},
                 {"event": "usage_update", "status": "✅ 已验证"},
                 {"event": "agent_message_chunk", "status": "✅ 真流式 (model.streaming text_delta)"},
-                {"event": "agent_thought_chunk", "status": "✅ 流式 (GLM-5-Turbo reasoning_delta)"},
+                {"event": "agent_thought_chunk",
+                 "status": "✅ 流式 (GLM-5-Turbo reasoning_delta; 该模型已于 App 3.12.3 "
+                           "时代由服务端从 coding-plan provider 下线, 此为历史观察)"},
                 {"event": "plan", "status": "⚠️ 代码就位, 数据驱动"},
                 {"event": "diff (文件列表)", "status": "⚠️ 仅文件名无内容"},
             ],

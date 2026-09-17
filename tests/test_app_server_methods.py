@@ -25,7 +25,10 @@ session/requestRuntimePreferences (§3)、subscribe 必传 deliveryKind + 新事
   M   存活方法回归 (规格书 §2 存活清单: setThoughtLevel/setModel/setMode/
       cancelBackgroundTask/fork/goal/compact + workspace/*)
   D   已删方法降级: steer/rewind/rewindCascade → -32601「该版本不支持」文案
-      (prompt/enhance* 的降级见 test_prompt_enhance.py)
+      (prompt/enhance* 的降级见 test_prompt_enhance.py); D4-D6: App 3.12.3 的
+      同号 0.16.5 构建删 workspace/* 7/8 与 updateRuntimeModelConfig 后,
+      降级泛化为「透传方法后端 -32601 一律『已移除』文案, 非 -32601 不翻译」;
+      D7: 核心路径 (session/create) 的 -32601 属深度异常, 不套「已移除」文案
   Z   未知方法仍 -32601 (bridge 自身文案, 与降级文案区分)
 
 事实注记 (reviewer-1 0.16.1 真机抓帧, 对规格书 §4 信封描述的勘误): 事件判别
@@ -78,6 +81,17 @@ DELIVERY_KINDS = ("desktop-continuous", "web-remote-replayable")
 
 # 规格书 §2: 0.16.1 已从 bundle 删除的方法 (steer/rewind 系; prompt/enhance* 见另一文件)
 DELETED_SESSION_METHODS = ("session/steer", "session/rewind", "session/rewindCascade")
+
+# App 3.12.3 的 0.16.5 构建新删除的透传方法 (2026-09-17 实测, 两次确认): CLI
+# --version 仍为 0.16.5 (与 App 3.10.2 同号) 但构建内容漂移 — workspace/* 8 删 7
+# (仅 generateText 存活), 另删 session/updateRuntimeModelConfig。这些方法不在
+# 桥的预知清单里, 用于验证 -32601 降级已泛化为「只看错误码」(D4)。
+REMOVED_IN_3123_METHODS = [
+    "session/updateRuntimeModelConfig",
+    "workspace/readState", "workspace/setDefaultModel", "workspace/setDefaultMode",
+    "workspace/setDefaultThoughtLevel", "workspace/upsertModelProvider",
+    "workspace/removeModelProvider", "workspace/updateProviderRegistry",
+]
 
 # 规格书 §2 存活且实测仍在 bundle 的扩展方法 (回归锚; updateRuntimeModelConfig
 # 经 commander 0.16.1 实测确认存活 — schema 新要求 runtimeModel.revision 必填,
@@ -1258,6 +1272,104 @@ class TestAppServerMethods(unittest.TestCase):
             "error": {"code": -32601, "message": "Method not found"}}}})
         resp = self._call(bridge, "session/steer", {})
         self._assert_error_code(resp, -32601)
+
+    # ---------- D4-D6: -32601 降级泛化 (App 3.12.3 的 0.16.5 构建漂移, 2026-09-17) ----------
+    def test_d4_passthrough_removed_3123_methods(self):
+        """D4: 3.12.3 构建删除的透传方法 → -32601 + 「已移除」文案 (泛化降级)
+
+        App 3.12.3 内嵌 CLI --version 仍为 0.16.5 (与 App 3.10.2 同号) 但构建
+        漂移: workspace/* 8 删 7 (仅 generateText 存活) + updateRuntimeModelConfig
+        均实测返 -32601。这些方法不在桥原 _REMOVED_IN_016 硬编码清单里 — 泛化后
+        判定只看错误码, 未预知的删除同样得到「已移除」降级而非 -32603 原样透传
+        (调用方据 -32601 做版本判断; 透传原始 Method not found 无区分度)。
+        """
+        for m in REMOVED_IN_3123_METHODS:
+            with self.subTest(method=m):
+                bridge, _ = self._new_bridge({m: {"response": {
+                    "error": {"code": -32601, "message": "Method not found"}}}})
+                resp = self._call(bridge, m, {"sessionId": "sess_x",
+                                              "workspacePath": "/p",
+                                              "runtimeModel": {"revision": "r1"},
+                                              "model": {"modelId": "m"}, "mode": "yolo",
+                                              "thoughtLevel": "high",
+                                              "provider": {"models": [{"modelId": "m"}]},
+                                              "providerId": "p",
+                                              "registry": {"providers": []}})
+                self._assert_error_code(resp, -32601,
+                                        f"{m} 后端 -32601 应保持 -32601 返回")
+                self.assertIn("已移除", resp["error"]["message"],
+                              f"{m} 的 -32601 应映射为「已移除」文案, "
+                              f"实际: {resp['error']['message']}")
+                self.assertIn(m, resp["error"]["message"],
+                              f"{m} 降级文案应含方法名便于定位, "
+                              f"实际: {resp['error']['message']}")
+
+    def test_d5_passthrough_other_error_codes_kept_failed(self):
+        """D5: 非 -32601 错误码不翻译 — 仍 -32603 "zcode <短名> failed: 原文"
+
+        泛化只针对 -32601 (方法不存在); 参数错/内部错/限流等必须保留后端原文,
+        否则真实故障会被「已移除」文案掩盖。覆盖 -32603/-32000 与缺 code 的裸
+        error (FakeBackend 里部分脚本就这么写), 且短名与既有文案逐字一致
+        (session/fork→fork, workspace/readState→readState)。
+        """
+        cases = [
+            ("workspace/readState", {"code": -32603, "message": "boom"},
+             "zcode readState failed: boom"),
+            ("session/fork", {"code": -32000, "message": "rate limited"},
+             "zcode fork failed: rate limited"),
+            ("session/setThoughtLevel", {"message": "model has no reasoning levels"},
+             "zcode setThoughtLevel failed: model has no reasoning levels"),
+        ]
+        for method, err, want_prefix in cases:
+            with self.subTest(method=method, code=err.get("code")):
+                bridge, _ = self._new_bridge({method: {"response": {"error": err}}})
+                resp = self._call(bridge, method, {"sessionId": "sess_x",
+                                                   "workspacePath": "/p",
+                                                   "thoughtLevel": "high"})
+                self._assert_error_code(resp, -32603,
+                                        f"{method} 非 -32601 错误不得换码")
+                self.assertIn(want_prefix, resp["error"]["message"],
+                              f"{method} 应保留 failed 原文形态, "
+                              f"实际: {resp['error']['message']}")
+                self.assertNotIn("已移除", resp["error"]["message"],
+                                 f"{method} 非 -32601 不得套「已移除」文案")
+
+    def test_d6_steer_rewind_wording_regression(self):
+        """D6: steer/rewind/rewindCascade 既有降级回归 — 收编进 _passthrough_error 后不回退
+
+        原 _removed_method_error 依赖 _REMOVED_IN_016 硬编码清单; 泛化收编后
+        0.16 已删方法的行为必须不变: -32601 + 「已移除」文案 + 完整方法名
+        (D1 只断言「不支持」, 这里补齐「已移除」与方法名两个要素)。
+        """
+        for m in DELETED_SESSION_METHODS:
+            with self.subTest(method=m):
+                bridge, _ = self._new_bridge({m: {"response": {
+                    "error": {"code": -32601, "message": "Method not found"}}}})
+                resp = self._call(bridge, m, {"sessionId": "sess_x", "content": "hi"})
+                self._assert_error_code(resp, -32601)
+                self.assertIn("已移除", resp["error"]["message"],
+                              f"{m} 应保持「已移除」文案, 实际: {resp['error']['message']}")
+                self.assertIn(m, resp["error"]["message"],
+                              f"{m} 文案应含完整方法名, 实际: {resp['error']['message']}")
+
+    def test_d7_core_path_32601_not_masked(self):
+        """D7: 核心路径 (session/create) 后端 -32601 不被「已移除」文案掩盖
+
+        泛化的边界不变量: 只有透传/扩展方法走 _passthrough_error; 核心协议路径
+        (create/send/stop/list/resume) 的 -32601 属深度异常 (session/create 不在
+        后端都意味着桥的协议纪元判定已失效), 必须保留原始错误信息 — 本用例
+        钉死 session/new 在该场景下仍返回 -32603 + "zcode create failed" 原文,
+        不套「已移除」文案 (此前只有代码结构保证, 无测试拦截)。
+        """
+        bridge, _ = self._new_bridge({"session/create": {"response": {
+            "error": {"code": -32601, "message": "Method not found"}}}})
+        resp = self._call(bridge, "session/new", {"cwd": "/p"})
+        self._assert_error_code(resp, -32603,
+                                "核心路径 -32601 应保持 -32603 透传, 不得换码")
+        self.assertIn("zcode create failed", resp["error"]["message"],
+                      f"应保留 create failed 原文形态, 实际: {resp['error']['message']}")
+        self.assertNotIn("已移除", resp["error"]["message"],
+                         "核心路径 -32601 属深度异常, 不得套「已移除」文案")
 
     # ---------- Z: 未知方法 ----------
     def test_z1_unknown_method_32601(self):
