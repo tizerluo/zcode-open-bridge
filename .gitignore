@@ -23,6 +23,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# mimosa 插件钩子的本地会话状态 (zcode 会话在本目录工作时会自动生成)
+.mimosa/
+
 # 本地配置/凭证 (绝不提交)
 *.env
 .env.local
