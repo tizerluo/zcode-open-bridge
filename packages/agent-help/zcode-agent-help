@@ -329,14 +329,14 @@ NATIVE_CLI = {
         {"category": "agency", "name": "autonomous-tools", "supported": True,
          "description": "自主调用工具: 读写文件、Bash、Grep、Web 搜索等",
          "limitations": {"tool_allowlist": "帮助文案有 --allowed-tools, 0.16.1–0.16.5 实测均未接线 "
-                                           "(Unknown option; 含 App 3.10.2 与 3.12.3 两个 0.16.5 构建)",
+                                           "(Unknown option)",
                          "tool_denylist": "0.16.1+ 实测可用 (--disallowed-tools, 工具集级物理移除, yolo 也绕不过)",
                          "max_turns": "帮助文案有 --max-turns, 0.16.1–0.16.5 实测均未接线 "
-                                      "(Unknown option; 含 App 3.10.2 与 3.12.3 两个 0.16.5 构建)",
+                                      "(Unknown option)",
                          "max_budget": "不支持"}},
         {"category": "agency", "name": "tool-allowlist", "supported": False,
          "description": "工具白名单 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 "
-                        "(Unknown option; 含 App 3.10.2 与 3.12.3 两个 0.16.5 构建), 勿用",
+                        "(Unknown option), 勿用",
          "arg": "--allowed-tools <list>",
          "since": "0.16.1 (仅文案)"},
         {"category": "agency", "name": "tool-denylist", "supported": True,
@@ -348,7 +348,7 @@ NATIVE_CLI = {
          "since": "0.16.1"},
         {"category": "agency", "name": "max-turns", "supported": False,
          "description": "最大模型轮次 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 "
-                        "(Unknown option; 含 App 3.10.2 与 3.12.3 两个 0.16.5 构建), 勿用",
+                        "(Unknown option), 勿用",
          "arg": "--max-turns <n>",
          "since": "0.16.1 (仅文案)"},
         # 以下 5 项 0.16.5 help 实测在列, 引入版本未考, since 记 0.16.5

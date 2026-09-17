@@ -51,7 +51,8 @@ CLI 0.16.1 适配 (依据 docs/upgrade-0.16.1-spec.md, 全部经实测复核):
     明确文案「当前 ZCode 版本已移除该能力」(steer/rewind*/prompt/enhance* 于
     0.16 删除; App 3.12.3 的同号 0.16.5 构建又删 workspace/* 7/8 与
     updateRuntimeModelConfig — 版本号相同而构建漂移, 故不再依赖硬编码清单,
-    见 _passthrough_error)。
+    见 _passthrough_error)。核心协议路径 (create/send/stop/list/resume) 的
+    -32601 属深度异常, 保留原始错误透传, 不套该文案。
   - state.updated 的 patch 合并为状态投影 (供事件流停滞检查);
     v4/telemetry/event 忽略; session.titleUpdated 转 stderr 日志。
 
@@ -74,9 +75,6 @@ CLI 0.16.1 适配 (依据 docs/upgrade-0.16.1-spec.md, 全部经实测复核):
       docs/recheck-3.12.3.md)
   ✅ prompt/* 方法 (App 3.3.0+): enhance (同步) / enhance/start+result+cancel (异步 job)
      (于 0.16 移除)
-  透传/扩展方法的后端 -32601 一律按「已移除」降级 (_passthrough_error, 不再
-  硬编码方法清单); 核心协议路径 (create/send/stop/list/resume) 的 -32601 属
-  深度异常, 保留原始错误透传, 不套该文案。
 
 协议: ACP (JSON-RPC 2.0 over stdio) 对外; ZCode Protocol (无 jsonrpc 字段) 对内
 依赖: 仅 Python3 标准库

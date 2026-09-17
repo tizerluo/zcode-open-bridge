@@ -262,7 +262,7 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 | `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, modelId}` / `{sessionId, mode}` |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
 | `session/rewindCascade` ❌ | 级联回退（同 rewind schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
-| `session/updateRuntimeModelConfig` | 运行时覆盖模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}`（0.16 起 `runtimeModel.revision` 必填；App 3.12.3 的 0.16.5 构建已删该方法，实测 -32601） |
+| `session/updateRuntimeModelConfig` ❌ | 运行时覆盖模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}`（0.16 起 `runtimeModel.revision` 必填） |
 
 > ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除（steer 并入 `session/send`——turn 进行中发送即 steer；rewind 仅剩 slash 命令 `/rewind`），0.16.1 上调用会收到 `-32601`。
 >
