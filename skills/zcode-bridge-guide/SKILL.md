@@ -8,7 +8,7 @@ user-invocable: true
 # 驱动 ZCode（三模式通用说明书）
 
 > 本 skill 是 [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) 项目的配套说明书。
-> 兼容 ZCode CLI **0.14.5 ~ 0.16.1**（App 3.6.5，实测含 3.2.1~3.6.5）。新版功能（事件驱动真流式、fork/goal/compact、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`；`session/steer`、`session/rewind*`、`prompt/enhance*` 已于 0.16 移除，调用返回 `-32601`。
+> 兼容 ZCode CLI **0.14.5 ~ 0.16.5**（实测含 App 3.2.1~3.12.3）。新版功能（事件驱动真流式、fork/goal/compact、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`；`session/steer`、`session/rewind*`、`prompt/enhance*` 已于 0.16 移除，调用返回 `-32601`。⚠️ App 3.12.3 的 0.16.5 构建（版本号未变、内容漂移）进一步删除了 workspace/* 面 7/8 方法与 `session/updateRuntimeModelConfig`（详见下文方法表注记与版本表）。
 
 ## 前置条件
 
@@ -268,14 +268,14 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 >
 > ℹ️ **0.16 schema 变更**：`session/updateRuntimeModelConfig` 在 0.16.1 仍存活（实测），但 schema 新要求 `runtimeModel.revision`（string）必填。
 
-**workspace 级扩展方法**（0.15.0+）：
+**workspace 级扩展方法**（0.15.0+；❌ 除 `generateText` 外已于 **App 3.12.3 的 0.16.5 构建**移除，调用返回 `-32601`「已移除该能力」）：
 
 | 方法 | 作用 | params |
 |------|------|--------|
-| `workspace/readState` | 读工作区状态（模型目录/设置） | `{workspace, runtimeModel?}` |
-| `workspace/generateText` | 一次性文本生成（不建会话） | `{workspace, modelRef, prompt, querySource, ...}` |
-| `workspace/setDefaultModel` / `setDefaultMode` / `setDefaultThoughtLevel` | 设工作区默认值（持久化） | `{workspace, model\|mode\|thoughtLevel, expectedWorkspaceRevision?}` |
-| `workspace/upsertModelProvider` / `removeModelProvider` / `updateProviderRegistry` | 管理模型供应商（含 apiKey，敏感） | `{workspace, provider\|providerId\|registry, ...}` |
+| `workspace/readState` | 读工作区状态（模型目录/设置）❌ 3.12.3 已删 | `{workspace, runtimeModel?}` |
+| `workspace/generateText` | 一次性文本生成（不建会话）—— 3.12.3 唯一幸存 | `{workspace, modelRef, prompt, querySource, ...}` |
+| `workspace/setDefaultModel` / `setDefaultMode` / `setDefaultThoughtLevel` | 设工作区默认值（持久化）❌ 3.12.3 已删 | `{workspace, model\|mode\|thoughtLevel, expectedWorkspaceRevision?}` |
+| `workspace/upsertModelProvider` / `removeModelProvider` / `updateProviderRegistry` | 管理模型供应商（含 apiKey，敏感）❌ 3.12.3 已删 | `{workspace, provider\|providerId\|registry, ...}` |
 
 **prompt 级扩展方法**（App 3.3.0 引入；❌ **0.16 已全部移除**，无替代）：
 
@@ -427,6 +427,8 @@ npm test     # 全量，看实际数字
 
 | ZCode CLI 版本 | 支持情况 | 差异 |
 |:--------------:|:--------:|------|
+| **0.16.5** (App 3.12.3，同号构建漂移) | ✅ 完整（核心面） | session/* 核心面不变；workspace/* 删 7/8 仅 `generateText` 幸存，`session/updateRuntimeModelConfig`、`updateInteractionPreferences` 已删——桥统一翻译为 `-32601`「已移除该能力」（见 docs/recheck-3.12.3.md） |
+| **0.16.5** (App 3.10.2) | ✅ 完整 | 与 0.16.1 同面 + `automation/*` 全族删除（桥未使用，无影响） |
 | **0.16.1** (App 3.6.5) | ✅ 完整 | ACP bridge 真流式；session/* + workspace/* 可用（steer/rewind*/prompt/enhance* 已于 0.16 移除；updateRuntimeModelConfig 存活但 `runtimeModel.revision` 必填） |
 | **0.15.x** (App 3.5.x) | ✅ 完整 | ACP bridge 真流式；扩展方法同 0.15.0 行（App 功能面：3.5.2 内置网页应用、PDF 预览，见规格书 changelog） |
 | **0.15.x** (App 3.4.x) | ✅ 完整 | ACP bridge 真流式；扩展方法同 0.15.0 行（App 功能面：3.4.2 定时任务 cron、Kimi K3，见规格书 changelog） |
