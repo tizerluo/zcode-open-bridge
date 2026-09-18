@@ -48,8 +48,10 @@ VERSION = "0.1.0"
 DEFAULT_CONFIG_PATH = "~/.config/zcode-review-gate/config.json"
 DEFAULT_STATE_FILE = "~/.local/state/zcode-review-gate/state.json"
 DEFAULT_CLONE_ROOT = "~/.local/state/zcode-review-gate/clones"
+DEFAULT_REPORTS_DIR = "~/.local/state/zcode-review-gate/reports"
 DEFAULT_MCP_SERVER = "zcode-mcp-server"
 DEFAULT_GITHUB_API = "https://api.github.com"
+MAX_REPORTS_KEPT = 50
 
 HTTP_TIMEOUT = 30           # GitHub API 单请求超时 (秒)
 GIT_TIMEOUT = 120           # 单条 git 命令超时 (秒; fetch/rev-parse 等)
@@ -64,13 +66,26 @@ PULLS_MAX_PAGES = 10        # 分页兜底: 单仓 open PR 超过 1000 个极罕
 VERDICT_SCAN_HEAD = 3000    # verdict 只扫报告前 N 字符 (汇总段在开头, 防正文干扰)
 MIN_COMMENT_BODY = 2000     # comment.max_body 下限 (小于模板开销的极端配置钳到这)
 
+# 尾段预算推算依据 (#32 保尾截断):
+# 1. zob-verdict marker 形态:
+#    <!-- zob-verdict:{"P0":<d{1,9}>,"P1":<d{1,9}>,"P2":<d{1,9}>,"P3":<d{1,9}>,"merge":<bool>} -->
+#    最长约 96 字符。
+# 2. VERDICT 行形态:
+#    VERDICT: P0=<d{1,9}> P1=<d{1,9}> P2=<d{1,9}> P3=<d{1,9}> MERGE=<yes|no>
+#    最长约 70 字符。
+# 3. 尾部换行与上下文容差: ~100 字符。合计必需空间约 270 字符。
+# 取 TRUNC_TAIL_BUDGET = 1024 (1KB), 远大于 270 字符必需空间,
+# 且 MIN_COMMENT_BODY (2000) 扣除模板开销 (~400) 与截断标记后仍留有 ~1570 字符预算,
+# 1024 预算既能牢牢罩住尾部 VERDICT + marker, 又能给头部保留数百字符摘要上下文。
+TRUNC_TAIL_BUDGET = 1024
+
 # 严重度分布解析 (issue #16): 优先读报告尾的 zob-verdict 结构化标记 —
-# 由 mcp-server 侧从严格单行 "VERDICT: P0=n P1=n P2=n MERGE=yes|no" 结论
-# 转写, 解析端直读不猜。只认完整注释形态 (<!-- ... -->) 且取**最后一个**
+# 由 mcp-server 侧从严格单行 "VERDICT: P0=n P1=n P2=n P3=n MERGE=yes|no"
+# 结论转写, 解析端直读不猜。只认完整注释形态 (<!-- ... -->) 且取**最后一个**
 # 匹配: 真标记由 mcp-server 恒定追加在文末, 正文里被复述/预埋的标记串
 # (狗食 review P1-1: 被审 PR 可伪造) 排在真标记之前, 不采信。
-# 无标记再退回正文正则 (下方三段)。
-# 正文正则: 在报告开头找 "P0 ... <数字>" 三段。确定性 fail-safe: 宁可
+# 无标记再退回正文正则 (下方四段; P3 段缺省计 0, 兜容旧三桶报告)。
+# 正文正则: 在报告开头找 "P0 ... <数字>" 四段。确定性 fail-safe: 宁可
 # 解析失败标"需人工核对", 也不猜。P 必须大写 (不用 IGNORECASE),
 # 防正文里 "p0" 之类的偶然命中。
 # [^\dP] 排除 P 是关键: "P0/P1/P2 各 0/0/2" 枚举格式里 P0 后面紧跟
@@ -81,12 +96,18 @@ MIN_COMMENT_BODY = 2000     # comment.max_body 下限 (小于模板开销的极�
 # 超长数字串一律不构成合法标记/计数 (finding 数到十亿不现实)。
 _RE_ZOB_VERDICT = re.compile(
     r"<!-- zob-verdict:\{\"P0\":(\d{1,9}),\"P1\":(\d{1,9}),\"P2\":(\d{1,9}),"
-    r"\"merge\":(true|false)\} -->")
+    r"(?:\"P3\":(\d{1,9}),)?\"merge\":(true|false)\} -->")
 _RE_P0 = re.compile(r"P0[^\dP]{0,12}(\d{1,9})(?!\d)")
 _RE_P1 = re.compile(r"P1[^\dP]{0,12}(\d{1,9})(?!\d)")
 _RE_P2 = re.compile(r"P2[^\dP]{0,12}(\d{1,9})(?!\d)")
+_RE_P3 = re.compile(r"P3[^\dP]{0,12}(\d{1,9})(?!\d)")
 
-_TRUNC_MARK = "\n\n[... 报告超长已截断 ...]"
+_TRUNC_MARK = "\n\n[... 报告超长已截断 ...]\n\n"
+
+# 报告文件名形态 (轮转白名单): <owner>__<repo>#<pr>-<sha12>.md — owner/repo
+# 允许字母数字._-。轮转只认这个形状: reports_dir 被运维指到已有内容的目录
+# 也不误删无关文件; 落盘中转文件 <名>.tmp.<pid> 不以 .md 结尾, 天然跳过。
+_RE_REPORT_FILE = re.compile(r"^[A-Za-z0-9_.-]+#[0-9]+-[0-9a-f]{12}\.md\Z")
 
 # 1308 额度防撞墙 (F6)
 _RE_QUOTA_1308 = re.compile(
@@ -157,13 +178,20 @@ def _as_int(value, default):
         return default
 
 
+def derive_reports_dir(state_file):
+    """state 同目录派生 reports/; 裸文件名 dirname 为空时回退默认目录。"""
+    state_dir = os.path.dirname(state_file)
+    return (os.path.join(state_dir, "reports") if state_dir
+            else os.path.expanduser(DEFAULT_REPORTS_DIR))
+
+
 class GateConfig:
     """运行配置: 全部键可选有默认值; env 覆盖见 apply_env_overrides。
 
     对应配置文件 (JSON):
-      repos / poll_interval_seconds / state_file / clone_root / mcp_server /
-      github_api / review.{depth,focus} / retry.{base_seconds,max_seconds,
-      max_attempts} / comment.{enabled,max_body}
+      repos / poll_interval_seconds / state_file / clone_root / reports_dir /
+      mcp_server / github_api / review.{depth,focus} / retry.{base_seconds,
+      max_seconds,max_attempts} / comment.{enabled,max_body}
     """
 
     def __init__(self, data):
@@ -176,6 +204,15 @@ class GateConfig:
             data.get("state_file") or DEFAULT_STATE_FILE)
         self.clone_root = os.path.expanduser(
             data.get("clone_root") or DEFAULT_CLONE_ROOT)
+        # 配置文件是否显式给了 reports_dir — env 的 GATE_STATE_FILE 派生
+        # 不得碾掉显式配置 (优先级: GATE_REPORTS_DIR > 显式配置 > 派生)
+        self._reports_dir_explicit = bool(data.get("reports_dir"))
+        if self._reports_dir_explicit:
+            self.reports_dir = os.path.expanduser(data["reports_dir"])
+        else:
+            self.reports_dir = derive_reports_dir(self.state_file)
+        self.reports_max_kept = max(
+            _as_int(data.get("reports_max_kept"), MAX_REPORTS_KEPT), 1)
         self.mcp_server = data.get("mcp_server") or DEFAULT_MCP_SERVER
         self.github_api = (data.get("github_api")
                            or DEFAULT_GITHUB_API).rstrip("/")
@@ -210,6 +247,14 @@ class GateConfig:
             self.state_file = os.path.expanduser(env["GATE_STATE_FILE"])
         if env.get("GATE_CLONE_ROOT"):
             self.clone_root = os.path.expanduser(env["GATE_CLONE_ROOT"])
+        if env.get("GATE_REPORTS_DIR"):
+            self.reports_dir = os.path.expanduser(env["GATE_REPORTS_DIR"])
+        elif env.get("GATE_STATE_FILE") and not self._reports_dir_explicit:
+            # 仅当配置文件未显式给 reports_dir 才派生 (显式配置优先)
+            self.reports_dir = derive_reports_dir(self.state_file)
+        if env.get("GATE_REPORTS_MAX_KEPT"):
+            self.reports_max_kept = max(
+                _as_int(env["GATE_REPORTS_MAX_KEPT"], self.reports_max_kept), 1)
         if env.get("GATE_MCP_SERVER"):
             self.mcp_server = env["GATE_MCP_SERVER"]
         if env.get("GATE_POLL_INTERVAL"):
@@ -593,22 +638,24 @@ def run_review(cfg, clone, base_ref, head_sha):
 # verdict 解析 (确定性, fail-safe)
 # ============================================================
 def parse_verdict_marker(report):
-    """读 zob-verdict 标记, 返回 ((P0, P1, P2), merge) 或 None。
+    """读 zob-verdict 标记, 返回 ((P0, P1, P2, P3), merge) 或 None。
 
     只认完整注释形态且取最后一个匹配 — 真标记由 mcp-server 恒定追加在
     文末 (且 mcp-server 侧已对正文标记引用消毒), 正文靠前的伪造标记
     不采信 (狗食 review P1-1)。
+    向后兼容: 旧格式无 P3 键时 P3 缺省计 0。
     """
     matches = list(_RE_ZOB_VERDICT.finditer(report or ""))
     if not matches:
         return None
     m = matches[-1]
-    return ((int(m.group(1)), int(m.group(2)), int(m.group(3))),
-            m.group(4) == "true")
+    p3 = int(m.group(4) or 0)
+    return ((int(m.group(1)), int(m.group(2)), int(m.group(3)), p3),
+            m.group(5) == "true")
 
 
 def parse_severity_counts(report):
-    """解析 (P0, P1, P2) 条数; 任一缺失 → None。
+    """解析 (P0, P1, P2, P3) 条数; P0/P1/P2 任一缺失 → None, P3 缺省计 0。
 
     优先读报告尾的 zob-verdict 结构化标记 (issue #16: mcp-server 侧从
     严格单行 VERDICT 结论转写, 取最后一个完整注释形态匹配); 无标记退回
@@ -624,6 +671,8 @@ def parse_severity_counts(report):
         if not m:
             return None
         counts.append(int(m.group(1)))
+    m_p3 = _RE_P3.search(head)
+    counts.append(int(m_p3.group(1)) if m_p3 else 0)
     return tuple(counts)
 
 
@@ -643,11 +692,13 @@ def verdict_from_counts(counts, merge_from_marker=None):
 
 
 def build_comment_body(verdict, counts, head_sha, report, max_body):
-    """拼 GitHub 评论 markdown; 超 max_body 时截断报告正文并标注。
+    """拼 GitHub 评论 markdown; 超 max_body 时掐中段保首尾截断报告正文。
 
     max_body 默认 60000, 低于 GitHub 评论 65536 硬上限留余量; 只截报告
     正文, 头部的 verdict 表格与尾部署名永远完整。max_body 钳下限
     MIN_COMMENT_BODY: 小于模板开销的极端配置不至于截出残破 markdown。
+    保尾逻辑: report 头预算段 + 截断标记 + report 尾预算段, 确保文末的
+    VERDICT 行与 zob-verdict marker 存活供下游复核与解析。
     """
     max_body = max(_as_int(max_body, 60000), MIN_COMMENT_BODY)
 
@@ -655,7 +706,9 @@ def build_comment_body(verdict, counts, head_sha, report, max_body):
         icon = {"pass": "✅ pass", "concerns": "⚠️ concerns"}.get(
             verdict, "❓ 需人工核对")
         if counts is not None:
-            sev = f"P0 × {counts[0]} · P1 × {counts[1]} · P2 × {counts[2]}"
+            # len 守卫必须留: 旧 state 三长 counts (无 P3 桶) 会流入
+            p3 = counts[3] if len(counts) > 3 else 0
+            sev = f"P0 × {counts[0]} · P1 × {counts[1]} · P2 × {counts[2]} · P3 × {p3}"
         else:
             sev = "解析失败（结构化标记与正文汇总均未解析出，请人工核对）"
         conclusion = {
@@ -686,8 +739,14 @@ def build_comment_body(verdict, counts, head_sha, report, max_body):
     body = assemble(report)
     if len(body) <= max_body:
         return body
+    # 剥旧截断标记防重试评论双标记: comment_failed 缓存本身已带一个
+    # _TRUNC_MARK (保尾截断), 这里再截断若不剥会出现两个「已截断」标记
+    report = (report or "").replace(_TRUNC_MARK, "")
     budget = max(max_body - len(assemble("")) - len(_TRUNC_MARK), 0)
-    return assemble(report[:budget] + _TRUNC_MARK)
+    tail_budget = min(TRUNC_TAIL_BUDGET, budget)
+    head_budget = max(budget - tail_budget, 0)
+    tail_part = (report or "")[-tail_budget:] if tail_budget > 0 else ""
+    return assemble((report or "")[:head_budget] + _TRUNC_MARK + tail_part)
 
 
 # ============================================================
@@ -697,7 +756,8 @@ class StateStore:
     """PR 审查状态 (JSON 文件, 原子写: 同目录 tmp + os.replace)。
 
     形状: {"prs": {"owner/repo#5": {head_sha, status, verdict, counts,
-    report, attempts, next_retry_at, reviewed_at, comment_url, error}}}
+    report, report_path, attempts, next_retry_at, reviewed_at, comment_url,
+    error}}}
     status ∈ pending|reviewed|failed|comment_failed|gave_up:
       pending        — 一轮处理中的瞬态; 崩溃残留时下轮自然恢复
       failed         — 审查链路失败 (git/审查子进程), 进退避
@@ -705,8 +765,10 @@ class StateStore:
                        重试时同 head 只补评论, 不重跑昂贵的 zcode
       reviewed       — 评论已发出 (或评论被禁用); report 缓存随即清空
       gave_up        — attempts 达上限; 同 head 不再动, 新 head 才复活
-    report 只存评论失败期间的缓存 (截断到 comment.max_body), reviewed 后
-    置 None 防 state 膨胀。
+    report 只存评论失败期间的缓存 (超长时掐中段保首尾截断到
+    comment.max_body, 尾部 VERDICT 行与标记存活), reviewed 后置 None 防
+    state 膨胀。report_path 为成功审查落盘的原文路径 (reports/ 下),
+    None = 落盘失败或旧 state 条目。
     """
 
     def __init__(self, path):
@@ -840,8 +902,78 @@ def mark_failure(entry, error, now, cfg, status="failed"):
             f"{int(delay)}s 后重试: {entry['error'][:200]}")
 
 
+def rotate_reports(reports_dir, max_kept=MAX_REPORTS_KEPT):
+    """reports/ 目录轮转: 只对匹配报告命名模式的文件留近 max_kept 份,
+    超出删最旧 (mtime 序)。目录里的无关文件与 tmp 中转残留一律不碰
+    (reports_dir 被指到已有内容的目录不误删别人的东西)。"""
+    if not os.path.isdir(reports_dir):
+        return
+    entries = []
+    for fname in os.listdir(reports_dir):
+        if fname.startswith(".") or not _RE_REPORT_FILE.match(fname):
+            continue
+        fpath = os.path.join(reports_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            entries.append((os.path.getmtime(fpath), fpath))
+        except OSError:
+            continue
+    entries.sort(key=lambda x: x[0])
+    num_to_delete = len(entries) - max_kept
+    if num_to_delete > 0:
+        for _, path_to_del in entries[:num_to_delete]:
+            try:
+                os.remove(path_to_del)
+            except OSError as e:
+                log(f"清理旧报告 {path_to_del} 失败: {e}", "WARNING")
+
+
+def save_report_and_rotate(reports_dir, owner, repo, pr_number, head_sha, report,
+                           max_kept=MAX_REPORTS_KEPT):
+    """成功审查落盘原始报告并轮转保留近 max_kept 份。
+
+    路径: <reports_dir>/<owner>__<repo>#<pr>-<sha12>.md (目录名消毒规则照仓内既有惯例)
+    失败不影响主流程, 记 warning 日志。
+    返回落盘绝对路径 (成功) 或 None (失败/无报告)。
+    """
+    if not report:
+        return None
+    tmp_path = None
+    try:
+        os.makedirs(reports_dir, exist_ok=True)
+        filename = f"{owner}__{repo}#{pr_number}-{head_sha[:12]}.md"
+        report_path = os.path.join(reports_dir, filename)
+        tmp_path = report_path + f".tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(report)
+        os.replace(tmp_path, report_path)
+    except Exception as e:
+        # 捕 Exception 不只 OSError: utf-8 文本写遇孤立代理字符抛
+        # UnicodeEncodeError (ValueError 子类), 上抛会把成功审查整体炸掉
+        # (缓存没写/评论没发/烧满重试), 违背「失败不影响主流程」契约
+        log(f"报告落盘失败 ({reports_dir}): {e}", "WARNING")
+        if tmp_path:  # best-effort 清理写一半的中转残留
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return None
+
+    try:
+        rotate_reports(reports_dir, max_kept=max_kept)
+    except Exception as e:
+        log(f"报告轮转失败 ({reports_dir}): {e}", "WARNING")
+
+    return report_path
+
+
 def mark_reviewed(entry, verdict, comment_url):
-    """审查+评论完成: 落 verdict 与时间戳, attempts 归零。"""
+    """审查+评论完成: 落 verdict 与时间戳, attempts 归零。
+
+    report_path 不在此落: 审查成功后已提前写入 entry (与评论成败解耦),
+    这里再传一遍只会用缓存路径覆盖, 无信息增量。
+    """
     entry["status"] = "reviewed"
     entry["verdict"] = verdict
     entry["error"] = ""
@@ -959,7 +1091,7 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
         entry = None        # head 变化 → 换新 entry, attempts/缓存随之清零
     if entry is None:
         entry = {"head_sha": head_sha, "status": "pending", "verdict": None,
-                 "counts": None, "report": None,
+                 "counts": None, "report": None, "report_path": None,
                  "attempts": 0, "next_retry_at": 0.0, "reviewed_at": "",
                  "comment_url": "", "error": ""}
         state.put(key, entry)
@@ -1026,10 +1158,26 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
                 and counts[0] == 0 and counts[1] == 0:
             log(f"{key}: verdict=concerns (标记 merge=no, 全 0 计数不给 pass)")
         else:
+            # 此处 counts 恒为新鲜 4 元组 (旧 state 三长走缓存重试分支,
+            # 到不了这行), 无需 len 守卫 (对照 build_comment_body)
             log(f"{key}: verdict={verdict} "
-                f"(P0={counts[0]} P1={counts[1]} P2={counts[2]})")
-        # 缓存审查结果: 万一评论失败, 下轮同 head 只补评论不重审
-        entry["report"] = report[: cfg.comment_max_body]
+                f"(P0={counts[0]} P1={counts[1]} P2={counts[2]} P3={counts[3]})")
+        # 落盘与评论成败解耦 (#33): 审查成功即存完整原文, 评论失败/gave_up/
+        # 评论禁用场景都天然有原文可查 (save 内部自捕一切异常, 不外抛)
+        entry["report_path"] = save_report_and_rotate(
+            cfg.reports_dir, owner, repo, info["number"], head_sha, report,
+            max_kept=cfg.reports_max_kept)
+        # 缓存审查结果: 万一评论失败, 下轮同 head 只补评论不重审。缓存按
+        # 保尾规则截断 (#32 症状在重试路径的翻版): 尾预算罩住 VERDICT 行与
+        # zob-verdict 标记, build_comment_body 对缓存再截断时尾部仍存活;
+        # cap 小到罩不住尾预算+截断标记时退纯头截断兜底
+        cap = cfg.comment_max_body
+        if len(report) > cap and cap > TRUNC_TAIL_BUDGET + len(_TRUNC_MARK):
+            entry["report"] = (
+                report[: cap - len(_TRUNC_MARK) - TRUNC_TAIL_BUDGET]
+                + _TRUNC_MARK + report[-TRUNC_TAIL_BUDGET:])
+        else:
+            entry["report"] = report[:cap]
         entry["verdict"] = verdict
         entry["counts"] = list(counts) if counts is not None else None
 

@@ -1551,18 +1551,18 @@ def tool_zcode_pr_review(args):
             f"(base={base} → {head}, 改动 {len(changed)} 个文件) ② mimosa 安全扫描结果"
             f"(depth={depth}, 业务逻辑复核优先聚焦本次改动文件{findings_scope_note})。\n"
             "任务:\n"
-            "1. 审查 diff 中新引入的问题, 按 P0(阻断合并)/P1(应修)/P2(建议) 分级,"
+            "1. 审查 diff 中新引入的问题, 按 P0(阻断合并)/P1(应修)/P2(建议)/P3(提示) 分级,"
             "每个问题含文件位置/判定依据/修复建议。重点是'新引入';"
-            "存量老问题不阻断本次合并的, 标为 P2 提示即可。\n"
+            "存量老问题不阻断本次合并的, 标为 P2/P3 提示即可。\n"
             "2. 核实 mimosa findings: 逐条判定【确认漏洞】/【误报】/【存疑】,"
             "优先核实落在改动文件里的; 每条给出依据 (攻击路径或为何不可利用)。\n"
             "3. 可以用只读工具 (Read/Grep/Glob) 阅读仓库代码获取上下文。\n"
             "规则: 绝对不要修改、创建或删除任何文件 (写/执行工具已被物理禁用);"
             "不要提出\"帮你修复\"的提议; 只输出审查报告。\n"
-            "输出格式: 先给汇总 (P0/P1/P2 各几条 + findings 确认/误报/存疑各几条"
+            "输出格式: 先给汇总 (P0/P1/P2/P3 各几条 + findings 确认/误报/存疑各几条"
             " + 能否合并的结论), 再逐条详述。用中文。\n"
             "报告最后一行必须是严格的单行结论 (供机器解析, 字段不得增删改名):\n"
-            "VERDICT: P0=<非负整数> P1=<非负整数> P2=<非负整数> MERGE=<yes|no>"
+            "VERDICT: P0=<非负整数> P1=<非负整数> P2=<非负整数> P3=<非负整数> MERGE=<yes|no>"
         )
         if focus:
             prompt += f"\n额外审查重点: {focus}。"
@@ -1606,7 +1606,7 @@ def tool_zcode_pr_review(args):
 
 _RE_FINAL_VERDICT = re.compile(
     r"^\s*VERDICT:\s*P0\s*=\s*(\d{1,9})\s+P1\s*=\s*(\d{1,9})\s+"
-    r"P2\s*=\s*(\d{1,9})\s+MERGE\s*=\s*(yes|no)\s*$",
+    r"P2\s*=\s*(\d{1,9})\s+(?:P3\s*=\s*(\d{1,9})\s+)?MERGE\s*=\s*(yes|no)\s*$",
     re.IGNORECASE,
 )
 
@@ -1617,7 +1617,7 @@ _RE_FINAL_VERDICT = re.compile(
 # (Python ≥3.11 整数转换上限), 整次审查作废并烧满 gate 侧 5 次重审 (P2-4)。
 _RE_ZOB_MARK_LINE = re.compile(
     r"^<!-- zob-verdict:\{\"P0\":(\d{1,9}),\"P1\":(\d{1,9}),\"P2\":(\d{1,9}),"
-    r"\"merge\":(true|false)\} -->$")
+    r"(?:\"P3\":(\d{1,9}),)?\"merge\":(true|false)\} -->$")
 # 正文中出现的完整注释形态标记 (被审代码可预埋) → 无条件消毒, 保证到达
 # 下游的任何完整形态标记必然出自本文末追加 (狗食二轮 review P1-1: 兜底
 # 路径同样不放行)。{0,200} 限界 (P2-3): 无界惰性量词最坏 O(n²), MB 级
@@ -1660,7 +1660,8 @@ def _verdict_marker_consistent(vm, zm):
     return (int(vm.group(1)) == int(zm.group(1))
             and int(vm.group(2)) == int(zm.group(2))
             and int(vm.group(3)) == int(zm.group(3))
-            and ((vm.group(4).lower() == "yes") == (zm.group(4) == "true")))
+            and int(vm.group(4) or 0) == int(zm.group(4) or 0)
+            and ((vm.group(5).lower() == "yes") == (zm.group(5) == "true")))
 
 
 def _append_verdict_marker(text):
@@ -1668,10 +1669,10 @@ def _append_verdict_marker(text):
 
     review-gate 之前靠正则猜报告正文的 P0/P1/P2 汇总计数, 报告格式稍变即
     误读 (把表头/枚举句里的数字当计数) 或读不到 (fallback"解析失败")。
-    prompt 已要求报告以严格单行 "VERDICT: P0=n P1=n P2=n MERGE=yes|no"
+    prompt 已要求报告以严格单行 "VERDICT: P0=n P1=n P2=n P3=n MERGE=yes|no"
     收尾; 结论行命中则在文末追加 HTML 注释标记 (GitHub 评论里不渲染, 人读
     无感):
-        <!-- zob-verdict:{"P0":0,"P1":2,"P2":3,"merge":false} -->
+        <!-- zob-verdict:{"P0":0,"P1":2,"P2":3,"P3":0,"merge":false} -->
 
     防伪造 (被审 PR 作者可预埋标记/结论行骗下游, 狗食两轮 review 攻防):
     - **位置契约**: 只认全文最后一个非空行为结论行 (prompt 规定结论收尾)。
@@ -1719,10 +1720,11 @@ def _append_verdict_marker(text):
         return body
     p0, p1, p2 = int(verdict_m.group(1)), int(verdict_m.group(2)), \
         int(verdict_m.group(3))
-    merge = "true" if verdict_m.group(4).lower() == "yes" else "false"
-    marker = (f'<!-- zob-verdict:{{"P0":{p0},"P1":{p1},"P2":{p2},'
+    p3 = int(verdict_m.group(4) or 0)
+    merge = "true" if verdict_m.group(5).lower() == "yes" else "false"
+    marker = (f'<!-- zob-verdict:{{"P0":{p0},"P1":{p1},"P2":{p2},"P3":{p3},'
               f'"merge":{merge}}} -->')
-    log(f"verdict 标记已附注: P0={p0} P1={p1} P2={p2} merge={merge} "
+    log(f"verdict 标记已附注: P0={p0} P1={p1} P2={p2} P3={p3} merge={merge} "
         f"(消毒正文标记引用 {n_marks} 处)")
     return body.rstrip("\n") + "\n" + marker
 

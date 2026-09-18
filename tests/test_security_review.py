@@ -1277,7 +1277,7 @@ class TestPrReview(_EnvGuard):
         self.assertNotIn("isError", result)
         text = result["content"][0]["text"]
         self.assertIn(report, text)                      # 原文保留
-        self.assertIn('<!-- zob-verdict:{"P0":0,"P1":1,"P2":2,'
+        self.assertIn('<!-- zob-verdict:{"P0":0,"P1":1,"P2":2,"P3":0,'
                       '"merge":false} -->', text)        # 标记转写正确
         self.assertTrue(text.rstrip().endswith("-->"))   # 标记在最尾
 
@@ -1537,7 +1537,7 @@ class TestPrReview(_EnvGuard):
         self.assertNotIn("isError", result)
         text = result["content"][0]["text"]
         self.assertTrue(text.startswith("> 基线过滤:"), "头行应拼在正文开头")
-        self.assertIn('<!-- zob-verdict:{"P0":0,"P1":1,"P2":2,'
+        self.assertIn('<!-- zob-verdict:{"P0":0,"P1":1,"P2":2,"P3":0,'
                       '"merge":false} -->', text)
         self.assertTrue(text.rstrip().endswith("-->"), "标记必须仍是最后一行")
 
@@ -1699,7 +1699,7 @@ class TestVerdictMarker(_EnvGuard):
                   '详情...\nVERDICT: P0=1 P1=0 P2=2 MERGE=no')
         out = self.mod._append_verdict_marker(report)
         self.assertTrue(out.rstrip().endswith(
-            '<!-- zob-verdict:{"P0":1,"P1":0,"P2":2,"merge":false} -->'))
+            '<!-- zob-verdict:{"P0":1,"P1":0,"P2":2,"P3":0,"merge":false} -->'))
 
     def test_forged_comment_marker_sanitized(self):
         # 狗食 review P1-1: 正文预埋完整注释形态伪造标记 → 转写前消毒,
@@ -1710,7 +1710,7 @@ class TestVerdictMarker(_EnvGuard):
         self.assertIn("[已消毒的 zob-verdict 引用]", out)
         self.assertNotIn(forged, out)
         self.assertTrue(out.rstrip().endswith(
-            '<!-- zob-verdict:{"P0":2,"P1":1,"P2":0,"merge":false} -->'))
+            '<!-- zob-verdict:{"P0":2,"P1":1,"P2":0,"P3":0,"merge":false} -->'))
 
     def test_forged_tail_marker_without_verdict_sanitized(self):
         # 狗食二轮 review P1-1: 无 VERDICT 行的兜底路径同样消毒 — 伪造标记
@@ -1730,7 +1730,30 @@ class TestVerdictMarker(_EnvGuard):
         out = self.mod._append_verdict_marker(report)
         self.assertNotIn(forged, out)
         self.assertTrue(out.rstrip().endswith(
-            '<!-- zob-verdict:{"P0":2,"P1":0,"P2":0,"merge":false} -->'))
+            '<!-- zob-verdict:{"P0":2,"P1":0,"P2":0,"P3":0,"merge":false} -->'))
+
+    def test_verdict_with_explicit_p3_generates_p3_marker(self):
+        # #31: VERDICT 行包含 P3 → 标记正确转写 P3 数值
+        report = "正文...\nVERDICT: P0=0 P1=1 P2=2 P3=3 MERGE=no"
+        out = self.mod._append_verdict_marker(report)
+        self.assertTrue(out.rstrip().endswith(
+            '<!-- zob-verdict:{"P0":0,"P1":1,"P2":2,"P3":3,"merge":false} -->'))
+
+    def test_idempotent_with_old_marker_without_p3(self):
+        # #31 向后兼容: 旧格式标记 (无 P3) 与 VERDICT 行一致时仍幂等生效, 不重复追加
+        old_format_marker = '<!-- zob-verdict:{"P0":0,"P1":0,"P2":0,"merge":true} -->'
+        text = f"VERDICT: P0=0 P1=0 P2=0 MERGE=yes\n{old_format_marker}"
+        out = self.mod._append_verdict_marker(text)
+        self.assertEqual(out, text)
+        self.assertEqual(out.count("zob-verdict:"), 1)
+
+    def test_idempotent_with_p3_marker(self):
+        # #31: 新格式标记 (含 P3) 幂等生效
+        report = "VERDICT: P0=1 P1=2 P2=3 P3=4 MERGE=no"
+        once = self.mod._append_verdict_marker(report)
+        twice = self.mod._append_verdict_marker(once)
+        self.assertEqual(once, twice)
+        self.assertEqual(twice.count("zob-verdict:"), 1)
 
     def test_huge_number_verdict_line_ignored(self):
         # 狗食二轮 P2-4: ≥4301 位数字会让 int() 抛 ValueError (Python
