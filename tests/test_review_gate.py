@@ -30,7 +30,10 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
   - state 脏值防御 (#36): quota_wall_until 脏按无墙 (WARNING 进程内去重
     只打一次) / 台账脏条目按窗外淘汰 (prune 首轮自愈) / 数字串容忍照转 /
     get_5h_usage 干净条目照常计入 / 端到端: 脏台账上的成功审查不再被
-    兜底 mark_failure (status=reviewed, 不烧 attempts)
+    兜底 mark_failure (status=reviewed, 不烧 attempts) / count·tokens=
+    Infinity 不炸 (int(float('inf')) 是 OverflowError, R1-P1) / prs 条目
+    键同族防御 (R1-P2): next_retry_at 脏按到点立即可审, attempts 脏在
+    mark_failure 失败处理器内回退 0 起计不二次抛错
   - mcp_server 解析: PATH 命中 / ~/.local/bin 回退 / 不可执行不用 / 原样兜底
   - --once 全链路 (新 sha → 审+评+落盘; 同 sha 不重复; 新 sha 重审 attempts 清零)
   - 评论失败两路径: RetryableError → comment_failed+退避+缓存, 下轮只补评论;
@@ -1651,16 +1654,18 @@ class TestQuotaLedgerMath(_GateCase):
 
 
 class TestStateStoreDirtyDefense(_GateCase):
-    """(#36) state 脏值防御: 手编/半损坏 state.json 的墙键与台账键,
-    读取侧一律 fail-safe 回退不外抛 — 脏墙按 0=无墙 (打一条 WARNING,
-    进程内按 key 去重防每 300s 轮询刷屏), 脏台账条目按窗外淘汰
-    (record_review 内联 prune 首轮自愈)。数字串 ("12120"/"6000.0")
-    容忍照转 — 手编 state 的本意可恢复, 不算脏。"""
+    """(#36) state 脏值防御: 手编/半损坏 state.json 的墙键/台账键/prs
+    条目键, 读取侧一律 fail-safe 回退不外抛 — 脏墙按 0=无墙 (打一条
+    WARNING, 进程内按 key 去重防每 300s 轮询刷屏), 脏台账条目按窗外
+    淘汰 (record_review 内联 prune 首轮自愈), 脏 next_retry_at 按到点
+    立即可审。数字串 ("12120"/"6000.0") 容忍照转 — 手编 state 的本意
+    可恢复, 不算脏。"""
 
-    NOW = 20000.0   # 5h 窗口 [2000.0, 20000.0]
+    NOW = 20000.0   # 5h 窗口 [2000.0, 20000.0] (> 18000: 脏 ts=0 须落窗外)
 
     # 混合台账夹具: 干净窗内/边界/跨窗 + 数字串 + 三态脏 ts + 垃圾条目
-    # + ts 净但 count/tokens 脏
+    # + ts 净但 count/tokens 脏 (含 Infinity — json.loads 默认接受其
+    # 字面量, int(float('inf')) 抛 OverflowError 非 ValueError, R1-P1)
     DIRTY_LEDGER = [
         {"ts": 1999.0, "count": 4, "tokens": 400, "pr": "o/r#0"},    # 干净但跨窗外
         {"ts": 2000.0, "count": 1, "tokens": 10, "pr": "o/r#1"},     # 干净窗边界
@@ -1670,7 +1675,9 @@ class TestStateStoreDirtyDefense(_GateCase):
         {"ts": None, "count": 9, "tokens": 900, "pr": "d2"},            # 脏: None
         {"ts": {"nested": 1}, "count": 9, "tokens": 900, "pr": "d3"},   # 脏: 嵌套 dict
         "garbage-entry",                                                 # 脏: 非 dict 条目
-        {"ts": 7000.0, "count": "x", "tokens": "y", "pr": "d4"},      # ts 净, count/tokens 脏
+        {"ts": 7000.0, "count": "x", "tokens": "y", "pr": "d4"},      # ts 净, count/tokens 脏串
+        {"ts": 8000.0, "count": float("inf"), "tokens": 5, "pr": "d5"},   # count=Infinity → 回退 1
+        {"ts": 8100.0, "count": 2, "tokens": float("inf"), "pr": "d6"},   # tokens=Infinity → 回退 0
     ]
 
     def _store_with(self, data):
@@ -1682,14 +1689,17 @@ class TestStateStoreDirtyDefense(_GateCase):
     def test_dirty_quota_wall_until_reads_as_no_wall(self):
         # 脏墙值 (非数字串/None/嵌套 dict/list/NaN/Infinity/超 float
         # 上限巨整 — NaN·inf 会穿透 json.loads 数值化) 全部按 0=无墙,
-        # 不抛; is_quota_wall_active 同步返回 False (照常启动审查)
-        for dirty in ["not-a-number", None, {"k": 1}, [1, 2],
-                      float("nan"), float("inf"), 10 ** 400]:
-            store = self._store_with({"prs": {}, "quota_wall_until": dirty})
-            self.assertEqual(store.get_quota_wall_until(), 0.0,
-                             f"脏墙值 {dirty!r} 应按无墙")
-            self.assertFalse(
-                self.mod.is_quota_wall_active(store, now=self.NOW))
+        # 不抛; is_quota_wall_active 同步返回 False (照常启动审查)。
+        # mock 掉 log: 防御 WARNING 不往真 stderr 打
+        with mock.patch.object(self.mod, "log"):
+            for dirty in ["not-a-number", None, {"k": 1}, [1, 2],
+                          float("nan"), float("inf"), 10 ** 400]:
+                store = self._store_with(
+                    {"prs": {}, "quota_wall_until": dirty})
+                self.assertEqual(store.get_quota_wall_until(), 0.0,
+                                 f"脏墙值 {dirty!r} 应按无墙")
+                self.assertFalse(
+                    self.mod.is_quota_wall_active(store, now=self.NOW))
 
     def test_numeric_string_wall_value_tolerated(self):
         # 数字串容忍 (与 float() 自然行为一致): "12120" 照转 12120.0,
@@ -1702,14 +1712,12 @@ class TestStateStoreDirtyDefense(_GateCase):
     def test_dirty_wall_warns_once_across_reads_and_instances(self):
         # 告警去重: 同进程多次读 + 下轮轮询新建的 StateStore 实例,
         # 只打一条 WARNING — 不去重会每 300s 轮询刷一条同样的告警
-        path = os.path.join(self.tmp, "state.json")
-        with open(path, "w") as f:
-            json.dump({"prs": {}, "quota_wall_until": "not-a-number"}, f)
         with mock.patch.object(self.mod, "log") as m_log:
-            s1 = self.mod.StateStore(path)
+            s1 = self._store_with(
+                {"prs": {}, "quota_wall_until": "not-a-number"})
             for _ in range(3):
                 self.assertEqual(s1.get_quota_wall_until(), 0.0)
-            s2 = self.mod.StateStore(path)    # run_once 每轮轮询新建实例
+            s2 = self.mod.StateStore(s1.path)   # run_once 每轮轮询新建实例
             self.assertEqual(s2.get_quota_wall_until(), 0.0)
         warns = [c for c in m_log.call_args_list
                  if c.args[1:] == ("WARNING",)]
@@ -1717,20 +1725,30 @@ class TestStateStoreDirtyDefense(_GateCase):
 
     def test_get_5h_usage_skips_dirty_counts_clean(self):
         # 窗内只计: 边界 2000 (1/10) + 窗内 5000 (2/20) + 数字串 6000
-        # (3/30) + ts 净但 count/tokens 脏 (回退 1/0); 三态脏 ts + 垃圾
-        # 条目 + 跨窗 1999 一律不计 — 脏条目不污染用量, 干净条目照常
+        # (3/30) + ts 净但 count/tokens 脏串 (回退 1/0) + count=Infinity
+        # (1/5) + tokens=Infinity (2/0) — int(float('inf')) 抛
+        # OverflowError (R1-P1), 回退不炸; 三态脏 ts + 垃圾条目 + 跨窗
+        # 1999 一律不计 — 脏条目不污染用量, 干净条目照常
         store = self._store_with({"prs": {}, "quota_ledger": self.DIRTY_LEDGER})
         usage = store.get_5h_usage(now=self.NOW)
-        self.assertEqual(usage["count"], 7)
-        self.assertEqual(usage["tokens"], 60)
-        self.assertEqual(usage["num_entries"], 4)
+        self.assertEqual(usage["count"], 1 + 2 + 3 + 1 + 1 + 2)
+        self.assertEqual(usage["tokens"], 10 + 20 + 30 + 0 + 5 + 0)
+        self.assertEqual(usage["num_entries"], 6)
+
+    def test_as_int_infinity_falls_back(self):
+        # (R1-P1) int(float('inf')) 抛 OverflowError 而非 ValueError —
+        # json.loads 默认接受 Infinity 字面量, _as_int 必须一并捕获
+        self.assertEqual(self.mod._as_int(float("inf"), 1), 1)
+        self.assertEqual(self.mod._as_int(float("-inf"), 0), 0)
+        self.assertEqual(self.mod._as_int(float("nan"), 1), 1)  # ValueError 路
 
     def test_prune_ledger_drops_dirty_and_aged_keeps_clean(self):
         # 自愈: 跨窗 1999 + 四条脏被淘汰, 干净/数字串窗内条目原样保留
+        # (含两条 count/tokens=Infinity 的 ts 净条目 — prune 只看 ts)
         store = self._store_with({"prs": {}, "quota_ledger": self.DIRTY_LEDGER})
         store.prune_ledger(now=self.NOW)
         self.assertEqual([e["ts"] for e in store.data["quota_ledger"]],
-                         [2000.0, 5000.0, "6000.0", 7000.0])
+                         [2000.0, 5000.0, "6000.0", 7000.0, 8000.0, 8100.0])
 
     def test_prune_and_usage_non_list_ledger_no_crash(self):
         # 台账键整键不是 list (字符串/数字) → prune 不动它, usage 按空台账
@@ -1746,10 +1764,36 @@ class TestStateStoreDirtyDefense(_GateCase):
         store = self._store_with({"prs": {}, "quota_ledger": self.DIRTY_LEDGER})
         store.record_review(ts=20000.0, tokens=500, pr="o/r#9")
         ledger = store.data["quota_ledger"]
-        self.assertEqual(len(ledger), 5)    # 4 条窗内净条目 + 新追加
+        self.assertEqual(len(ledger), 7)    # 6 条窗内净条目 + 新追加
         self.assertEqual(ledger[-1],
                          {"ts": 20000.0, "count": 1, "tokens": 500,
                           "pr": "o/r#9"})
+
+    def test_needs_review_dirty_next_retry_at_reviews_now(self):
+        # (P2) next_retry_at 脏两态: "abc" 旧代码在任何 try 之外抛
+        # ValueError 穿透 run_once 崩进程; Infinity 则 inf > now 恒真
+        # → 永远 False, PR 被静默永久跳过 (与墙 inf 睡死同型)。
+        # 防御后均回退 0=到点立即可审 (fail-safe), 进处理即自愈
+        with mock.patch.object(self.mod, "log"):
+            for dirty in ["abc", float("inf"), {"k": 1}]:
+                e = {"head_sha": "s1", "status": "failed",
+                     "next_retry_at": dirty}
+                self.assertTrue(self.mod.needs_review(e, "s1", self.NOW),
+                                f"脏 next_retry_at {dirty!r} 应立即可审")
+
+    def test_mark_failure_dirty_attempts_no_crash(self):
+        # (P2) attempts 脏值不得在这个失败处理器里二次抛错穿透
+        # process_repo 兜底 except — 回退 0 起计, attempts=1 正常退避
+        cfg = self.mod.GateConfig({"retry": {}})
+        with mock.patch.object(self.mod, "log"):
+            for dirty in ["abc", float("inf")]:
+                entry = {"head_sha": "s1", "status": "failed",
+                         "attempts": dirty, "next_retry_at": 0.0,
+                         "error": ""}
+                self.mod.mark_failure(entry, "审查失败", self.NOW, cfg)
+                self.assertEqual(entry["attempts"], 1, f"{dirty!r} 应按 0 起")
+                self.assertEqual(entry["status"], "failed")
+                self.assertEqual(entry["next_retry_at"], self.NOW + 300.0)
 
     def test_dirty_ledger_falls_back_silently(self):
         # 台账循环侧单条目静默回退 (#36): 不逐条目打 WARNING 刷屏 —
