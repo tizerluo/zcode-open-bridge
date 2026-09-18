@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -209,6 +209,37 @@ def _extract_retry_after(sample):
             except (TypeError, ValueError):
                 pass
     return None
+
+
+# 1308 = z.ai 5 小时额度耗尽业务码 (issue #35): 解析 reset 时间作结构化
+# 载荷附在 zcode_pr_review 的 result 上, 下游 (review-gate 额度墙) 直读
+# 不猜。副本源自 shared/provider_error.py (正则/时区规则与其逐字同源,
+# 与 gate 的 parse_1308_reset_time 同一套 +08:00 契约), 修改时请同步。
+_RE_QUOTA_1308 = re.compile(
+    r"\[1308\]\[Usage limit reached for 5\s*hours?\.\s*Your limit will reset at\s+"
+    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]",
+    re.IGNORECASE,
+)
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _parse_quota_1308(text):
+    """解析 1308 额度 stderr → {"code": 1308, "reset_at": <unix 秒 int>} 或 None。
+
+    只认 1308 + 5 hour(s) 窗; reset 为 naive 北京时间串, 按 +08:00 转 unix
+    秒; 不命中/格式非法返回 None (调用方不加结构化键)。
+    """
+    if not text:
+        return None
+    m = _RE_QUOTA_1308.search(text)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        return {"code": 1308,
+                "reset_at": int(dt.replace(tzinfo=_BEIJING_TZ).timestamp())}
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 # ============================================================
@@ -1053,11 +1084,23 @@ def _parse_result_json(output):
 
 
 def _extract_response(output):
-    """--json 模式下提取 zcode stdout 的 response 字段; 无法识别时原样返回。"""
+    """--json 模式下提取 (response 正文, usage.totalTokens); 无法识别时 (原文, None)。
+
+    (#35) 第二返回值供 usage 透传: zcode --json 原始字段是 camelCase 的
+    usage.totalTokens, 消费方转成仓内 snake_case 键; 无 usage 字段 / 非整数
+    (bool 是 int 子类, 显式排除) / 非 --json 输出 → None (调用方不加键);
+    负整数是 provider bug, 钳 0 防下游 5h 台账被抵扣。
+    """
     data = _parse_result_json(output)
     if data is not None and isinstance(data.get("response"), str):
-        return data["response"]
-    return output
+        usage = data.get("usage")
+        tokens = usage.get("totalTokens") if isinstance(usage, dict) else None
+        if isinstance(tokens, bool) or not isinstance(tokens, int):
+            tokens = None
+        elif tokens < 0:
+            tokens = 0
+        return data["response"], tokens
+    return output, None
 
 
 def _build_review_cmd(prompt, cwd):
@@ -1071,10 +1114,14 @@ def _build_review_cmd(prompt, cwd):
     return cmd
 
 
-def _run_zcode_headless(cmd, env, timeout):
+def _run_zcode_headless(cmd, env, timeout, structured_output=False):
     """带文件锁 + 限流有限重试执行 zcode headless, 返回 MCP result dict。
 
     锁与重试语义见 ReviewFileLock / _parse_provider_error 注释 (issue #3)。
+    structured_output=True (仅 zcode_pr_review 用, #35): 失败时若 stderr 命中
+    1308 额度错误, result 顶层附 "quota_limit": {"code": 1308, "reset_at":
+    <unix 秒>}; 成功时有 usage 时附 "usage": {"total_tokens": <int>}。其余
+    review tool 的 result 形状保持不变。
     """
     # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数。
     # clamp 到 >=0, 防止 ZCODE_BRIDGE_MAX_RETRIES=-1 导致不执行 zcode (Codex P2)
@@ -1122,13 +1169,22 @@ def _run_zcode_headless(cmd, env, timeout):
                         suffix = f" (已重试 {attempt} 次)" if attempt > 0 else ""
                         err_text = result.stderr.strip() or output or "未知错误"
                         # 提取简短错误 (脱敏: provider 错误一般不含 apiKey, 但截断防泄漏)
-                        return {"content": [{"type": "text",
-                                             "text": f"zcode 调用失败{suffix}: {err_text[:500]}"}],
-                                "isError": True}
+                        err_result = {"content": [{"type": "text",
+                                                   "text": f"zcode 调用失败{suffix}: {err_text[:500]}"}],
+                                      "isError": True}
+                        # 1308 结构化载荷 (#35): 从完整 stderr 解析 (上面 content
+                        # 里的 err_text 已截 500 字符, 尾部时间串可能被切掉);
+                        # isError 文本本身一字不动保留 1308 原文 — 旧 gate 的
+                        # 正则路径仍能命中 (向后兼容), 命中才附加键。
+                        if structured_output:
+                            quota = _parse_quota_1308(result.stderr or "")
+                            if quota is not None:
+                                err_result["quota_limit"] = quota
+                        return err_result
                     # 成功: 先提取 response 再截断 (复审 P2-1: 先截断会破坏
                     # JSON 结构导致提取失败)。体积上限 ZCODE_BRIDGE_MAX_OUTPUT
                     # (整体 review P2-1): 超大审查/verbose 输出可达几十 MB。
-                    text = _extract_response(output)
+                    text, total_tokens = _extract_response(output)
                     max_output = max(10_000, _env_int(
                         "ZCODE_BRIDGE_MAX_OUTPUT", 10_000_000, maximum=100_000_000))
                     if len(text) > max_output:
@@ -1138,7 +1194,12 @@ def _run_zcode_headless(cmd, env, timeout):
                         text = text[:max_output] + (
                             f"\n\n[... 输出超 {max_output} 字符已截断; "
                             "超大审查建议拆分文件分批进行 ...]")
-                    return {"content": [{"type": "text", "text": text}]}
+                    ok_result = {"content": [{"type": "text", "text": text}]}
+                    # usage 透传 (#35): zcode --json 的 camelCase totalTokens 转
+                    # snake_case; 无 usage 字段不加键 (调用方 0 兜底)。
+                    if structured_output and total_tokens is not None:
+                        ok_result["usage"] = {"total_tokens": total_tokens}
+                    return ok_result
 
                 except subprocess.TimeoutExpired:
                     return {"content": [{"type": "text", "text": f"zcode review 超时 ({timeout}s)"}],
@@ -1572,7 +1633,11 @@ def tool_zcode_pr_review(args):
 
         log(f"调用 zcode PR 复核 (yolo+只读黑名单, {len(changed)} 个改动文件)")
         env = _merge_env_with_creds(load_zcode_credentials())
-        result = _run_zcode_headless(cmd, env, _review_timeout())
+        # structured_output (#35): PR 复核的 result 附结构化 quota_limit/usage
+        # 键, 供 review-gate 额度墙与 token 台账直读 (zcode_review /
+        # zcode_security_review 的交互式调用方不需要, 保持原形状)。
+        result = _run_zcode_headless(cmd, env, _review_timeout(),
+                                     structured_output=True)
         # issue #16: 报告尾附机器可读 verdict 标记, 下游 (review-gate) 直读不猜
         if not result.get("isError"):
             # 基线头行先拼在正文开头再转写标记 — 纯中文不含 P0/P1/P2 字面

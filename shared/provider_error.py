@@ -14,6 +14,9 @@ zcode --prompt 失败时, provider 端错误 (限流/配额) 会出现在:
 本模块是纯函数, 无副作用, 便于单测。MCP/ACP bridge 各内嵌一份副本
 (保持单文件可独立运行特性), 修改时请同步。
 
+另有 parse_quota_1308: 解析 z.ai 1308 (5 小时额度耗尽) 业务码的 reset
+时间, 供 mcp-server 结构化输出 (review-gate 的 1308 额度墙消费)。
+
 用法:
   from shared.provider_error import parse_provider_error
   info = parse_provider_error(stderr_text)
@@ -22,6 +25,7 @@ zcode --prompt 失败时, provider 端错误 (限流/配额) 会出现在:
 """
 
 import re
+from datetime import datetime, timedelta, timezone
 
 
 def parse_provider_error(text):
@@ -144,6 +148,41 @@ def _bounded(seconds, lo=1, hi=300):
     except (TypeError, ValueError):
         return None
     return max(lo, min(hi, s))
+
+
+# 1308 = z.ai 5 小时额度耗尽业务码 (issue #35)。正则与 review-gate 的
+# _RE_QUOTA_1308 / parse_1308_reset_time 逐字同源 — gate 正则兜底路径靠它
+# 解析同一段文本, 两处漂移会让结构化/正则两条路径给出不同 reset。
+_RE_QUOTA_1308 = re.compile(
+    r"\[1308\]\[Usage limit reached for 5\s*hours?\.\s*Your limit will reset at\s+"
+    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]",
+    re.IGNORECASE,
+)
+# reset 时间是 naive 北京时间串 (provider 不带时区), 统一按 +08:00 解析 —
+# 与 review-gate 的 BEIJING_TZ 同一套时区规则, 不许出现第二套时区逻辑。
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def parse_quota_1308(text):
+    """解析 1308 额度错误文本, 返回 {"code": 1308, "reset_at": <unix 秒 int>} 或 None。
+
+    实测文本形态 (GC-8G journalctl):
+      ProviderBusinessError: [1308][Usage limit reached for 5 hour. Your limit
+      will reset at 2026-09-18 18:43:16][request-id]
+    只认 1308 + 5 hour(s) 窗 (1309 周窗/月窗及 10 hour 等不认); reset 按
+    北京时间 +08:00 转 unix 秒; 不命中/格式非法返回 None (调用方不加结构化键)。
+    """
+    if not text:
+        return None
+    m = _RE_QUOTA_1308.search(text)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        return {"code": 1308,
+                "reset_at": int(dt.replace(tzinfo=BEIJING_TZ).timestamp())}
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 if __name__ == "__main__":

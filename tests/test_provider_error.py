@@ -13,6 +13,8 @@ test_provider_error.py — parse_provider_error 错误解析单测
   PE6 其他 provider 错误 (Unauthorized, 不重试)
   PE7 空文本 / 无错误文本 → unknown
   PE8 retry-after 边界 (超大值截断到 300, 含堆栈的长文本只看头部)
+  PQ0-PQ2 (#35) parse_quota_1308: 1308 结构化解析 (北京 naive → unix 对拍
+    review-gate 正则路径钉死值; 1309/10h/坏日期/空文本不命中)
 
 运行: python3 tests/test_provider_error.py
 依赖: 仅 Python 标准库 + shared/provider_error.py
@@ -25,6 +27,7 @@ import unittest
 # shared/provider_error.py 是普通 .py, 直接 import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 from provider_error import parse_provider_error as pe  # noqa: E402
+from provider_error import parse_quota_1308 as pq  # noqa: E402
 
 
 class TestParseProviderError(unittest.TestCase):
@@ -183,6 +186,45 @@ class TestParseProviderError(unittest.TestCase):
         r = pe(text)
         self.assertNotIn("at ", r["raw_hint"], "raw_hint 不应是堆栈行")
         self.assertIn("APICallError", r["raw_hint"])
+
+
+class TestParseQuota1308(unittest.TestCase):
+    """(#35) parse_quota_1308: 1308 额度错误的结构化解析。
+
+    钉死值与 tests/test_review_gate.py 的 parse_1308_reset_time 对拍:
+    "2026-09-18 18:43:16" 按 +08:00 (北京) 解析 = 1789728196 unix 秒 —
+    权威版与 mcp-server 内嵌副本/gate 正则路径必须同一套时区规则。
+    """
+
+    def test_pq0_canonical_forms(self):
+        """PQ0: 实测单数 hour 原件 / 复数 hours / 裸文本 (无前缀) → 同一 unix 值"""
+        canonical = (
+            "ProviderBusinessError: [1308][Usage limit reached for 5 hour. "
+            "Your limit will reset at 2026-09-18 18:43:16][0191ebc5-1234-7000]"
+        )
+        self.assertEqual(pq(canonical), {"code": 1308, "reset_at": 1789728196})
+        self.assertEqual(pq(canonical.replace("5 hour", "5 hours")),
+                         {"code": 1308, "reset_at": 1789728196})
+        self.assertEqual(
+            pq("[1308][Usage limit reached for 5 hour. "
+               "Your limit will reset at 2026-09-18 18:43:16]"),
+            {"code": 1308, "reset_at": 1789728196})
+
+    def test_pq1_non_quota_forms_return_none(self):
+        """PQ1: 1309 周窗 / 非 5 小时窗 / 坏日期 / 常见 HTTP 错误 → None"""
+        self.assertIsNone(pq("[1309][Usage limit reached for weekly quota. "
+                             "Your limit will reset at 2026-09-25 18:43:16]"))
+        self.assertIsNone(pq("[1308][Usage limit reached for 10 hour. "
+                             "Your limit will reset at 2026-09-18 18:43:16]"))
+        self.assertIsNone(pq("[1308][Usage limit reached for 5 hour. "
+                             "Your limit will reset at 2026-99-99 99:99:99]"))
+        self.assertIsNone(pq("HTTP 401: Unauthorized"))
+        self.assertIsNone(pq("HTTP 429: Too Many Requests"))
+
+    def test_pq2_empty_and_none(self):
+        """PQ2: 空文本 / None → None (不崩, 调用方不加结构化键)"""
+        self.assertIsNone(pq(""))
+        self.assertIsNone(pq(None))
 
 
 if __name__ == "__main__":
