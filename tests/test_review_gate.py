@@ -27,6 +27,10 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
   - 结构化 1308 消费 (#35①/#39/#42): quota_limit 键优先进墙 / 远期 reset_at
     拒绝 (防睡死, 含双路并存: 结构化窗外 + 正文窗内仍退避) / NaN·Infinity 按
     形状不符 / 键缺失退正则兜底 / 台账记完成时刻 + tokens 透传 (负值钳 0)
+  - state 脏值防御 (#36): quota_wall_until 脏按无墙 (WARNING 进程内去重
+    只打一次) / 台账脏条目按窗外淘汰 (prune 首轮自愈) / 数字串容忍照转 /
+    get_5h_usage 干净条目照常计入 / 端到端: 脏台账上的成功审查不再被
+    兜底 mark_failure (status=reviewed, 不烧 attempts)
   - mcp_server 解析: PATH 命中 / ~/.local/bin 回退 / 不可执行不用 / 原样兜底
   - --once 全链路 (新 sha → 审+评+落盘; 同 sha 不重复; 新 sha 重审 attempts 清零)
   - 评论失败两路径: RetryableError → comment_failed+退避+缓存, 下轮只补评论;
@@ -1646,6 +1650,118 @@ class TestQuotaLedgerMath(_GateCase):
         self.assertTrue(any("95%" in m and "WARNING" == lvl for lvl, m in logs))
 
 
+class TestStateStoreDirtyDefense(_GateCase):
+    """(#36) state 脏值防御: 手编/半损坏 state.json 的墙键与台账键,
+    读取侧一律 fail-safe 回退不外抛 — 脏墙按 0=无墙 (打一条 WARNING,
+    进程内按 key 去重防每 300s 轮询刷屏), 脏台账条目按窗外淘汰
+    (record_review 内联 prune 首轮自愈)。数字串 ("12120"/"6000.0")
+    容忍照转 — 手编 state 的本意可恢复, 不算脏。"""
+
+    NOW = 20000.0   # 5h 窗口 [2000.0, 20000.0]
+
+    # 混合台账夹具: 干净窗内/边界/跨窗 + 数字串 + 三态脏 ts + 垃圾条目
+    # + ts 净但 count/tokens 脏
+    DIRTY_LEDGER = [
+        {"ts": 1999.0, "count": 4, "tokens": 400, "pr": "o/r#0"},    # 干净但跨窗外
+        {"ts": 2000.0, "count": 1, "tokens": 10, "pr": "o/r#1"},     # 干净窗边界
+        {"ts": 5000.0, "count": 2, "tokens": 20, "pr": "o/r#2"},     # 干净窗内
+        {"ts": "6000.0", "count": 3, "tokens": 30, "pr": "o/r#3"},   # 数字串容忍
+        {"ts": "not-a-number", "count": 9, "tokens": 900, "pr": "d1"},  # 脏: 非数字串
+        {"ts": None, "count": 9, "tokens": 900, "pr": "d2"},            # 脏: None
+        {"ts": {"nested": 1}, "count": 9, "tokens": 900, "pr": "d3"},   # 脏: 嵌套 dict
+        "garbage-entry",                                                 # 脏: 非 dict 条目
+        {"ts": 7000.0, "count": "x", "tokens": "y", "pr": "d4"},      # ts 净, count/tokens 脏
+    ]
+
+    def _store_with(self, data):
+        path = os.path.join(self.tmp, "state.json")
+        with open(path, "w") as f:
+            json.dump(data, f)
+        return self.mod.StateStore(path)
+
+    def test_dirty_quota_wall_until_reads_as_no_wall(self):
+        # 脏墙值 (非数字串/None/嵌套 dict/list/NaN/Infinity/超 float
+        # 上限巨整 — NaN·inf 会穿透 json.loads 数值化) 全部按 0=无墙,
+        # 不抛; is_quota_wall_active 同步返回 False (照常启动审查)
+        for dirty in ["not-a-number", None, {"k": 1}, [1, 2],
+                      float("nan"), float("inf"), 10 ** 400]:
+            store = self._store_with({"prs": {}, "quota_wall_until": dirty})
+            self.assertEqual(store.get_quota_wall_until(), 0.0,
+                             f"脏墙值 {dirty!r} 应按无墙")
+            self.assertFalse(
+                self.mod.is_quota_wall_active(store, now=self.NOW))
+
+    def test_numeric_string_wall_value_tolerated(self):
+        # 数字串容忍 (与 float() 自然行为一致): "12120" 照转 12120.0,
+        # 墙态照常生效 — 不把可恢复本意的手编值当脏值抹掉
+        store = self._store_with({"prs": {}, "quota_wall_until": "12120"})
+        self.assertEqual(store.get_quota_wall_until(), 12120.0)
+        self.assertTrue(
+            self.mod.is_quota_wall_active(store, now=10000.0))
+
+    def test_dirty_wall_warns_once_across_reads_and_instances(self):
+        # 告警去重: 同进程多次读 + 下轮轮询新建的 StateStore 实例,
+        # 只打一条 WARNING — 不去重会每 300s 轮询刷一条同样的告警
+        path = os.path.join(self.tmp, "state.json")
+        with open(path, "w") as f:
+            json.dump({"prs": {}, "quota_wall_until": "not-a-number"}, f)
+        with mock.patch.object(self.mod, "log") as m_log:
+            s1 = self.mod.StateStore(path)
+            for _ in range(3):
+                self.assertEqual(s1.get_quota_wall_until(), 0.0)
+            s2 = self.mod.StateStore(path)    # run_once 每轮轮询新建实例
+            self.assertEqual(s2.get_quota_wall_until(), 0.0)
+        warns = [c for c in m_log.call_args_list
+                 if c.args[1:] == ("WARNING",)]
+        self.assertEqual(len(warns), 1)
+
+    def test_get_5h_usage_skips_dirty_counts_clean(self):
+        # 窗内只计: 边界 2000 (1/10) + 窗内 5000 (2/20) + 数字串 6000
+        # (3/30) + ts 净但 count/tokens 脏 (回退 1/0); 三态脏 ts + 垃圾
+        # 条目 + 跨窗 1999 一律不计 — 脏条目不污染用量, 干净条目照常
+        store = self._store_with({"prs": {}, "quota_ledger": self.DIRTY_LEDGER})
+        usage = store.get_5h_usage(now=self.NOW)
+        self.assertEqual(usage["count"], 7)
+        self.assertEqual(usage["tokens"], 60)
+        self.assertEqual(usage["num_entries"], 4)
+
+    def test_prune_ledger_drops_dirty_and_aged_keeps_clean(self):
+        # 自愈: 跨窗 1999 + 四条脏被淘汰, 干净/数字串窗内条目原样保留
+        store = self._store_with({"prs": {}, "quota_ledger": self.DIRTY_LEDGER})
+        store.prune_ledger(now=self.NOW)
+        self.assertEqual([e["ts"] for e in store.data["quota_ledger"]],
+                         [2000.0, 5000.0, "6000.0", 7000.0])
+
+    def test_prune_and_usage_non_list_ledger_no_crash(self):
+        # 台账键整键不是 list (字符串/数字) → prune 不动它, usage 按空台账
+        for junk in ["garbage", 42]:
+            store = self._store_with({"prs": {}, "quota_ledger": junk})
+            store.prune_ledger(now=self.NOW)
+            self.assertEqual(store.data["quota_ledger"], junk)
+            self.assertEqual(store.get_5h_usage(now=self.NOW)["count"], 0)
+
+    def test_record_review_appends_clean_entry_on_dirty_ledger(self):
+        # 成功路径读侧 (旧脏台账) 不抛: 追加条目必净 (ts/tokens/pr
+        # 皆规整), 内联 prune 首轮淘汰脏条目自愈
+        store = self._store_with({"prs": {}, "quota_ledger": self.DIRTY_LEDGER})
+        store.record_review(ts=20000.0, tokens=500, pr="o/r#9")
+        ledger = store.data["quota_ledger"]
+        self.assertEqual(len(ledger), 5)    # 4 条窗内净条目 + 新追加
+        self.assertEqual(ledger[-1],
+                         {"ts": 20000.0, "count": 1, "tokens": 500,
+                          "pr": "o/r#9"})
+
+    def test_dirty_ledger_falls_back_silently(self):
+        # 台账循环侧单条目静默回退 (#36): 不逐条目打 WARNING 刷屏 —
+        # 脏条目按窗外被 prune 淘汰自愈, 无每轮重复告警的源头
+        store = self._store_with({"prs": {}, "quota_ledger": self.DIRTY_LEDGER})
+        with mock.patch.object(self.mod, "log") as m_log:
+            store.get_5h_usage(now=self.NOW)
+            store.prune_ledger(now=self.NOW)
+            store.record_review(ts=20000.0, pr="o/r#9")
+        m_log.assert_not_called()
+
+
 class TestFakeMcpServerQuotaWallIntegration(_GateCase):
     """F6 集成验证: fake mcp-server 两形 1308 首撞进墙 + 墙期拒动 (计数断言) + 醒后自愈 + 负控。"""
 
@@ -1842,7 +1958,8 @@ class TestFakeMcpServerQuotaWallIntegration(_GateCase):
 class TestStructuredQuotaIntegration(_GateCase):
     """结构化 1308 集成验证: quota_limit 键优先命中 (无 1308 文本也进墙)、
     结构化 reset_at 异常远期被 is_valid_quota_window 拒绝 (防睡死钉死)、
-    键缺失退正则兜底、台账记完成时刻 (#42) 且 tokens 接 usage 透传 (#35②)。"""
+    键缺失退正则兜底、台账记完成时刻 (#42) 且 tokens 接 usage 透传 (#35②)、
+    脏台账端到端 (#36): 成功审查不再被兜底 mark_failure。"""
 
     def setUp(self):
         super().setUp()
@@ -2051,6 +2168,52 @@ class TestStructuredQuotaIntegration(_GateCase):
         ledger = self._state()["quota_ledger"]
         self.assertEqual(len(ledger), 1)
         self.assertEqual(ledger[0]["tokens"], 0)
+
+    def test_dirty_ledger_success_path_not_marked_failure(self):
+        """(#36 端到端/爆炸半径回归) 脏台账 + 成功审查全链路: 修复前
+        record_review→prune_ledger 对脏 ts 裸 float() 抛错上抛, 被
+        process_repo 兜底 except 接住 mark_failure — 已成功的审查被记
+        failed (烧 attempts + 报告未缓存 → 下轮全额重审)。修复后全链路
+        不抛: status=reviewed 落盘, 台账首轮自愈 (脏条目淘汰)。"""
+        cfg_path = self._write_config()
+        self.pr_list = [{"number": 5, "title": "pr 5",
+                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
+        now = 100000.0
+        dirty_ledger = [
+            {"ts": "not-a-number", "count": 9, "tokens": 900, "pr": "o/r#1"},
+            {"ts": None, "count": 9, "tokens": 900, "pr": "o/r#2"},
+            {"ts": {"nested": 1}, "count": 9, "tokens": 900, "pr": "o/r#3"},
+            "garbage-entry",
+            {"ts": 99000.0, "count": 1, "tokens": 77, "pr": "o/r#4"},  # 干净窗内
+        ]
+        with open(os.path.join(self.tmp, "state.json"), "w") as f:
+            json.dump({"prs": {}, "quota_ledger": dirty_ledger}, f)
+
+        ok_stdout = json.dumps({"ok": True, "result": {
+            "content": [{"type": "text",
+                         "text": "汇总: P0: 0 条, P1: 0 条, P2: 1 条\nMERGE: yes"}],
+            "usage": {"total_tokens": 500}}})
+        run = self._fake_run_factory(0, ok_stdout, "")
+
+        with mock.patch.object(self.mod.subprocess, "run", run), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
+             mock.patch.object(self.mod.time, "time", return_value=now):
+            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
+
+        st = self._state()
+        entry = st["prs"]["octo/hello#5"]
+        # 爆炸半径钉死: 成功审查不再被兜底记失败, 不烧 attempts
+        self.assertEqual(entry["status"], "reviewed")
+        self.assertEqual(entry["attempts"], 0)
+        self.assertEqual(entry["error"], "")
+        self.assertEqual(entry["verdict"], "pass")
+        # 台账自愈: 脏条目被淘汰, 只剩干净旧条目 + 本轮新追加条目
+        ledger = st["quota_ledger"]
+        self.assertEqual(len(ledger), 2)
+        self.assertEqual(ledger[0]["ts"], 99000.0)
+        self.assertEqual(ledger[1],
+                         {"ts": now, "count": 1, "tokens": 500,
+                          "pr": "octo/hello#5"})
 
 
 # ============================================================
