@@ -41,7 +41,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 VERSION = "0.1.0"
 
@@ -87,6 +87,15 @@ _RE_P1 = re.compile(r"P1[^\dP]{0,12}(\d{1,9})(?!\d)")
 _RE_P2 = re.compile(r"P2[^\dP]{0,12}(\d{1,9})(?!\d)")
 
 _TRUNC_MARK = "\n\n[... 报告超长已截断 ...]"
+
+# 1308 额度防撞墙 (F6)
+_RE_QUOTA_1308 = re.compile(
+    r"\[1308\]\[Usage limit reached for 5\s*hours?\.\s*Your limit will reset at\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]",
+    re.IGNORECASE,
+)
+BEIJING_TZ = timezone(timedelta(hours=8))
+MAX_QUOTA_WINDOW_SECONDS = 5.5 * 3600  # 5.5h 窗合理性校验上限 (19800 秒)
+WALL_BUFFER_SECONDS = 120.0            # reset + 2min 纯定时醒 buffer
 
 _LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 _LOG_LEVEL = "INFO"
@@ -190,6 +199,10 @@ class GateConfig:
         self.comment_enabled = bool(comment.get("enabled", True))
         self.comment_max_body = _as_int(comment.get("max_body"), 60000)
 
+        quota = data.get("quota") or {}
+        self.quota_limit_5h = max(_as_int(quota.get("limit_5h"), 0), 0)
+        self.quota_tokens_5h = max(_as_int(quota.get("tokens_5h"), 0), 0)
+
     def apply_env_overrides(self):
         """env 覆盖 (优先级高于配置文件, 方便 systemd unit 里调 Environment=)。"""
         env = os.environ
@@ -202,6 +215,12 @@ class GateConfig:
         if env.get("GATE_POLL_INTERVAL"):
             self.poll_interval = _as_int(env["GATE_POLL_INTERVAL"],
                                          self.poll_interval)
+        if env.get("GATE_QUOTA_LIMIT_5H"):
+            self.quota_limit_5h = max(_as_int(env["GATE_QUOTA_LIMIT_5H"],
+                                              self.quota_limit_5h), 0)
+        if env.get("GATE_QUOTA_TOKENS_5H"):
+            self.quota_tokens_5h = max(_as_int(env["GATE_QUOTA_TOKENS_5H"],
+                                               self.quota_tokens_5h), 0)
 
 
 def load_config(path):
@@ -725,6 +744,56 @@ class StateStore:
     def put(self, key, entry):
         self.data["prs"][key] = entry
 
+    def get_quota_wall_until(self):
+        return float(self.data.get("quota_wall_until") or 0.0)
+
+    def set_quota_wall_until(self, until):
+        self.data["quota_wall_until"] = float(until)
+
+    def record_review(self, ts=None, count=1, tokens=0, pr=""):
+        """记录一次审查完成到 5h 滚动台账 (B件 记账代理)。"""
+        if ts is None:
+            ts = time.time()
+        ledger = self.data.get("quota_ledger")
+        if not isinstance(ledger, list):
+            ledger = []
+            self.data["quota_ledger"] = ledger
+        entry = {
+            "ts": round(float(ts), 2),
+            "count": int(count),
+            "tokens": int(tokens or 0),
+            "pr": str(pr or ""),
+        }
+        ledger.append(entry)
+        self.prune_ledger(now=ts)
+
+    def prune_ledger(self, now=None, max_age_seconds=18000):
+        """淘汰超出 5 小时滚动窗的陈旧台账, 防止 state 文件无限膨胀。"""
+        if now is None:
+            now = time.time()
+        cutoff = now - max_age_seconds
+        ledger = self.data.get("quota_ledger")
+        if isinstance(ledger, list):
+            self.data["quota_ledger"] = [
+                e for e in ledger if float(e.get("ts") or 0) >= cutoff
+            ]
+
+    def get_5h_usage(self, now=None, window_seconds=18000):
+        """计算当前 5 小时滚动窗口内的审查使用量 (次数与 token)。"""
+        if now is None:
+            now = time.time()
+        cutoff = now - window_seconds
+        ledger = self.data.get("quota_ledger") or []
+        window_entries = [e for e in ledger if float(e.get("ts") or 0) >= cutoff]
+        total_count = sum(int(e.get("count") or 1) for e in window_entries)
+        total_tokens = sum(int(e.get("tokens") or 0) for e in window_entries)
+        return {
+            "count": total_count,
+            "tokens": total_tokens,
+            "window_seconds": window_seconds,
+            "num_entries": len(window_entries),
+        }
+
 
 # ============================================================
 # 去重 / 退避状态机
@@ -783,6 +852,80 @@ def mark_reviewed(entry, verdict, comment_url):
 
 
 # ============================================================
+# 1308 额度防撞墙与水位巡检 (F6)
+# ============================================================
+def parse_1308_reset_time(error_text):
+    """从 1308 错误文本解析 reset 时间 (unix 时间戳, float)。
+
+    实测文本形态:
+      ProviderBusinessError: [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-18 18:43:16][request-id]
+    - capture-first: 正则钉紧实测文本, 只认 1308 与 5 hour(s) 窗;
+    - 1309 (周窗/月窗) 及其他未分类错误一律返回 None (不进墙, 防睡死);
+    - reset 为 naive 字符串无时区, 强制按 +08:00 (北京时间) 解析并转为 unix timestamp;
+    - 格式非法或解析异常返回 None。
+    """
+    if not error_text:
+        return None
+    m = _RE_QUOTA_1308.search(str(error_text))
+    if not m:
+        return None
+    raw_dt = m.group(1)
+    try:
+        dt = datetime.strptime(raw_dt, "%Y-%m-%d %H:%M:%S")
+        dt = dt.replace(tzinfo=BEIJING_TZ)
+        return dt.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def is_valid_quota_window(reset_ts, now=None):
+    """合理性校验: reset_ts 须落在 now ~ now + 5.5h 窗内。
+
+    不落窗 (过去时间, 或大于 5.5 小时的远期/异常值) 返回 False (拒进墙, 走既有退避)。
+    """
+    if reset_ts is None:
+        return False
+    if now is None:
+        now = time.time()
+    return (now - 1.0) <= reset_ts <= (now + MAX_QUOTA_WINDOW_SECONDS)
+
+
+def is_quota_wall_active(state, now=None):
+    """检查当前是否处于额度墙期内 (墙态到点自然消退)。"""
+    if now is None:
+        now = time.time()
+    return state.get_quota_wall_until() > now
+
+
+def check_watermark(usage, limit_count=0, limit_tokens=0, log_fn=log):
+    """水位巡检 (observe-only): 80%/95% 两档阈值打日志, 只观测不断供不告警。
+
+    返回触发的最高档位 ("95%" | "80%" | None)。
+    """
+    levels = []
+    if limit_count > 0:
+        ratio = usage["count"] / limit_count
+        levels.append((ratio, f"审查次数 {usage['count']}/{limit_count}"))
+    if limit_tokens > 0:
+        ratio = usage["tokens"] / limit_tokens
+        levels.append((ratio, f"token 用量 {usage['tokens']}/{limit_tokens}"))
+
+    if not levels:
+        return None
+
+    max_ratio, desc = max(levels, key=lambda x: x[0])
+    pct = max_ratio * 100.0
+
+    if pct >= 95.0:
+        log_fn(f"[水位巡检] 5h 额度使用率达到 95% 警戒水位: {pct:.1f}% ({desc})", "WARNING")
+        return "95%"
+    elif pct >= 80.0:
+        log_fn(f"[水位巡检] 5h 额度使用率达到 80% 水位: {pct:.1f}% ({desc})", "WARNING")
+        return "80%"
+    return None
+
+
+# ============================================================
 # 主流程
 # ============================================================
 def _pr_info(pr):
@@ -829,6 +972,15 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
         counts = tuple(entry["counts"]) if entry.get("counts") else None
         log(f"{key}: 沿用缓存审查结果 (verdict={verdict}), 只补评论")
     else:
+        # 启动审查前查墙: 若处于 1308 额度墙期内, 跳过审查启动 (保持 pending 不衰老, 不烧 attempts)
+        if is_quota_wall_active(state, now):
+            until = state.get_quota_wall_until()
+            until_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
+            log(f"{key}: 处于 1308 额度墙期内 (至 {until_str}), 跳过审查启动 "
+                "(保持 pending, 不计失败)")
+            entry["status"] = "pending"
+            return
+
         try:
             fetch_pr_refs(clone, token, info["number"], info["base_ref"])
         except GitError as e:
@@ -846,10 +998,25 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
             f"base=origin/{info['base_ref']} depth={cfg.review_depth}")
         ok, payload = run_review(cfg, clone, info["base_ref"], head_sha)
         if not ok:
+            reset_ts = parse_1308_reset_time(payload)
+            if reset_ts is not None and is_valid_quota_window(reset_ts, now):
+                wall_until = reset_ts + WALL_BUFFER_SECONDS
+                state.set_quota_wall_until(wall_until)
+                until_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(wall_until))
+                reset_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_ts))
+                log(f"{key}: 触发 1308 额度墙 (reset at {reset_str}, 锁墙至 {until_str}, "
+                    f"含 {int(WALL_BUFFER_SECONDS)}s buffer), 保持 pending (不计失败)")
+                entry["status"] = "pending"
+                entry["error"] = payload[:500]
+                return
             mark_failure(entry, payload, now, cfg)
             return
 
         report = payload
+        state.record_review(now, count=1, tokens=0, pr=key)
+        usage = state.get_5h_usage(now)
+        check_watermark(usage, cfg.quota_limit_5h, cfg.quota_tokens_5h)
+
         marker = parse_verdict_marker(report)
         counts = parse_severity_counts(report)
         verdict = verdict_from_counts(counts, marker[1] if marker else None)

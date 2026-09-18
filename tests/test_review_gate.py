@@ -101,7 +101,8 @@ class _EnvGuard(unittest.TestCase):
     """保存/恢复本文件用到的环境变量 (与 test_security_review 同惯例)。"""
 
     ENV_KEYS = ("GITHUB_TOKEN", "GH_TOKEN", "GATE_CONFIG", "GATE_STATE_FILE",
-                "GATE_CLONE_ROOT", "GATE_MCP_SERVER", "GATE_POLL_INTERVAL")
+                "GATE_CLONE_ROOT", "GATE_MCP_SERVER", "GATE_POLL_INTERVAL",
+                "GATE_QUOTA_LIMIT_5H", "GATE_QUOTA_TOKENS_5H")
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in self.ENV_KEYS}
@@ -564,6 +565,8 @@ class TestConfig(_GateCase):
         self.assertEqual(cfg.retry_max_attempts, 5)
         self.assertTrue(cfg.comment_enabled)
         self.assertEqual(cfg.comment_max_body, 60000)
+        self.assertEqual(cfg.quota_limit_5h, 0)
+        self.assertEqual(cfg.quota_tokens_5h, 0)
         self.assertTrue(
             cfg.state_file.endswith(".local/state/zcode-review-gate/state.json"))
         self.assertEqual(cfg.mcp_server, "zcode-mcp-server")
@@ -572,11 +575,15 @@ class TestConfig(_GateCase):
         os.environ["GATE_STATE_FILE"] = "/tmp/x/state.json"
         os.environ["GATE_POLL_INTERVAL"] = "42"
         os.environ["GATE_MCP_SERVER"] = "/opt/mcp"
+        os.environ["GATE_QUOTA_LIMIT_5H"] = "20"
+        os.environ["GATE_QUOTA_TOKENS_5H"] = "100000"
         cfg = self.mod.GateConfig({})
         cfg.apply_env_overrides()
         self.assertEqual(cfg.state_file, "/tmp/x/state.json")
         self.assertEqual(cfg.poll_interval, 42)
         self.assertEqual(cfg.mcp_server, "/opt/mcp")
+        self.assertEqual(cfg.quota_limit_5h, 20)
+        self.assertEqual(cfg.quota_tokens_5h, 100000)
 
     def test_bad_depth_falls_back(self):
         cfg = self.mod.GateConfig({"review": {"depth": "ultra"}})
@@ -1206,6 +1213,394 @@ class TestOnceEndToEnd(_GateCase):
         # 释放后同进程再跑 → 正常走完一轮
         self.assertEqual(self._run_once(cfg_path), 0)
         self.assertEqual(len(self.mcp_calls), 1)
+
+
+# ============================================================
+# F6: 1308 额度防撞墙与水位巡检
+# ============================================================
+class TestQuotaClassifier(_GateCase):
+    """F6 分类器验证: 1308 实测文本三形态、naive 时间 +08:00 解析与合理性窗、1309 与非额度错误拒进墙。"""
+
+    def test_canonical_1308_three_forms_and_reset_parsing(self):
+        # 形态 1: GC-8G 现场 journalctl 实测原件 (单数 hour, 带 request-id)
+        raw_canonical = (
+            "ProviderBusinessError: [1308][Usage limit reached for 5 hour. "
+            "Your limit will reset at 2026-09-18 18:43:16][0191ebc5-1234-7000]"
+        )
+        ts1 = self.mod.parse_1308_reset_time(raw_canonical)
+        self.assertIsNotNone(ts1)
+        # 验证 +08:00 (北京时间) 解析契约: 18:43:16+08:00 = 10:43:16 UTC
+        # 1789728196.0 秒
+        self.assertEqual(ts1, 1789728196.0)
+
+        # 形态 2: 复数 hours 形态
+        raw_plural = (
+            "ProviderBusinessError: [1308][Usage limit reached for 5 hours. "
+            "Your limit will reset at 2026-09-18 18:43:16][req-plural-567]"
+        )
+        ts2 = self.mod.parse_1308_reset_time(raw_plural)
+        self.assertEqual(ts2, 1789728196.0)
+
+        # 形态 3: 子进程包装/stderr 尾部形态 (gate 上浮格式)
+        raw_wrapped = (
+            "审查失败 (exit=1): zcode 调用失败 (已重试 3 次): "
+            "ProviderBusinessError: [1308][Usage limit reached for 5 hour. "
+            "Your limit will reset at 2026-09-18 18:43:16][req-tail] | "
+            "stderr: ProviderBusinessError: [1308][Usage limit reached for 5 hour. "
+            "Your limit will reset at 2026-09-18 18:43:16][req-tail]"
+        )
+        ts3 = self.mod.parse_1308_reset_time(raw_wrapped)
+        self.assertEqual(ts3, 1789728196.0)
+
+        # 裸文本形态 (无 ProviderBusinessError 前缀)
+        raw_bare = "[1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-18 18:43:16]"
+        ts_bare = self.mod.parse_1308_reset_time(raw_bare)
+        self.assertEqual(ts_bare, 1789728196.0)
+
+    def test_reasonableness_window(self):
+        """合理性窗验证: 解析值须落在 now ~ now+5.5h 窗内; 不落窗=不进墙"""
+        target_ts = 1789728196.0
+
+        # 窗内: 撞墙在 1 小时前 (now = target_ts - 3600)
+        now_1h_before = target_ts - 3600
+        self.assertTrue(self.mod.is_valid_quota_window(target_ts, now=now_1h_before))
+
+        # 窗内: 恰好当前 (now = target_ts)
+        self.assertTrue(self.mod.is_valid_quota_window(target_ts, now=target_ts))
+
+        # 窗内边界: 恰在 5.5 小时边缘 (now = target_ts - 5.5 * 3600)
+        now_5_5h_before = target_ts - 5.5 * 3600
+        self.assertTrue(self.mod.is_valid_quota_window(target_ts, now=now_5_5h_before))
+
+        # 窗外 (过去时间): reset_at 已经过去 10 秒
+        now_after = target_ts + 10
+        self.assertFalse(self.mod.is_valid_quota_window(target_ts, now=now_after))
+
+        # 窗外 (超期远期): reset_at 超过 5.5 小时 (如 6 小时后, 疑似周窗或时钟错配)
+        now_6h_before = target_ts - 6 * 3600
+        self.assertFalse(self.mod.is_valid_quota_window(target_ts, now=now_6h_before))
+
+        # None 或非法值
+        self.assertFalse(self.mod.is_valid_quota_window(None))
+
+    def test_non_1308_and_1309_rejected(self):
+        """1309 (周窗/月窗) 及其他未分类错误一律不进墙 (防睡死)"""
+        # 1309 周窗错误
+        err_1309 = (
+            "ProviderBusinessError: [1309][Usage limit reached for weekly quota. "
+            "Your limit will reset at 2026-09-25 18:43:16][req-weekly]"
+        )
+        self.assertIsNone(self.mod.parse_1308_reset_time(err_1309))
+
+        # 非 5 小时窗 (如 10 hour)
+        err_10h = "[1308][Usage limit reached for 10 hour. Your limit will reset at 2026-09-18 18:43:16]"
+        self.assertIsNone(self.mod.parse_1308_reset_time(err_10h))
+
+        # 非法日期格式
+        err_bad_date = "[1308][Usage limit reached for 5 hour. Your limit will reset at 2026-99-99 99:99:99]"
+        self.assertIsNone(self.mod.parse_1308_reset_time(err_bad_date))
+
+        # 常见 HTTP 4xx/5xx 与其它错误
+        self.assertIsNone(self.mod.parse_1308_reset_time("HTTP 401: Unauthorized"))
+        self.assertIsNone(self.mod.parse_1308_reset_time("HTTP 422: Unprocessable Entity"))
+        self.assertIsNone(self.mod.parse_1308_reset_time("HTTP 429: Too Many Requests"))
+        self.assertIsNone(self.mod.parse_1308_reset_time("审查子进程超时 (3720s)"))
+        self.assertIsNone(self.mod.parse_1308_reset_time(""))
+        self.assertIsNone(self.mod.parse_1308_reset_time(None))
+
+
+class TestQuotaWallStateMachine(_GateCase):
+    """F6 墙态机验证: 未撞墙正常启动、撞墙进墙、墙期跳过审查且条目不衰老、到点自醒、醒后再撞重写墙。"""
+
+    def test_wall_lifecycle_and_persistence(self):
+        path = os.path.join(self.tmp, "state.json")
+        store = self.mod.StateStore(path)
+        now = 10000.0
+
+        # 1. 未撞墙: 初始状态没有墙
+        self.assertEqual(store.get_quota_wall_until(), 0.0)
+        self.assertFalse(self.mod.is_quota_wall_active(store, now=now))
+
+        # 2. 撞墙进墙: reset=12000, 墙态应为 reset + 120s = 12120
+        reset_ts = 12000.0
+        wall_until = reset_ts + self.mod.WALL_BUFFER_SECONDS
+        store.set_quota_wall_until(wall_until)
+        self.assertTrue(self.mod.is_quota_wall_active(store, now=now))
+        self.assertEqual(store.get_quota_wall_until(), 12120.0)
+
+        # 持久化检验: save 后新实例回读
+        store.save()
+        store2 = self.mod.StateStore(path)
+        self.assertEqual(store2.get_quota_wall_until(), 12120.0)
+        self.assertTrue(self.mod.is_quota_wall_active(store2, now=now))
+
+        # 3. 墙期内 (now=12119 < 12120): 依然在墙内
+        self.assertTrue(self.mod.is_quota_wall_active(store2, now=12119.0))
+
+        # 4. 到点自然醒 (now=12120.0 >= 12120.0): 自动消墙, 不派 probe
+        self.assertFalse(self.mod.is_quota_wall_active(store2, now=12120.0))
+        self.assertFalse(self.mod.is_quota_wall_active(store2, now=12200.0))
+
+        # 5. 醒后再撞重写墙 (自愈环): 再次撞墙, 新 reset=15000 -> 新 wall_until=15120
+        new_reset = 15000.0
+        store2.set_quota_wall_until(new_reset + self.mod.WALL_BUFFER_SECONDS)
+        self.assertEqual(store2.get_quota_wall_until(), 15120.0)
+        self.assertTrue(self.mod.is_quota_wall_active(store2, now=12200.0))
+
+
+class TestQuotaLedgerMath(_GateCase):
+    """F6 记账数学验证: 滚动 5h 窗求和边界（恰好跨窗、窗满、空窗）。"""
+
+    def test_ledger_rolling_window_boundaries(self):
+        path = os.path.join(self.tmp, "state.json")
+        store = self.mod.StateStore(path)
+        now = 20000.0  # 5h 窗口为 [2000.0, 20000.0]
+
+        # 1. 空窗
+        usage = store.get_5h_usage(now=now)
+        self.assertEqual(usage["count"], 0)
+        self.assertEqual(usage["tokens"], 0)
+        self.assertIsNone(self.mod.check_watermark(usage, limit_count=10))
+
+        # 2. 恰好跨窗边界:
+        # ts = 1999.0 (now - 18001, 已跨窗, 应排除)
+        # ts = 2000.0 (now - 18000, 边界上, 应计入)
+        # ts = 5000.0 (窗内, 应计入)
+        store.record_review(ts=1999.0, count=1, tokens=50, pr="o/r#1")
+        store.record_review(ts=2000.0, count=1, tokens=100, pr="o/r#2")
+        store.record_review(ts=5000.0, count=1, tokens=200, pr="o/r#3")
+
+        usage = store.get_5h_usage(now=now)
+        # 1999.0 被排除, 只计入 2000.0 与 5000.0
+        self.assertEqual(usage["count"], 2)
+        self.assertEqual(usage["tokens"], 300)
+
+        # prune 检验: 淘汰超出 5h 的条目
+        store.prune_ledger(now=now)
+        ledger = store.data["quota_ledger"]
+        self.assertEqual(len(ledger), 2)
+        self.assertNotIn(1999.0, [e["ts"] for e in ledger])
+
+    def test_watermark_thresholds_80_and_95(self):
+        """observe-only: 80% 与 95% 两档阈值打日志, 只观测不断供不告警"""
+        logs = []
+        def fake_log(msg, level="INFO"):
+            logs.append((level, msg))
+
+        limit = 10
+        # 7 次 (70%): 未达 80%, 不触发
+        u7 = {"count": 7, "tokens": 0}
+        self.assertIsNone(self.mod.check_watermark(u7, limit_count=limit, log_fn=fake_log))
+        self.assertEqual(len(logs), 0)
+
+        # 8 次 (80%): 触发 80% 档位
+        u8 = {"count": 8, "tokens": 0}
+        ret8 = self.mod.check_watermark(u8, limit_count=limit, log_fn=fake_log)
+        self.assertEqual(ret8, "80%")
+        self.assertTrue(any("80%" in m and "WARNING" == lvl for lvl, m in logs))
+
+        # 9 次 (90%): 触发 80% 档位
+        logs.clear()
+        u9 = {"count": 9, "tokens": 0}
+        ret9 = self.mod.check_watermark(u9, limit_count=limit, log_fn=fake_log)
+        self.assertEqual(ret9, "80%")
+
+        # 10 次 (100% >= 95%, 窗满): 触发 95% 警戒水位
+        logs.clear()
+        u10 = {"count": 10, "tokens": 0}
+        ret10 = self.mod.check_watermark(u10, limit_count=limit, log_fn=fake_log)
+        self.assertEqual(ret10, "95%")
+        self.assertTrue(any("95%" in m and "WARNING" == lvl for lvl, m in logs))
+
+
+class TestFakeMcpServerQuotaWallIntegration(_GateCase):
+    """F6 集成验证: fake mcp-server 两形 1308 首撞进墙 + 墙期拒动 (计数断言) + 醒后自愈 + 负控。"""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GITHUB_TOKEN"] = "fake-token-123"
+        self.mcp_calls = []
+        self.api_calls = []
+
+    def _fake_urlopen(self, req, timeout=None, **kw):
+        url = req.full_url
+        method = req.get_method()
+        body = json.loads(req.data.decode("utf-8")) if req.data else None
+        self.api_calls.append((method, url, body))
+        if "/pulls?" in url:
+            return _FakeResp(self.pr_list)
+        if url.endswith("/comments"):
+            return _FakeResp({"html_url": "https://github.com/octo/hello#issuecomment-1"})
+        raise AssertionError(f"未预期 URL: {url}")
+
+    def _fake_run_factory(self, mcp_returncode, mcp_stdout, mcp_stderr):
+        def _run(cmd, *a, **kw):
+            if cmd[0] == "git":
+                if "clone" in cmd:
+                    os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
+                if "checkout" in cmd:
+                    self.checked_out = cmd[-1]
+                if "rev-parse" in cmd and cmd[-1] == "HEAD":
+                    return _CP(returncode=0, stdout=getattr(self, "checked_out", "") + "\n", stderr="")
+                return _CP(returncode=0, stdout="", stderr="")
+            if "--call" in cmd:
+                self.mcp_calls.append(json.loads(cmd[cmd.index("--call") + 2]))
+                return _CP(returncode=mcp_returncode, stdout=mcp_stdout, stderr=mcp_stderr)
+            raise AssertionError(f"未预期命令: {cmd}")
+        return _run
+
+    def _write_config(self):
+        cfg = {"repos": ["octo/hello"],
+               "state_file": os.path.join(self.tmp, "state.json"),
+               "clone_root": os.path.join(self.tmp, "clones"),
+               "review": {"depth": "deep", "focus": ""},
+               "retry": {"base_seconds": 300, "max_seconds": 3600, "max_attempts": 5},
+               "comment": {"enabled": True, "max_body": 60000}}
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        return path
+
+    def test_form1_1308_stderr_first_hit_enters_wall_and_second_refuses(self):
+        """形 1 (stderr 包含 1308 实测文本): 首撞进墙 + 同轮/下轮墙期拒动 (不发起子进程, 计数断言)"""
+        cfg_path = self._write_config()
+        self.pr_list = [
+            {"number": 5, "title": "pr 5", "head": {"sha": "a" * 40}, "base": {"ref": "main"}},
+            {"number": 6, "title": "pr 6", "head": {"sha": "b" * 40}, "base": {"ref": "main"}}
+        ]
+        now = 1789724596.0  # 18:43:16 (+08:00 = 1789728196) 的 1 小时前
+        stderr_1308 = (
+            "ProviderBusinessError: [1308][Usage limit reached for 5 hour. "
+            "Your limit will reset at 2026-09-18 18:43:16][req-form1]"
+        )
+        fake_run = self._fake_run_factory(1, json.dumps({"ok": False, "result": {"content": [{"type": "text", "text": "error"}]}}), stderr_1308)
+
+        with mock.patch.object(self.mod.subprocess, "run", fake_run), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
+             mock.patch.object(self.mod.time, "time", return_value=now):
+            rc = self.mod.main(["--once", "--config", cfg_path])
+            self.assertEqual(rc, 0)
+
+            # 计数断言: PR#5 首撞进墙 (第 1 次调 mcp-server);
+            # 紧接着处理 PR#6 时已被墙拦住, 绝对不发起第 2 次 mcp 子进程!
+            self.assertEqual(len(self.mcp_calls), 1)
+
+            with open(os.path.join(self.tmp, "state.json")) as f:
+                st = json.load(f)
+
+            # 墙态落盘: wall_until = 1789728196 + 120 = 1789728316
+            self.assertEqual(st["quota_wall_until"], 1789728316.0)
+
+            # 条目不衰老: PR#5 保持 pending, attempts=0
+            p5 = st["prs"]["octo/hello#5"]
+            self.assertEqual(p5["status"], "pending")
+            self.assertEqual(p5["attempts"], 0)
+
+            # PR#6 也被跳过: 保持 pending, attempts=0
+            p6 = st["prs"]["octo/hello#6"]
+            self.assertEqual(p6["status"], "pending")
+            self.assertEqual(p6["attempts"], 0)
+
+        # 下一轮轮询 (仍处于墙期内, now 推进 300s): 再次拒动
+        now_r2 = now + 300.0
+        with mock.patch.object(self.mod.subprocess, "run", fake_run), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
+             mock.patch.object(self.mod.time, "time", return_value=now_r2):
+            rc = self.mod.main(["--once", "--config", cfg_path])
+            self.assertEqual(rc, 0)
+            # 计数断言: mcp-server 仍为 1 次!
+            self.assertEqual(len(self.mcp_calls), 1)
+
+    def test_form2_1308_stdout_hours_and_wake_up_self_healing(self):
+        """形 2 (stdout 错误文本 + hours 复数): 首撞进墙 + 到点自醒续审 + 醒后再撞重写墙 (自愈环)"""
+        cfg_path = self._write_config()
+        self.pr_list = [{"number": 5, "title": "pr 5", "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
+        now = 1789724596.0  # 18:43:16 的 1 小时前
+        stdout_1308 = json.dumps({
+            "ok": False,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "ProviderBusinessError: [1308][Usage limit reached for 5 hours. Your limit will reset at 2026-09-18 18:43:16][req-form2]"
+                }],
+                "isError": True
+            }
+        })
+        run_form2 = self._fake_run_factory(1, stdout_1308, "")
+
+        # 1. 首撞进墙
+        with mock.patch.object(self.mod.subprocess, "run", run_form2), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
+             mock.patch.object(self.mod.time, "time", return_value=now):
+            rc = self.mod.main(["--once", "--config", cfg_path])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(self.mcp_calls), 1)
+
+            with open(os.path.join(self.tmp, "state.json")) as f:
+                st = json.load(f)
+            self.assertEqual(st["quota_wall_until"], 1789728316.0)
+            self.assertEqual(st["prs"]["octo/hello#5"]["status"], "pending")
+            self.assertEqual(st["prs"]["octo/hello#5"]["attempts"], 0)
+
+        # 2. 到点自醒 (now 推进到 reset+2min 之后: 1789728317.0)
+        now_wake = 1789728317.0
+        ok_report = "汇总: P0: 0 条, P1: 0 条, P2: 1 条\nMERGE: yes"
+        ok_stdout = json.dumps({"ok": True, "result": {"content": [{"type": "text", "text": ok_report}]}})
+        run_ok = self._fake_run_factory(0, ok_stdout, "")
+
+        with mock.patch.object(self.mod.subprocess, "run", run_ok), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
+             mock.patch.object(self.mod.time, "time", return_value=now_wake):
+            rc = self.mod.main(["--once", "--config", cfg_path])
+            self.assertEqual(rc, 0)
+            # 计数断言: 成功发起第 2 次调用
+            self.assertEqual(len(self.mcp_calls), 2)
+
+            with open(os.path.join(self.tmp, "state.json")) as f:
+                st = json.load(f)
+            self.assertEqual(st["prs"]["octo/hello#5"]["status"], "reviewed")
+            self.assertEqual(st["prs"]["octo/hello#5"]["verdict"], "pass")
+            self.assertEqual(len(st.get("quota_ledger", [])), 1)
+
+    def test_negative_control_401_or_422_normal_backoff(self):
+        """负控: 非墙 4xx (401/422/非限流) 行为不变——不进墙, 既有退避路径照旧, attempts+1"""
+        cfg_path = self._write_config()
+        self.pr_list = [{"number": 5, "title": "pr 5", "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
+        err_401 = json.dumps({
+            "ok": False,
+            "result": {
+                "content": [{"type": "text", "text": "HTTP 401: Unauthorized API key"}],
+                "isError": True
+            }
+        })
+        run_401 = self._fake_run_factory(1, err_401, "")
+
+        now = 10000.0
+        with mock.patch.object(self.mod.subprocess, "run", run_401), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
+             mock.patch.object(self.mod.time, "time", return_value=now):
+            rc = self.mod.main(["--once", "--config", cfg_path])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(self.mcp_calls), 1)
+
+            with open(os.path.join(self.tmp, "state.json")) as f:
+                st = json.load(f)
+            # 墙态不应被设置 (0.0)
+            self.assertEqual(st.get("quota_wall_until", 0.0), 0.0)
+            entry = st["prs"]["octo/hello#5"]
+            # 走既有退避: status=failed, attempts=1, next_retry_at 设定
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["attempts"], 1)
+            self.assertEqual(entry["next_retry_at"], now + 300.0)
+
+        # 第二轮: 退避未到点 (now=10100 < 10300)
+        with mock.patch.object(self.mod.subprocess, "run", run_401), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
+             mock.patch.object(self.mod.time, "time", return_value=now + 100.0):
+            rc = self.mod.main(["--once", "--config", cfg_path])
+            self.assertEqual(rc, 0)
+            # 仍未增加调用
+            self.assertEqual(len(self.mcp_calls), 1)
 
 
 if __name__ == "__main__":
