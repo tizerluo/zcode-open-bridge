@@ -173,7 +173,9 @@ class _OnceEndToEndBase(_GateCase):
       - pr_list / comment_behavior (ok | retryable | ratelimited | 404)
       - pr_get_behavior: 单 PR GET (#43 甄别器) 分流, None=不接此类请求
         (open | closed | error5xx | gone404 | nostate)
-      - review_report: 覆写默认成功报告 (超长/带标记场景)
+      - review_report: 覆写默认成功报告 (超长/带标记场景)。默认报告统一为
+        'P2: 2 条' 版 (收编前 WallSkips/Comment404/墙集成三类用
+        'P2: 1 条', verdict 判定不受影响 — verdict_from_counts 只看 P0/P1)
       - mcp_rc/mcp_stdout/mcp_stderr: --call 固定返回 (mcp_rc=None 时走
         成功报告路径); mcp_flip_phase: --call 返回前回调 (切 fake time 相位)
     记录: api_calls[(method, url, body)] / mcp_calls[审查 args dict] /
@@ -229,6 +231,10 @@ class _OnceEndToEndBase(_GateCase):
                                              "X-RateLimit-Reset": "1893456000"})
             if self.comment_behavior == "404":
                 raise _make_http_error(404)
+            if self.comment_behavior != "ok":
+                raise AssertionError(
+                    f"未预期评论行为 (comment_behavior="
+                    f"{self.comment_behavior!r}): {url}")
             return _FakeResp(
                 {"html_url": "https://github.com/octo/hello#issuecomment-1"})
         raise AssertionError(f"未预期 URL: {url}")
@@ -263,6 +269,13 @@ class _OnceEndToEndBase(_GateCase):
             return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
         raise AssertionError(f"未预期命令: {cmd}")
 
+    def _err_stdout(self, text, quota_limit=None):
+        """伪造 mcp-server --call 失败输出 (isError result, 可选结构化键)"""
+        result = {"content": [{"type": "text", "text": text}], "isError": True}
+        if quota_limit is not None:
+            result["quota_limit"] = quota_limit
+        return json.dumps({"ok": False, "result": result})
+
     def _write_config(self, repos=("octo/hello",), quota=None):
         cfg = {"repos": list(repos),
                "state_file": os.path.join(self.tmp, "state.json"),
@@ -289,11 +302,8 @@ class _OnceEndToEndBase(_GateCase):
         """--once + fake time (1308 墙态机轮: 同轮内多处 time.time() 须取
         同值; now 传数值恒值, 或无参回调 (审查完成切相位场景))"""
         fake_time = now if callable(now) else (lambda: now)
-        with mock.patch.object(self.mod.subprocess, "run", self._fake_run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen",
-                               self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", fake_time):
-            return self.mod.main(["--once", "--config", cfg_path])
+        with mock.patch.object(self.mod.time, "time", fake_time):
+            return self._run_once(cfg_path)
 
     def _state(self):
         with open(os.path.join(self.tmp, "state.json")) as f:
@@ -1359,8 +1369,7 @@ class TestOnceEndToEnd(_OnceEndToEndBase):
         同时钉住语义: 有 PR 失败时 --once 仍 exit 0 (失败记在 state, 不传染退出码)"""
         cfg_path = self._write_config()
         self.mcp_rc = 2
-        self.mcp_stdout = json.dumps({"ok": False, "result": {
-            "content": [{"type": "text", "text": "炸了"}], "isError": True}})
+        self.mcp_stdout = self._err_stdout("炸了")
 
         self.assertEqual(self._run_once(cfg_path), 0)
         entry = self._state_entry()
@@ -2048,16 +2057,9 @@ class TestFakeMcpServerQuotaWallIntegration(_OnceEndToEndBase):
         cfg_path = self._write_config()
         now = 1789724596.0  # 18:43:16 的 1 小时前
         self.mcp_rc = 1
-        self.mcp_stdout = json.dumps({
-            "ok": False,
-            "result": {
-                "content": [{
-                    "type": "text",
-                    "text": "ProviderBusinessError: [1308][Usage limit reached for 5 hours. Your limit will reset at 2026-09-18 18:43:16][req-form2]"
-                }],
-                "isError": True
-            }
-        })
+        self.mcp_stdout = self._err_stdout(
+            "ProviderBusinessError: [1308][Usage limit reached for 5 hours. "
+            "Your limit will reset at 2026-09-18 18:43:16][req-form2]")
 
         # 1. 首撞进墙
         self.assertEqual(self._run_once_at(cfg_path, now), 0)
@@ -2070,11 +2072,8 @@ class TestFakeMcpServerQuotaWallIntegration(_OnceEndToEndBase):
 
         # 2. 到点自醒 (now 推进到 reset+2min 之后: 1789728317.0)
         now_wake = 1789728317.0
-        ok_report = "汇总: P0: 0 条, P1: 0 条, P2: 1 条\nMERGE: yes"
-        self.mcp_rc = 0
-        self.mcp_stdout = json.dumps(
-            {"ok": True, "result": {"content": [{"type": "text", "text": ok_report}]}})
-        self.mcp_stderr = ""
+        self.mcp_rc = None   # 切回基类默认成功报告路径
+        self.review_report = "汇总: P0: 0 条, P1: 0 条, P2: 1 条\nMERGE: yes"
 
         self.assertEqual(self._run_once_at(cfg_path, now_wake), 0)
         # 计数断言: 成功发起第 2 次调用
@@ -2140,13 +2139,7 @@ class TestFakeMcpServerQuotaWallIntegration(_OnceEndToEndBase):
         cfg_path = self._write_config()
         now = 10000.0
         self.mcp_rc = 1
-        self.mcp_stdout = json.dumps({
-            "ok": False,
-            "result": {
-                "content": [{"type": "text", "text": "HTTP 401: Unauthorized API key"}],
-                "isError": True
-            }
-        })
+        self.mcp_stdout = self._err_stdout("HTTP 401: Unauthorized API key")
 
         self.assertEqual(self._run_once_at(cfg_path, now), 0)
         self.assertEqual(len(self.mcp_calls), 1)
@@ -2173,13 +2166,6 @@ class TestStructuredQuotaIntegration(_OnceEndToEndBase):
     结构化 reset_at 异常远期被 is_valid_quota_window 拒绝 (防睡死钉死)、
     键缺失退正则兜底、台账记完成时刻 (#42) 且 tokens 接 usage 透传 (#35②)、
     脏台账端到端 (#36): 成功审查不再被兜底 mark_failure。"""
-
-    def _err_stdout(self, text, quota_limit=None):
-        """伪造 mcp-server --call 失败输出 (isError result, 可选结构化键)"""
-        result = {"content": [{"type": "text", "text": text}], "isError": True}
-        if quota_limit is not None:
-            result["quota_limit"] = quota_limit
-        return json.dumps({"ok": False, "result": result})
 
     def test_structured_priority_enters_wall_without_text_hit(self):
         """(#35①) 结构化键优先: payload/正文/stderr 全无 1308 串, 只有
@@ -2293,10 +2279,7 @@ class TestStructuredQuotaIntegration(_OnceEndToEndBase):
         """(#35②) 成功结果无 usage 键 → tokens 0 兜底, 台账照记"""
         cfg_path = self._write_config()
         now = 10000.0
-        self.mcp_rc = 0
-        self.mcp_stdout = json.dumps({"ok": True, "result": {
-            "content": [{"type": "text",
-                         "text": "汇总: P0: 0 条, P1: 0 条, P2: 1 条\nMERGE: yes"}]}})
+        # 走基类默认成功路径 (无 usage 键)
 
         self.assertEqual(self._run_once_at(cfg_path, now), 0)
 
@@ -2550,8 +2533,7 @@ class TestWallSkipsRepoCloneFetch(_OnceEndToEndBase):
         # 进墙 (now+1h) + 新 head (待审非空): 本轮 git 子进程零发起,
         # mcp 审查零发起; 一条 INFO 说明跳过 (不打 WARNING 刷屏)
         self._set_wall(time.time() + 3600.0)
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "b" * 40}, "base": {"ref": "main"}}]
+        self.pr_list = [self._mkpr(5, "b" * 40)]
         with mock.patch.object(self.mod, "log") as m_log:
             self.assertEqual(self._run_once(cfg_path), 0)
         self.assertEqual(len(self.git_calls), git_after)
@@ -2604,11 +2586,7 @@ class TestWallSkipsRepoCloneFetch(_OnceEndToEndBase):
         self._set_wall(time.time() + 3600.0)
         self._force_retry_due()
         self.comment_behavior = "ok"
-        self.pr_list = [
-            {"number": 5, "title": "pr 5",
-             "head": {"sha": "a" * 40}, "base": {"ref": "main"}},
-            {"number": 6, "title": "pr 6",
-             "head": {"sha": "b" * 40}, "base": {"ref": "main"}}]
+        self.pr_list = [self._mkpr(5, "a" * 40), self._mkpr(6, "b" * 40)]
         with mock.patch.object(self.mod, "log") as m_log:
             self.assertEqual(self._run_once(cfg_path), 0)
         # 一句 INFO 涵盖被跳过的待重审 PR
