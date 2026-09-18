@@ -27,7 +27,9 @@ zcode-review-gate — PR 自动审查闸门守护进程 (zcode-open-bridge 第 4
     quota_limit 键 (reset_at 已是 unix 秒), 键缺失退失败 payload 正则
     兜底 (#39: 最左命中依赖 run_review 的拼接顺序); 两条路径同过
     is_valid_quota_window 防异常远期 reset_at 睡死闸。5h 台账记审查
-    完成时刻且接 usage.total_tokens 透传 (#42/#35②)。
+    完成时刻且接 usage.total_tokens 透传 (#42/#35②)。state 的墙/台账
+    两键脏值读取侧防御 (#36): 墙脏按无墙、台账脏条目按窗外淘汰
+    (prune 自愈), 成功审查不被脏 state 炸成 failed。
 
 依赖: 仅 Python3 标准库 (零第三方依赖)
 日志: 全部走 stderr (带时间戳前缀)
@@ -180,7 +182,9 @@ class GitError(Exception):
 def _as_int(value, default):
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(float('inf')) — json.loads 默认接受
+        # Infinity 字面量, state 脏 count/tokens 会以此形态穿到 (#36 R1-P1)
         return default
 
 
@@ -778,12 +782,63 @@ def build_comment_body(verdict, counts, head_sha, report, max_body):
 # ============================================================
 # 状态文件 (JSON, 原子写)
 # ============================================================
+# 脏 state 值的告警去重表 (#36): run_once 每轮轮询都新建 StateStore,
+# 脏墙值每轮都会重读, 不按 key 进程内去重会每 300s 刷一条 WARNING。
+# 同 key 进程内只报一次是刻意取舍: 脏值修复 (或被处理路径写回干净值)
+# 之后再变脏不重复提醒 — 防刷屏优先于二次告警。
+_DIRTY_STATE_WARNED = set()
+
+
+def _safe_float(value, default=0.0, warn_key=None):
+    """防御 float() (#36): 脏值 (None/嵌套 dict/非数字串/非有限数) 回 default。
+
+    - 数字串 ("12120") 容忍照转 — 手编 state 的本意可恢复, 不算脏;
+    - NaN/Infinity 拒收 (与 quota_limit_reset_ts 同口径): inf 墙值会
+      睡死闸, 回默认更 fail-safe;
+    - 接受 bool (float(True)=1.0, 有限): 墙/台账语义下结果 fail-safe;
+      与 quota_limit_reset_ts 显式拒 bool 的口径差异是有意的 — 那边
+      reset_at 是上游契约值须严格, 这边是自家 state 的容错读取;
+    - warn_key 非空时失败打一条 WARNING (按 key 去重只打一次, repr
+      截 120 字防 MB 级脏串打爆 stderr)。台账循环侧不传 warn_key:
+      单条目静默回退即可 — 脏条目按窗外被 prune 首轮淘汰自愈,
+      不长驻 state, 无每轮重复告警的源头。
+    """
+    try:
+        val = float(value)
+    except (TypeError, ValueError, OverflowError):
+        val = None
+    if val is None or not math.isfinite(val):
+        if warn_key and warn_key not in _DIRTY_STATE_WARNED:
+            _DIRTY_STATE_WARNED.add(warn_key)
+            log(f"state 值 {repr(value)[:120]} 非数字, 防御性按 {default} "
+                f"处理 ({warn_key})", "WARNING")
+        return default
+    return val
+
+
+def _entry_in_window(entry, cutoff):
+    """台账条目窗内判定 (#36): 非 dict 条目或 ts 脏一律视为窗外。
+
+    脏 ts 按 0 (1970 纪元) 处理 — 真实时钟下必然落在任何 5h 窗外:
+    get_5h_usage 不计入 (脏条目不污染用量统计), prune_ledger 视为陈旧
+    淘汰 (record_review 末尾的 prune 首轮即自愈清除, 不长驻 state)。
+    「ts=0=窗外」依赖 cutoff > 0 — 真实时钟 (now ≈ 1.7e9) 恒成立;
+    测试用假时钟须取 now > 18000 (默认窗长) 保 cutoff 为正, 否则
+    ts=0 会落进窗内。
+    不选「脏 ts 猜个值保进窗」: 猜值会把不可信条目钉进用量基线,
+    也救不回被污染的墙/水位判断, 拒窗更 fail-safe。
+    """
+    return (isinstance(entry, dict)
+            and _safe_float(entry.get("ts"), 0.0) >= cutoff)
+
+
 class StateStore:
     """PR 审查状态 (JSON 文件, 原子写: 同目录 tmp + os.replace)。
 
-    形状: {"prs": {"owner/repo#5": {head_sha, status, verdict, counts,
-    report, report_path, attempts, next_retry_at, reviewed_at, comment_url,
-    error}}}
+    形状: {"prs": {...}, "quota_wall_until": ..., "quota_ledger": [...]}
+    - prs: {"owner/repo#5": {head_sha, status, verdict, counts,
+      report, report_path, attempts, next_retry_at, reviewed_at,
+      comment_url, error}}
     status ∈ pending|reviewed|failed|comment_failed|gave_up:
       pending        — 一轮处理中的瞬态; 崩溃残留时下轮自然恢复
       failed         — 审查链路失败 (git/审查子进程), 进退避
@@ -795,6 +850,13 @@ class StateStore:
     comment.max_body, 尾部 VERDICT 行与标记存活), reviewed 后置 None 防
     state 膨胀。report_path 为成功审查落盘的原文路径 (reports/ 下),
     None = 落盘失败或旧 state 条目。
+    - quota_wall_until (#35/#37): 1308 额度墙截止 unix 秒 (float),
+      0/缺省 = 无墙; 撞墙时写 reset_at + WALL_BUFFER_SECONDS, 到点
+      自然消退。读取侧脏值防御按 0=无墙 (#36)。
+    - quota_ledger (#42/#37): 5h 滚动台账, 每条 {ts: 审查完成时刻
+      unix 秒, count: 次数, tokens: usage 透传 token 数,
+      pr: "owner/repo#N"}; prune_ledger 淘汰窗外条目防 state 膨胀,
+      脏条目按窗外淘汰自愈 (#36)。
     """
 
     def __init__(self, path):
@@ -833,13 +895,19 @@ class StateStore:
         self.data["prs"][key] = entry
 
     def get_quota_wall_until(self):
-        return float(self.data.get("quota_wall_until") or 0.0)
+        # 脏值按 0=无墙 (#36): 墙是节流优化而非正确性护栏, 值不可信时
+        # 放行审查比据脏值睡死更 fail-safe; 下次真撞 1308 会写回干净值
+        return _safe_float(self.data.get("quota_wall_until"), 0.0,
+                           warn_key="quota_wall_until")
 
     def set_quota_wall_until(self, until):
         self.data["quota_wall_until"] = float(until)
 
     def record_review(self, ts=None, count=1, tokens=0, pr=""):
-        """记录一次审查完成到 5h 滚动台账 (B件 记账代理)。"""
+        """记录一次审查完成到 5h 滚动台账 (B件 记账代理)。
+
+        追加条目自身必干净; 末尾 prune 兼做脏台账自愈 (#36)。
+        """
         if ts is None:
             ts = time.time()
         ledger = self.data.get("quota_ledger")
@@ -856,25 +924,35 @@ class StateStore:
         self.prune_ledger(now=ts)
 
     def prune_ledger(self, now=None, max_age_seconds=18000):
-        """淘汰超出 5 小时滚动窗的陈旧台账, 防止 state 文件无限膨胀。"""
+        """淘汰超出 5 小时滚动窗的陈旧台账, 防止 state 文件无限膨胀。
+
+        脏条目一并按窗外淘汰 (语义见 _entry_in_window) (#36)。
+        """
         if now is None:
             now = time.time()
         cutoff = now - max_age_seconds
         ledger = self.data.get("quota_ledger")
         if isinstance(ledger, list):
             self.data["quota_ledger"] = [
-                e for e in ledger if float(e.get("ts") or 0) >= cutoff
+                e for e in ledger if _entry_in_window(e, cutoff)
             ]
 
     def get_5h_usage(self, now=None, window_seconds=18000):
-        """计算当前 5 小时滚动窗口内的审查使用量 (次数与 token)。"""
+        """计算当前 5 小时滚动窗口内的审查使用量 (次数与 token)。
+
+        入窗条目 count/tokens 脏值回退 1/0 (#36)。
+        """
         if now is None:
             now = time.time()
         cutoff = now - window_seconds
-        ledger = self.data.get("quota_ledger") or []
-        window_entries = [e for e in ledger if float(e.get("ts") or 0) >= cutoff]
-        total_count = sum(int(e.get("count") or 1) for e in window_entries)
-        total_tokens = sum(int(e.get("tokens") or 0) for e in window_entries)
+        ledger = self.data.get("quota_ledger")
+        if not isinstance(ledger, list):
+            ledger = []
+        window_entries = [e for e in ledger if _entry_in_window(e, cutoff)]
+        total_count = sum(_as_int(e.get("count") or 1, 1)
+                          for e in window_entries)
+        total_tokens = sum(_as_int(e.get("tokens"), 0)
+                           for e in window_entries)
         return {
             "count": total_count,
             "tokens": total_tokens,
@@ -895,8 +973,13 @@ def needs_review(entry, head_sha, now):
     status = entry.get("status")
     if status in ("reviewed", "gave_up"):
         return False                                    # 同 sha 已审 / 已放弃
+    # (#36 P2) next_retry_at 脏回退 0=立即可审 (fail-safe): 脏 "abc" 旧代码
+    # 在一切 try 之外抛 ValueError 穿透 run_once 崩进程; Infinity 则
+    # inf > now 恒真 → 永远 False, PR 被静默永久跳过 (与墙 inf 睡死同型)。
+    # 回退 0 后进处理即自愈 (mark_failure 写回干净退避值)。
     if status in ("failed", "comment_failed") \
-            and float(entry.get("next_retry_at") or 0) > now:
+            and _safe_float(entry.get("next_retry_at"), 0.0,
+                            warn_key="next_retry_at") > now:
         return False                                    # 退避未到点
     return True                     # failed 到点重试 / comment_failed 补评论
                                     # / pending 断点恢复
@@ -910,7 +993,9 @@ def mark_failure(entry, error, now, cfg, status="failed"):
     status="comment_failed" 用于评论失败 (审查结果已缓存在 entry,
     重试只补评论); 缓存不清, gave_up 时也保留供人工排查。
     """
-    entry["attempts"] = int(entry.get("attempts") or 0) + 1
+    # (#36 P2) attempts 脏值经 _as_int 回退 0 起计: 裸 int() 会在这个
+    # 失败处理器里二次抛错, 穿透 process_repo 兜底 except 烧掉守护进程
+    entry["attempts"] = _as_int(entry.get("attempts"), 0) + 1
     entry["error"] = str(error)[:500]
     if status == "failed":
         entry["verdict"] = None     # 审查链路失败: 旧 verdict 不再可信
