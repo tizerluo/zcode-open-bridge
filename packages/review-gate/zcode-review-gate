@@ -30,6 +30,11 @@ zcode-review-gate — PR 自动审查闸门守护进程 (zcode-open-bridge 第 4
     完成时刻且接 usage.total_tokens 透传 (#42/#35②)。state 的墙/台账
     两键脏值读取侧防御 (#36): 墙脏按无墙、台账脏条目按窗外淘汰
     (prune 自愈), 成功审查不被脏 state 炸成 failed。
+  - 运行期行为 (#38/#40/#43): 墙期内有待审 PR 时整仓跳过 clone/fetch
+    (per-PR 墙检查保留作双保险); 水位巡检按档位去重 — 严格升档才报
+    WARNING, 回落 <80% 才复位 (state.watermark_last_tier 跨轮持久);
+    评论 404 先 GET 单 PR 甄别: open 判列表→评论竞态走 comment_failed
+    缓存补评论, 确认关闭/删除才静默跳过, 甄别不可得保守走原 404 路径。
 
 依赖: 仅 Python3 标准库 (零第三方依赖)
 日志: 全部走 stderr (带时间戳前缀)
@@ -393,6 +398,35 @@ def post_comment(token, api_base, owner, repo, pr_number, body):
         token, api_base, "POST",
         f"/repos/{owner}/{repo}/issues/{pr_number}/comments",
         body={"body": body})
+
+
+def classify_comment_404(token, api_base, owner, repo, pr_number):
+    """(#43) 评论 404 甄别器: GET 单个 PR, 区分瞬态竞态与真已关闭/删除。
+
+    评论端点 404 有两种成因, 处置完全不同:
+      - 新建 PR 的「列表→评论」竞态: 列表拉到时 PR 尚未完全就绪, 评论
+        404 但 PR 实为 open → 应走 comment_failed 缓存路径, 下轮同 head
+        只补评论, 不为一次评论失败重跑昂贵的 deep 审查;
+      - PR 在列表拉取后被关闭/删除: 下轮列表自然收敛, 静默跳过即可。
+    返回三态:
+      "open"    — GET 200 且 state=open (竞态);
+      "gone"    — GET 200 且 state!=open, 或 GET 404 (确认关闭/删除);
+      "unknown" — GET 其他错误 (5xx/网络/限流): 甄别不可得, 保守按原
+                  RepoHardError 路径处理 — 不烧 attempts 不启用缓存,
+                  下轮全额重审。宁可浪费一次审查, 也不据不可得的甄别
+                  信息判定终态。
+    复用 github_request 的 token 注入与错误分类, 不另起 HTTP 封装。
+    """
+    try:
+        pr = github_request(token, api_base, "GET",
+                            f"/repos/{owner}/{repo}/pulls/{pr_number}")
+    except RepoHardError:
+        return "gone"
+    except (RetryableError, RateLimited):
+        return "unknown"
+    if not isinstance(pr, dict):
+        return "unknown"
+    return "open" if pr.get("state") == "open" else "gone"
 
 
 # ============================================================
@@ -857,6 +891,10 @@ class StateStore:
       unix 秒, count: 次数, tokens: usage 透传 token 数,
       pr: "owner/repo#N"}; prune_ledger 淘汰窗外条目防 state 膨胀,
       脏条目按窗外淘汰自愈 (#36)。
+    - watermark_last_tier (#40/#37): 水位巡检档位去重键 (int, 0=低于80 /
+      1=80-95 / 2=≥95, 缺省 0=未报过); check_watermark 严格升档才报
+      WARNING、回落 <80% 才复位 (跨轮持久)。脏值读取回退 0=未报过
+      (#36 同口径, fail-safe: 重报一条好过漏报)。
     """
 
     def __init__(self, path):
@@ -902,6 +940,17 @@ class StateStore:
 
     def set_quota_wall_until(self, until):
         self.data["quota_wall_until"] = float(until)
+
+    def get_watermark_last_tier(self):
+        """(#40) 读水位档位键 (0/1/2); 脏值 (非数字/嵌套/NaN·Infinity/
+        超 float 上限巨整) 经 _safe_float + _as_int 双层防御回退 0=未报过
+        (#36 同口径), 结果钳回 [0,2] — 手编越界档位不外溢进升档比较。"""
+        tier = _as_int(
+            _safe_float(self.data.get("watermark_last_tier"), 0.0), 0)
+        return min(max(tier, 0), 2)
+
+    def set_watermark_last_tier(self, tier):
+        self.data["watermark_last_tier"] = int(tier)
 
     def record_review(self, ts=None, count=1, tokens=0, pr=""):
         """记录一次审查完成到 5h 滚动台账 (B件 记账代理)。
@@ -1169,10 +1218,16 @@ def is_quota_wall_active(state, now=None):
     return state.get_quota_wall_until() > now
 
 
-def check_watermark(usage, limit_count=0, limit_tokens=0, log_fn=log):
+def check_watermark(usage, state, limit_count=0, limit_tokens=0, log_fn=log):
     """水位巡检 (observe-only): 80%/95% 两档阈值打日志, 只观测不断供不告警。
 
-    返回触发的最高档位 ("95%" | "80%" | None)。
+    (#40) 档位去重降噪: tier = 0 (<80%) / 1 (80-95%) / 2 (≥95%),
+    严格升档才报 WARNING — 80%→95% 必须再报一次 (不是同值去重),
+    同档位只报一次; 回落低于 80% 才复位 (回落即复位语义已裁定),
+    复位后再次爬回 80% 会再报。79-81% 抖动场景回落复位 + 再触发各报
+    一条是接受的取舍 (好过观察期内每轮刷一条)。档位经
+    state.watermark_last_tier 跨轮持久 (键说明见 StateStore docstring)。
+    返回本次报出的最高档位 ("95%" | "80%" | None; 去重/未达档为 None)。
     """
     levels = []
     if limit_count > 0:
@@ -1187,14 +1242,23 @@ def check_watermark(usage, limit_count=0, limit_tokens=0, log_fn=log):
 
     max_ratio, desc = max(levels, key=lambda x: x[0])
     pct = max_ratio * 100.0
+    tier = 2 if pct >= 95.0 else (1 if pct >= 80.0 else 0)
 
-    if pct >= 95.0:
-        log_fn(f"[水位巡检] 5h 额度使用率达到 95% 警戒水位: {pct:.1f}% ({desc})", "WARNING")
-        return "95%"
-    elif pct >= 80.0:
-        log_fn(f"[水位巡检] 5h 额度使用率达到 80% 水位: {pct:.1f}% ({desc})", "WARNING")
-        return "80%"
-    return None
+    last_tier = state.get_watermark_last_tier()
+    reported = None
+    if tier > last_tier:
+        if tier == 2:
+            log_fn(f"[水位巡检] 5h 额度使用率达到 95% 警戒水位: {pct:.1f}% ({desc})", "WARNING")
+            reported = "95%"
+        else:
+            log_fn(f"[水位巡检] 5h 额度使用率达到 80% 水位: {pct:.1f}% ({desc})", "WARNING")
+            reported = "80%"
+        state.set_watermark_last_tier(tier)
+    elif tier == 0 and last_tier > 0:
+        # 回落低于 80% 才复位: 中途降档 (95→82) 不复位, 未破 80 再爬回
+        # 95 不算新事件, 不重报
+        state.set_watermark_last_tier(0)
+    return reported
 
 
 # ============================================================
@@ -1296,7 +1360,7 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
         # 审查时长; tokens 接结构化透传值, 无 usage 时 0 兜底。
         state.record_review(tokens=rinfo["total_tokens"], pr=key)
         usage = state.get_5h_usage(now)
-        check_watermark(usage, cfg.quota_limit_5h, cfg.quota_tokens_5h)
+        check_watermark(usage, state, cfg.quota_limit_5h, cfg.quota_tokens_5h)
 
         marker = parse_verdict_marker(report)
         counts = parse_severity_counts(report)
@@ -1349,9 +1413,28 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
                          status="comment_failed")
             return
         except RepoHardError as e:
-            # 评论 404: PR 在拉取列表后被关闭/删除属常态, 不烧重试次数,
-            # 留下次轮询的列表自然收敛
-            log(f"{key}: 评论端点 404 (PR 已关闭?), 跳过: {e}", "WARNING")
+            # 评论 404 (#43): 先甄别 PR 真实状态再定处置 —
+            #   open    → 列表→评论竞态 (新建 PR 尚未就绪): 走 comment_failed,
+            #             report 缓存已就位, attempts+1 进退避, 下轮同 head
+            #             只补评论不重跑 deep 审查 (立即重试大概率仍在竞态
+            #             窗口内, 交给退避下轮更稳)。gave_up 语义随之变化:
+            #             只有「持续 open 却持续 404」的异常 PR 才会烧满
+            #             attempts 到 gave_up — 异常路径该有终止态, 有意
+            #             变更 (现行是 404 永不 gave_up)。
+            #   gone    → PR 确认已关闭/删除: 静默跳过, 不烧 attempts 不
+            #             启用缓存, 下轮列表自然收敛。
+            #   unknown → 甄别不可得 (5xx/网络): 保守走原 RepoHardError
+            #             路径 (处置同 gone, WARNING 级日志保留线索)。
+            cls = classify_comment_404(token, cfg.github_api, owner, repo,
+                                       info["number"])
+            if cls == "open":
+                mark_failure(entry, f"评论 404 (PR 实为 open, 判竞态): {e}",
+                             now, cfg, status="comment_failed")
+            elif cls == "gone":
+                log(f"{key}: 评论端点 404, PR 已关闭/删除, 跳过: {e}", "INFO")
+            else:
+                log(f"{key}: 评论端点 404, 甄别不可得, 按原路径跳过: {e}",
+                    "WARNING")
             return
         except RateLimited:
             # 限流不烧 attempts (仓级事件), 但置 comment_failed 让下轮
@@ -1399,6 +1482,19 @@ def process_repo(cfg, state, token, repo_full, pr_filter):
         log(f"{repo_full}: {len(infos)} 个 open PR, 无待审新 head")
         return
     log(f"{repo_full}: {len(infos)} 个 open PR, {len(todo)} 个待审")
+
+    # (#38) 墙期上提检查: 有待审 PR 但处于 1308 额度墙期内 → 本轮跳过
+    # 整仓的 clone/fetch — 墙最长 5.5h, 每轮白跑 repo 级 git 网络操作
+    # 纯属浪费 (INFO 一句, 不打 WARNING 刷屏)。语义红线: 必须在 todo
+    # 判空之后 — 无待审 PR 时本来就不 clone, 该早退语义不变。
+    # process_pr 内的 per-PR 墙检查保留不动, 作双保险: 防将来这里的
+    # 上提检查被重构掉后, 墙期又漏跑审查烧额度。
+    if is_quota_wall_active(state, now):
+        until = state.get_quota_wall_until()
+        until_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
+        log(f"{repo_full}: 处于 1308 额度墙期内 (至 {until_str}), "
+            f"跳过 {len(todo)} 个待审 PR 与 clone/fetch")
+        return
 
     try:
         clone = ensure_clone(cfg, token, owner, repo)

@@ -39,6 +39,13 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
   - 评论失败两路径: RetryableError → comment_failed+退避+缓存, 下轮只补评论;
     RateLimited → 不烧 attempts 有缓存, 下轮只补评论
   - CLI: --repo 覆盖配置 repos; --pr 过滤生效; 有 PR 失败 --once 仍 exit 0
+  - 运行期行为 (#38/#40/#43): 墙期内整仓跳过 clone/fetch (git 子进程计数
+    为 0, 一条 INFO 不刷 WARNING; 墙外照跑; todo 空 → 早退语义不变);
+    水位巡检档位去重 (严格升档才报 / 80→95 再报 / 同档一次 / 回落 <80
+    复位后再爬回再报 / 脏档位回退 0 / watermark_last_tier 跨轮落盘生效);
+    评论 404 甄别三分支 (GET open → comment_failed 缓存+attempts+下轮只补
+    评论; GET closed/404 → 静默跳过 INFO 不烧不缓存; GET 5xx → 保守原路径
+    WARNING, 下轮全额重审)
 
 运行: python3 tests/test_review_gate.py
 依赖: 仅 Python 标准库
@@ -53,6 +60,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import types
 import unittest
 import urllib.error
@@ -1171,7 +1179,7 @@ class TestOnceEndToEnd(_GateCase):
             return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
         raise AssertionError(f"未预期命令: {cmd}")
 
-    def _write_config(self, repos=("octo/hello",)):
+    def _write_config(self, repos=("octo/hello",), quota=None):
         cfg = {"repos": list(repos),
                "state_file": os.path.join(self.tmp, "state.json"),
                "clone_root": os.path.join(self.tmp, "clones"),
@@ -1179,6 +1187,8 @@ class TestOnceEndToEnd(_GateCase):
                "retry": {"base_seconds": 300, "max_seconds": 3600,
                          "max_attempts": 5},
                "comment": {"enabled": True, "max_body": 60000}}
+        if quota is not None:
+            cfg["quota"] = quota
         path = os.path.join(self.tmp, "config.json")
         with open(path, "w") as f:
             json.dump(cfg, f)
@@ -1388,6 +1398,33 @@ class TestOnceEndToEnd(_GateCase):
         entry = self._state_entry()
         self.assertEqual(entry["status"], "reviewed")
         self.assertIsNone(entry["report"])
+
+    def test_watermark_tier_persists_across_rounds(self):
+        """(#40) watermark_last_tier 跨轮持久: 第一轮 1/1=100% 报一次 95% 档;
+        第二轮新 PR 审查后累计 2/1 仍 ≥95% 档 → 不再报 (键经 state.json 落盘,
+        run_once 每轮新建 StateStore 回读生效 — 若只在内存去重, 第二轮
+        会按未报过再报一条)"""
+        cfg_path = self._write_config(quota={"limit_5h": 1})
+        reported = []
+        real_wm = self.mod.check_watermark
+
+        def spy_wm(*a, **kw):
+            ret = real_wm(*a, **kw)
+            reported.append(ret)
+            return ret
+
+        with mock.patch.object(self.mod, "check_watermark", spy_wm):
+            # 第一轮: PR#5 审查完成 → 台账 1/1 → 升档报 95%, 键落盘
+            self.assertEqual(self._run_once(cfg_path), 0)
+            self.assertEqual(reported, ["95%"])
+            with open(os.path.join(self.tmp, "state.json")) as f:
+                self.assertEqual(json.load(f)["watermark_last_tier"], 2)
+
+            # 第二轮: PR#6 (新 head) 审查完成 → 累计 2/1 = 200% 仍 95 档
+            # → 持久化的档位键生效, 去重不再报
+            self.pr_list = [self._mkpr(5, self.pr_sha), self._mkpr(6, "c" * 40)]
+            self.assertEqual(self._run_once(cfg_path), 0)
+            self.assertEqual(reported, ["95%", None])
 
     def test_repo_flag_overrides_config_repos(self):
         """CLI --repo 覆盖配置文件 repos"""
@@ -1600,7 +1637,7 @@ class TestQuotaLedgerMath(_GateCase):
         usage = store.get_5h_usage(now=now)
         self.assertEqual(usage["count"], 0)
         self.assertEqual(usage["tokens"], 0)
-        self.assertIsNone(self.mod.check_watermark(usage, limit_count=10))
+        self.assertIsNone(self.mod.check_watermark(usage, store, limit_count=10))
 
         # 2. 恰好跨窗边界:
         # ts = 1999.0 (now - 18001, 已跨窗, 应排除)
@@ -1621,36 +1658,99 @@ class TestQuotaLedgerMath(_GateCase):
         self.assertEqual(len(ledger), 2)
         self.assertNotIn(1999.0, [e["ts"] for e in ledger])
 
-    def test_watermark_thresholds_80_and_95(self):
-        """observe-only: 80% 与 95% 两档阈值打日志, 只观测不断供不告警"""
+    def test_watermark_tier_dedup_and_reset_lifecycle(self):
+        """(#40) 档位去重: 严格升档才报 WARNING (80→95 必须再报), 同档
+        只报一次; 回落 <80% 才复位 (95→82 中途降档不复位), 复位后再爬回
+        80% 会再报。observe-only 语义不变: 只打日志不断供不告警。"""
         logs = []
+
         def fake_log(msg, level="INFO"):
             logs.append((level, msg))
 
+        store = self.mod.StateStore(os.path.join(self.tmp, "state.json"))
         limit = 10
+        u = lambda n: {"count": n, "tokens": 0}  # noqa: E731
+        wm = lambda n: self.mod.check_watermark(  # noqa: E731
+            u(n), store, limit_count=limit, log_fn=fake_log)
+
         # 7 次 (70%): 未达 80%, 不触发
-        u7 = {"count": 7, "tokens": 0}
-        self.assertIsNone(self.mod.check_watermark(u7, limit_count=limit, log_fn=fake_log))
-        self.assertEqual(len(logs), 0)
+        self.assertIsNone(wm(7))
+        self.assertEqual(logs, [])
+        self.assertEqual(store.get_watermark_last_tier(), 0)
 
-        # 8 次 (80%): 触发 80% 档位
-        u8 = {"count": 8, "tokens": 0}
-        ret8 = self.mod.check_watermark(u8, limit_count=limit, log_fn=fake_log)
-        self.assertEqual(ret8, "80%")
-        self.assertTrue(any("80%" in m and "WARNING" == lvl for lvl, m in logs))
+        # 8 次 (80%): 升档 0→1, 报 80% 水位
+        self.assertEqual(wm(8), "80%")
+        self.assertTrue(any("80%" in m and lvl == "WARNING" for lvl, m in logs))
+        self.assertEqual(store.get_watermark_last_tier(), 1)
 
-        # 9 次 (90%): 触发 80% 档位
+        # 9 次 (90%): 同档 (1), 去重不再报 — 观察期持续噪音消除点
         logs.clear()
-        u9 = {"count": 9, "tokens": 0}
-        ret9 = self.mod.check_watermark(u9, limit_count=limit, log_fn=fake_log)
-        self.assertEqual(ret9, "80%")
+        self.assertIsNone(wm(9))
+        self.assertEqual(logs, [])
 
-        # 10 次 (100% >= 95%, 窗满): 触发 95% 警戒水位
+        # 10 次 (100% ≥95%): 严格升档 1→2, 必须再报一次 (非同值去重)
+        self.assertEqual(wm(10), "95%")
+        self.assertTrue(any("95%" in m and lvl == "WARNING" for lvl, m in logs))
+        self.assertEqual(store.get_watermark_last_tier(), 2)
+
+        # 再来一轮 10 次: 同档 (2), 不再报
         logs.clear()
-        u10 = {"count": 10, "tokens": 0}
-        ret10 = self.mod.check_watermark(u10, limit_count=limit, log_fn=fake_log)
-        self.assertEqual(ret10, "95%")
-        self.assertTrue(any("95%" in m and "WARNING" == lvl for lvl, m in logs))
+        self.assertIsNone(wm(10))
+        self.assertEqual(logs, [])
+
+        # 9 次 (90%): 中途降档 2→1 但未破 80 — 不复位, 不报
+        self.assertIsNone(wm(9))
+        self.assertEqual(logs, [])
+        self.assertEqual(store.get_watermark_last_tier(), 2)
+
+        # 再爬回 10 次: 未复位 (last 仍 2), 不算新事件不报
+        self.assertIsNone(wm(10))
+        self.assertEqual(logs, [])
+
+        # 7 次 (70%): 回落低于 80% → 复位 (回落即复位)
+        self.assertIsNone(wm(7))
+        self.assertEqual(store.get_watermark_last_tier(), 0)
+
+        # 再爬回 8 次: 复位后再触发, 会再报 (79-81% 抖动的接受取舍)
+        self.assertEqual(wm(8), "80%")
+        self.assertEqual(store.get_watermark_last_tier(), 1)
+
+    def test_watermark_dirty_last_tier_falls_back_unreported(self):
+        """(#40/#36) watermark_last_tier 脏值经 _safe_float + _as_int 双层
+        防御回退 0=未报过, 不外抛 — 下一档爬升照常再报 (fail-safe: 重报
+        一条好过漏报)"""
+        path = os.path.join(self.tmp, "state.json")
+        with open(path, "w") as f:
+            json.dump({"prs": {}, "watermark_last_tier": "abc"}, f)
+        store = self.mod.StateStore(path)
+        # JSON 落盘的脏形态 + 进程内直塞的脏形态一并钉住 (bool 除外:
+        # _safe_float 口径明确容忍 bool — float(True)=1 有限, 结果 fail-safe)
+        for dirty in ["abc", None, {"k": 1}, [1, 2], float("inf"),
+                      float("nan"), 10 ** 400]:
+            store.data["watermark_last_tier"] = dirty
+            with mock.patch.object(self.mod, "log"):
+                self.assertEqual(store.get_watermark_last_tier(), 0,
+                                 f"脏档位 {dirty!r} 应回退 0")
+        # 数字串容忍 (手编 state 本意可恢复, 与墙键同口径): "2" 照转
+        store.data["watermark_last_tier"] = "2"
+        self.assertEqual(store.get_watermark_last_tier(), 2)
+        # 越界值钳回 [0,2]
+        store.data["watermark_last_tier"] = 7
+        self.assertEqual(store.get_watermark_last_tier(), 2)
+        store.data["watermark_last_tier"] = -3
+        self.assertEqual(store.get_watermark_last_tier(), 0)
+
+        # 功能面: 脏档位下 80% 照常报 (不因脏值误判"已报过"而漏报)
+        logs = []
+
+        def fake_log(msg, level="INFO"):
+            logs.append((level, msg))
+
+        store.data["watermark_last_tier"] = {"dirty": 1}
+        ret = self.mod.check_watermark({"count": 8, "tokens": 0}, store,
+                                       limit_count=10, log_fn=fake_log)
+        self.assertEqual(ret, "80%")
+        self.assertTrue(any("80%" in m and lvl == "WARNING" for lvl, m in logs))
 
 
 class TestStateStoreDirtyDefense(_GateCase):
@@ -2431,6 +2531,293 @@ class TestReportPersistenceAndRotation(_GateCase):
 
         store2 = self.mod.StateStore(path)
         self.assertEqual(store2.get("octo/hello#5")["report_path"], "/some/path.md")
+
+
+# ============================================================
+# #38 墙期上提检查: 整仓跳过 clone/fetch
+# ============================================================
+class TestWallSkipsRepoCloneFetch(_GateCase):
+    """(#38) 有待审 PR 且处于 1308 墙期内 → 本轮整仓跳过 clone/fetch
+    (git 子进程零发起, 计数断言); 墙外正常路径 clone/fetch 照跑; todo
+    为空时先走「无待审新 head」早退, 墙检查不触发额外行为 (该早退语义
+    不许变 — 墙检查必须放在 todo 判空之后)。"""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GITHUB_TOKEN"] = "fake-token-123"
+        self.pr_list = [{"number": 5, "title": "pr 5",
+                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
+        self.git_calls = []
+        self.mcp_calls = []
+
+    def _fake_urlopen(self, req, timeout=None, **kw):
+        url = req.full_url
+        if "/pulls?" in url:
+            return _FakeResp(self.pr_list)
+        if url.endswith("/comments"):
+            return _FakeResp(
+                {"html_url": "https://github.com/octo/hello#issuecomment-1"})
+        raise AssertionError(f"未预期 URL: {url}")
+
+    def _fake_run(self, cmd, *a, **kw):
+        if cmd[0] == "git":
+            self.git_calls.append(list(cmd))
+            if "clone" in cmd:
+                # 假 clone 也要建出 .git, 否则每轮都重复 clone
+                os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
+            if "checkout" in cmd:
+                self.checked_out = cmd[-1]
+            if "rev-parse" in cmd and cmd[-1] == "HEAD":
+                return _CP(returncode=0,
+                           stdout=getattr(self, "checked_out", "") + "\n",
+                           stderr="")
+            return _CP(returncode=0, stdout="", stderr="")
+        if "--call" in cmd:
+            self.mcp_calls.append(json.loads(cmd[cmd.index("--call") + 2]))
+            payload = {"ok": True, "result": {
+                "content": [{"type": "text",
+                             "text": "汇总: P0: 0 条, P1: 0 条, P2: 1 条"}]}}
+            return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
+        raise AssertionError(f"未预期命令: {cmd}")
+
+    def _write_config(self):
+        cfg = {"repos": ["octo/hello"],
+               "state_file": os.path.join(self.tmp, "state.json"),
+               "clone_root": os.path.join(self.tmp, "clones"),
+               "review": {"depth": "deep", "focus": ""},
+               "retry": {"base_seconds": 300, "max_seconds": 3600,
+                         "max_attempts": 5},
+               "comment": {"enabled": True, "max_body": 60000}}
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        return path
+
+    def _run_once(self, cfg_path):
+        with mock.patch.object(self.mod.subprocess, "run", self._fake_run), \
+             mock.patch.object(self.mod.urllib.request, "urlopen",
+                               self._fake_urlopen):
+            return self.mod.main(["--once", "--config", cfg_path])
+
+    def _set_wall(self, until):
+        """把墙态直接写进 state 文件 (模拟上一轮撞 1308 进墙)"""
+        path = os.path.join(self.tmp, "state.json")
+        with open(path) as f:
+            st = json.load(f)
+        st["quota_wall_until"] = until
+        with open(path, "w") as f:
+            json.dump(st, f)
+
+    def test_wall_round_runs_zero_git_subprocess(self):
+        cfg_path = self._write_config()
+
+        # 墙外正常路径: clone/fetch 照跑 (git 子进程非零, 含 clone 与 fetch)
+        self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertTrue(any("clone" in c for c in self.git_calls))
+        self.assertTrue(any("fetch" in c for c in self.git_calls))
+        git_after = len(self.git_calls)
+        mcp_after = len(self.mcp_calls)
+
+        # 进墙 (now+1h) + 新 head (待审非空): 本轮 git 子进程零发起,
+        # mcp 审查零发起; 一条 INFO 说明跳过 (不打 WARNING 刷屏)
+        self._set_wall(time.time() + 3600.0)
+        self.pr_list = [{"number": 5, "title": "pr 5",
+                         "head": {"sha": "b" * 40}, "base": {"ref": "main"}}]
+        with mock.patch.object(self.mod, "log") as m_log:
+            self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertEqual(len(self.git_calls), git_after)
+        self.assertEqual(len(self.mcp_calls), mcp_after)
+        wall_msgs = [c for c in m_log.call_args_list
+                     if "额度墙期内" in c.args[0]]
+        self.assertEqual(len(wall_msgs), 1)
+        # 默认级 INFO (log 不带 level 参数即 INFO): 不打 WARNING 刷屏
+        self.assertIn(wall_msgs[0].args[1:], ((), ("INFO",)))
+        # 早退发生在 process_pr 之前: 新 head 连 entry 都未建 (per-PR 的
+        # pending 标记路径未到达 — 上提检查先兜住了)
+        with open(os.path.join(self.tmp, "state.json")) as f:
+            self.assertEqual(list(json.load(f)["prs"]), ["octo/hello#5"])
+
+    def test_empty_todo_wall_check_inert(self):
+        # todo 为空 (同 head 已 reviewed): 仍走「无待审新 head」早退 —
+        # 即使墙态生效, 墙检查也不触发额外行为 (无待审本来就不 clone)
+        cfg_path = self._write_config()
+        self.assertEqual(self._run_once(cfg_path), 0)
+        self._set_wall(time.time() + 3600.0)
+        git_after = len(self.git_calls)
+        with mock.patch.object(self.mod, "log") as m_log:
+            self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertEqual(len(self.git_calls), git_after)
+        wall_msgs = [c for c in m_log.call_args_list
+                     if "额度墙期内" in c.args[0]]
+        self.assertEqual(wall_msgs, [])
+        self.assertTrue(any("无待审新 head" in c.args[0]
+                            for c in m_log.call_args_list))
+
+
+# ============================================================
+# #43 评论 404 甄别器 (三分支)
+# ============================================================
+class TestComment404Disambiguation(_GateCase):
+    """(#43) 评论 POST 404 后 GET 单 PR 甄别 (fake urlopen 按 URL 分流):
+      ① GET open    → 判瞬态竞态: comment_failed + report 缓存 + attempts=1,
+                      退避到点后同 head 只补评论 (mcp 调用计数不再 +1);
+      ② GET closed / GET 404 → PR 确认关闭/删除: 静默跳过 (不烧 attempts、
+                      不启用缓存分支、一句 INFO);
+      ③ GET 5xx     → 甄别不可得: 保守走原 RepoHardError 路径 (WARNING,
+                      不烧不缓存), 下轮同 head 全额重审。"""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GITHUB_TOKEN"] = "fake-token-123"
+        os.environ.pop("GH_TOKEN", None)
+        self.pr_list = [{"number": 5, "title": "pr 5",
+                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
+        self.comment_behavior = "404"     # 404 | ok
+        self.pr_get_behavior = "open"     # open | closed | error5xx | gone404
+        self.api_calls = []
+        self.mcp_calls = []
+
+    def _fake_urlopen(self, req, timeout=None, **kw):
+        url = req.full_url
+        method = req.get_method()
+        body = json.loads(req.data.decode("utf-8")) if req.data else None
+        self.api_calls.append((method, url, body))
+        if "/pulls?" in url:
+            return _FakeResp(self.pr_list)
+        if "/pulls/" in url:              # 单 PR GET (#43 甄别器)
+            if self.pr_get_behavior == "open":
+                return _FakeResp({"number": 5, "state": "open"})
+            if self.pr_get_behavior == "closed":
+                return _FakeResp({"number": 5, "state": "closed"})
+            if self.pr_get_behavior == "error5xx":
+                raise _make_http_error(502)
+            if self.pr_get_behavior == "gone404":
+                raise _make_http_error(404)
+            raise AssertionError(
+                f"未预期 pr_get_behavior: {self.pr_get_behavior}")
+        if url.endswith("/comments"):
+            if self.comment_behavior == "404":
+                raise _make_http_error(404)
+            return _FakeResp(
+                {"html_url": "https://github.com/octo/hello#issuecomment-1"})
+        raise AssertionError(f"未预期 URL: {url}")
+
+    def _fake_run(self, cmd, *a, **kw):
+        if cmd[0] == "git":
+            if "clone" in cmd:
+                os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
+            if "checkout" in cmd:
+                self.checked_out = cmd[-1]
+            if "rev-parse" in cmd and cmd[-1] == "HEAD":
+                return _CP(returncode=0,
+                           stdout=getattr(self, "checked_out", "") + "\n",
+                           stderr="")
+            return _CP(returncode=0, stdout="", stderr="")
+        if "--call" in cmd:
+            self.mcp_calls.append(json.loads(cmd[cmd.index("--call") + 2]))
+            payload = {"ok": True, "result": {
+                "content": [{"type": "text",
+                             "text": "汇总: P0: 0 条, P1: 0 条, P2: 1 条"}]}}
+            return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
+        raise AssertionError(f"未预期命令: {cmd}")
+
+    def _write_config(self):
+        cfg = {"repos": ["octo/hello"],
+               "state_file": os.path.join(self.tmp, "state.json"),
+               "clone_root": os.path.join(self.tmp, "clones"),
+               "review": {"depth": "deep", "focus": ""},
+               "retry": {"base_seconds": 300, "max_seconds": 3600,
+                         "max_attempts": 5},
+               "comment": {"enabled": True, "max_body": 60000}}
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        return path
+
+    def _run_once(self, cfg_path):
+        with mock.patch.object(self.mod.subprocess, "run", self._fake_run), \
+             mock.patch.object(self.mod.urllib.request, "urlopen",
+                               self._fake_urlopen):
+            return self.mod.main(["--once", "--config", cfg_path])
+
+    def _state_entry(self, key="octo/hello#5"):
+        with open(os.path.join(self.tmp, "state.json")) as f:
+            return json.load(f)["prs"][key]
+
+    def _force_retry_due(self, key="octo/hello#5"):
+        """模拟退避到点: 把 next_retry_at 拨回过去"""
+        path = os.path.join(self.tmp, "state.json")
+        with open(path) as f:
+            st = json.load(f)
+        st["prs"][key]["next_retry_at"] = 0
+        with open(path, "w") as f:
+            json.dump(st, f)
+
+    def test_404_get_open_transient_race_caches_report(self):
+        """① 评论 404 + GET open (新建 PR 竞态): comment_failed + 缓存 +
+        attempts=1 进退避; 退避到点后同 head 只补评论, 不重跑审查"""
+        cfg_path = self._write_config()
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "comment_failed")
+        self.assertEqual(entry["attempts"], 1)
+        self.assertGreater(entry["next_retry_at"], 0)   # 交给既有退避
+        self.assertTrue(entry["report"])                # 审查结果已缓存
+        self.assertEqual(entry["verdict"], "pass")
+        # 甄别 GET 确实发起过 (评论 POST 404 之后一次)
+        pr_gets = [c for c in self.api_calls if c[0] == "GET"
+                   and "/pulls/5" in c[1]]
+        self.assertEqual(len(pr_gets), 1)
+
+        # 退避到点 + 评论恢复 → 只补评论不重审
+        self.comment_behavior = "ok"
+        self._force_retry_due()
+        self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertEqual(len(self.mcp_calls), 1)        # mcp 不再 +1
+        self.assertEqual(
+            len([c for c in self.api_calls if c[0] == "POST"]), 2)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "reviewed")
+        self.assertIsNone(entry["report"])
+
+    def test_404_get_closed_silent_skip(self):
+        """② 评论 404 + 确认关闭/删除 (GET closed / GET 404): 静默跳过 —
+        不烧 attempts、不启用缓存 (status 保持 pending), 一句 INFO"""
+        for behavior in ("closed", "gone404"):
+            with self.subTest(pr_get=behavior):
+                self.pr_get_behavior = behavior
+                cfg_path = self._write_config()
+                mcp_before = len(self.mcp_calls)
+                with mock.patch.object(self.mod, "log") as m_log:
+                    self.assertEqual(self._run_once(cfg_path), 0)
+                entry = self._state_entry()
+                self.assertEqual(entry["status"], "pending")
+                self.assertEqual(entry["attempts"], 0)
+                self.assertEqual(entry["next_retry_at"], 0.0)
+                self.assertEqual(len(self.mcp_calls), mcp_before + 1)
+                skips = [c for c in m_log.call_args_list
+                         if c.args[1:] == ("INFO",) and "404" in c.args[0]]
+                self.assertEqual(len(skips), 1)
+
+    def test_404_get_5xx_unknown_keeps_original_hard_error_path(self):
+        """③ 评论 404 + GET 5xx: 甄别不可得 → 保守走原 RepoHardError 路径
+        (WARNING + 不烧 attempts 不缓存); 下轮同 head 全额重审"""
+        cfg_path = self._write_config()
+        self.pr_get_behavior = "error5xx"
+        with mock.patch.object(self.mod, "log") as m_log:
+            self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "pending")
+        self.assertEqual(entry["attempts"], 0)
+        warns = [c for c in m_log.call_args_list
+                 if c.args[1:] == ("WARNING",) and "404" in c.args[0]]
+        self.assertEqual(len(warns), 1)
+
+        # 下轮 (pending 无退避立即可审): 全额重跑 deep 审查 (保守取舍)
+        self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertEqual(len(self.mcp_calls), 2)
+        self.assertEqual(
+            len([c for c in self.api_calls if c[0] == "POST"]), 2)
 
 
 if __name__ == "__main__":
