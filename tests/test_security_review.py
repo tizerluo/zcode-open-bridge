@@ -5,7 +5,7 @@ test_security_review.py — review 只读护栏 + zcode_security_review 管线�
   - _build_review_cmd: yolo + 写/执行工具全黑名单 + --json, 不含 plan
   - review prompt 含"只审不修"约束
   - _extract_response: --json 输出提取 (response, usage.totalTokens) / 非 JSON
-    原样返回 / tokens 非法形状 (含 bool) 回 None
+    原样返回 / tokens 非法形状 (含 bool) 回 None / 负值钳 0
   - _find_mimosa_root: env 覆盖 / 找不到返回 None
   - MimosaMcpClient: stdio JSON-RPC 握手 + tools/call (假 server 实测)
   - _mimosa_quick_scan: content 提取 / isError 抛异常
@@ -251,6 +251,12 @@ class TestExtractResponse(unittest.TestCase):
             out = json.dumps({"response": "正文", "usage": usage})
             self.assertEqual(self.mod._extract_response(out), ("正文", None),
                              f"usage={usage!r} 时 tokens 应为 None")
+
+    def test_ex6_negative_tokens_clamped_to_zero(self):
+        """EX6 (R1 P3-3): 负 token 数是 provider bug → 钳 0 (非弃键),
+        防下游 5h 台账被负值抵扣"""
+        out = json.dumps({"response": "正文", "usage": {"totalTokens": -5}})
+        self.assertEqual(self.mod._extract_response(out), ("正文", 0))
 
     def test_ex3_end_to_end_via_tool(self):
         """tool_zcode_review 成功路径返回的是提取后的 response, 不是整个 JSON"""
@@ -1122,6 +1128,7 @@ class TestPrReview(_EnvGuard):
                 if sub == "diff":
                     return _FakeCompletedProcess(0, diff_text, "")
             captured["cmd"] = cmd  # zcode 调用
+            captured["zcode_calls"] = captured.get("zcode_calls", 0) + 1
             # 附件临时文件 finally 才清理, 这里顺便读回内容供断言
             with open(cmd[cmd.index("--attach") + 1]) as fh:
                 captured["attachment"] = fh.read()
@@ -1673,8 +1680,10 @@ class TestStructuredQuotaOutput(_EnvGuard):
 
     def test_sq1_1308_stderr_attaches_quota_limit_and_keeps_text(self):
         """SQ1: 1308 stderr → isError result 顶层附 quota_limit (unix 秒);
-        isError 文本一字不删保留 1308 串 (旧 gate 正则路径兼容钉死)"""
-        result, _ = self._pr_review(zcode_rc=1, zcode_stderr=self._STDERR_1308)
+        isError 文本一字不删保留 1308 串 (旧 gate 正则路径兼容钉死)。
+        恰被调用 1 次: 1308 不进 mcp-server 重试 — 这是 #39 最左命中论证
+        ("多枚 1308 串必同事件同 reset") 的支点, 重试语义变更会在这里红。"""
+        result, captured = self._pr_review(zcode_rc=1, zcode_stderr=self._STDERR_1308)
         self.assertTrue(result.get("isError"))
         self.assertEqual(result.get("quota_limit"),
                          {"code": 1308, "reset_at": self._TS_1789728196})
@@ -1682,6 +1691,7 @@ class TestStructuredQuotaOutput(_EnvGuard):
                       result["content"][0]["text"])
         self.assertIn("Your limit will reset at 2026-09-18 18:43:16",
                       result["content"][0]["text"])
+        self.assertEqual(captured["zcode_calls"], 1, "1308 不应触发重试")
 
     def test_sq2_non_1308_error_no_quota_key(self):
         """SQ2: 非 1308 错误 → isError 但不加 quota_limit 键"""
@@ -1692,10 +1702,14 @@ class TestStructuredQuotaOutput(_EnvGuard):
 
     def test_sq3_usage_passthrough_with_and_without(self):
         """SQ3: 成功结果 usage.totalTokens (camelCase) → 顶层 usage.total_tokens
-        (snake_case); 无 usage 字段不加键"""
+        (snake_case); 负值钳 0 (R1 P3-3, 防下游 5h 台账抵扣); 无 usage 不加键"""
         result, _ = self._pr_review(zcode_usage={"totalTokens": 12345})
         self.assertNotIn("isError", result)
         self.assertEqual(result.get("usage"), {"total_tokens": 12345})
+
+        result_neg, _ = self._pr_review(zcode_usage={"totalTokens": -7})
+        self.assertNotIn("isError", result_neg)
+        self.assertEqual(result_neg.get("usage"), {"total_tokens": 0})
 
         result_no, _ = self._pr_review()      # 默认 zcode_usage=None
         self.assertNotIn("isError", result_no)
@@ -1714,9 +1728,34 @@ class TestStructuredQuotaOutput(_EnvGuard):
             result = mod.tool_zcode_review({"code": "x"})
         finally:
             mod.subprocess.run = saved
-            os.environ.pop("ZCODE_BRIDGE_REVIEW_LOCK", None)
         self.assertNotIn("isError", result)
         self.assertNotIn("usage", result)
+
+    def test_sq4b_security_review_keeps_result_shape(self):
+        """SQ4b: zcode_security_review 对称验证 — 成功 (带 usage 的输出) 与
+        1308 失败两态都不附 quota_limit/usage 键 (structured_output 只开给
+        pr_review)"""
+        mod, saved, proj = TestSecurityReviewTool._patch_common(self)
+        payload = json.dumps(
+            {"response": "正文", "usage": {"totalTokens": 7}})
+        saved_run = mod.subprocess.run
+        try:
+            mod.subprocess.run = lambda *a, **kw: _FakeCompletedProcess(
+                0, payload, "")
+            result = mod.tool_zcode_security_review({"path": proj})
+            self.assertNotIn("isError", result)
+            self.assertNotIn("usage", result)
+            self.assertNotIn("quota_limit", result)
+
+            mod.subprocess.run = lambda *a, **kw: _FakeCompletedProcess(
+                1, "", self._STDERR_1308)
+            result_err = mod.tool_zcode_security_review({"path": proj})
+            self.assertTrue(result_err.get("isError"))
+            self.assertNotIn("quota_limit", result_err)
+            self.assertNotIn("usage", result_err)
+        finally:
+            mod.subprocess.run = saved_run
+            TestSecurityReviewTool._restore_common(self, mod, saved)
 
     def test_sq5_call_once_serializes_extra_keys(self):
         """SQ5: --call 一次性模式 (gate 消费路径) 的信封不丢顶层附加键"""

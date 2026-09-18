@@ -1088,7 +1088,8 @@ def _extract_response(output):
 
     (#35) 第二返回值供 usage 透传: zcode --json 原始字段是 camelCase 的
     usage.totalTokens, 消费方转成仓内 snake_case 键; 无 usage 字段 / 非整数
-    (bool 是 int 子类, 显式排除) / 非 --json 输出 → None (调用方不加键)。
+    (bool 是 int 子类, 显式排除) / 非 --json 输出 → None (调用方不加键);
+    负整数是 provider bug, 钳 0 防下游 5h 台账被抵扣。
     """
     data = _parse_result_json(output)
     if data is not None and isinstance(data.get("response"), str):
@@ -1096,6 +1097,8 @@ def _extract_response(output):
         tokens = usage.get("totalTokens") if isinstance(usage, dict) else None
         if isinstance(tokens, bool) or not isinstance(tokens, int):
             tokens = None
+        elif tokens < 0:
+            tokens = 0
         return data["response"], tokens
     return output, None
 

@@ -25,7 +25,8 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
   - ensure_clone: 半成品重建 / clone 失败清理 / web 宿主推导
   - run_review: 坏 JSON / 空报告 / OSError / TimeoutExpired / 超时透传 / stderr 尾部
   - 结构化 1308 消费 (#35①/#39/#42): quota_limit 键优先进墙 / 远期 reset_at
-    拒绝 (防睡死) / 键缺失退正则兜底 / 台账记完成时刻 + tokens 透传
+    拒绝 (防睡死, 含双路并存: 结构化窗外 + 正文窗内仍退避) / NaN·Infinity 按
+    形状不符 / 键缺失退正则兜底 / 台账记完成时刻 + tokens 透传 (负值钳 0)
   - mcp_server 解析: PATH 命中 / ~/.local/bin 回退 / 不可执行不用 / 原样兜底
   - --once 全链路 (新 sha → 审+评+落盘; 同 sha 不重复; 新 sha 重审 attempts 清零)
   - 评论失败两路径: RetryableError → comment_failed+退避+缓存, 下轮只补评论;
@@ -1080,7 +1081,8 @@ class TestRunReview(_GateCase):
         self.assertEqual(info["total_tokens"], 0)  # 失败结果无 usage
 
     def test_usage_tokens_unpacked_into_info(self):
-        """成功结果的 usage.total_tokens 透传进 info; 非法形状回 0"""
+        """成功结果的 usage.total_tokens 透传进 info; 非法形状回 0;
+        负值钳 0 (R1 P3-3, 负 token 入台账会抵扣 5h 用量)"""
         payload = {"ok": True, "result": {
             "content": [{"type": "text", "text": "报告"}],
             "usage": {"total_tokens": 12345}}}
@@ -1090,7 +1092,7 @@ class TestRunReview(_GateCase):
         self.assertEqual(info["total_tokens"], 12345)
         self.assertIsNone(info["quota_limit"])
 
-        for bad in (True, "12345", 1.5, None, {"x": 1}):
+        for bad in (True, "12345", 1.5, None, {"x": 1}, -7):
             payload_bad = {"ok": True, "result": {
                 "content": [{"type": "text", "text": "报告"}],
                 "usage": {"total_tokens": bad}}}
@@ -1516,7 +1518,7 @@ class TestQuotaClassifier(_GateCase):
         self.assertIsNone(self.mod.parse_1308_reset_time(None))
 
     def test_quota_limit_reset_ts_shapes(self):
-        """(#35①) 结构化键形状校验: 只认 {"code": 1308, "reset_at": 数值}"""
+        """(#35①) 结构化键形状校验: 只认 {"code": 1308, "reset_at": 有限数值}"""
         f = self.mod.quota_limit_reset_ts
         # 合法 (int / float / 字符串数字不算)
         self.assertEqual(f({"code": 1308, "reset_at": 1789728196}), 1789728196.0)
@@ -1529,6 +1531,15 @@ class TestQuotaClassifier(_GateCase):
         self.assertIsNone(f({"code": 1308}))                      # 缺 reset_at
         self.assertIsNone(f({"code": 1308, "reset_at": "123"}))   # 字符串不算
         self.assertIsNone(f({"code": 1308, "reset_at": True}))    # bool 不算 (int 子类)
+        # NaN/Infinity/-Infinity: json.loads 默认接受这些字面量, 会穿透 isinstance
+        # 数值判定 (R1 P3-1) — 非有限按形状不符, 退正则兜底
+        self.assertIsNone(f({"code": 1308, "reset_at": float("nan")}))
+        self.assertIsNone(f({"code": 1308, "reset_at": float("inf")}))
+        self.assertIsNone(f({"code": 1308, "reset_at": float("-inf")}))
+        # 钉住 "字面量确实能穿过 json.loads" 这条前提 (若未来禁了 NaN 反而更安全)
+        parsed = json.loads('{"code": 1308, "reset_at": NaN}')
+        self.assertNotEqual(parsed["reset_at"], parsed["reset_at"])  # NaN != NaN
+        self.assertIsNone(f(parsed))
 
 
 class TestQuotaWallStateMachine(_GateCase):
@@ -1936,6 +1947,33 @@ class TestStructuredQuotaIntegration(_GateCase):
         self.assertEqual(st.get("quota_wall_until", 0.0), 0.0)  # 不进墙
         entry = st["prs"]["octo/hello#5"]
         self.assertEqual(entry["status"], "failed")             # 既有退避
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(entry["next_retry_at"], now + 300.0)
+
+    def test_structured_far_future_with_valid_regex_text_still_backoff(self):
+        """(#35① 双路并存) 结构化形状合法但窗口非法 (reset +6h), 正文同时带
+        窗内合法 1308 串 (reset +1h, 正则单独命中会进墙) → 仍走退避不进墙。
+        钉住 process_pr 的 `if reset_ts is None` 回退语义: 结构化命中后不再
+        请教正则 — 改成"窗口非法再试正则"会让本测试红。"""
+        cfg_path = self._write_config()
+        self.pr_list = [{"number": 5, "title": "pr 5",
+                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
+        now = 1789724596.0                     # 正文串 reset 1789728196 = +1h, 窗内
+        stdout = self._err_stdout(
+            "zcode 调用失败: ProviderBusinessError: [1308][Usage limit reached "
+            "for 5 hour. Your limit will reset at 2026-09-18 18:43:16][req-x]",
+            quota_limit={"code": 1308, "reset_at": now + 6 * 3600})  # 窗外
+        run = self._fake_run_factory(1, stdout, "")
+
+        with mock.patch.object(self.mod.subprocess, "run", run), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
+             mock.patch.object(self.mod.time, "time", return_value=now):
+            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
+
+        st = self._state()
+        self.assertEqual(st.get("quota_wall_until", 0.0), 0.0, "不得进墙")
+        entry = st["prs"]["octo/hello#5"]
+        self.assertEqual(entry["status"], "failed")
         self.assertEqual(entry["attempts"], 1)
         self.assertEqual(entry["next_retry_at"], now + 300.0)
 

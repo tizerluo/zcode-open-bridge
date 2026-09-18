@@ -37,6 +37,7 @@ import argparse
 import base64
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -607,8 +608,8 @@ def run_review(cfg, clone, base_ref, head_sha):
       quota_limit: {"code": 1308, "reset_at": <unix 秒>} | None — 仅 stderr
         命中 1308 才有 (mcp-server 侧已完成北京 naive → unix 转换);
       total_tokens: int — 成功时 usage.total_tokens 透传, 无则 0。
-    子进程异常/非 JSON 输出时为空 info。仅作形状预筛, 键的合法性校验在
-    消费端 (quota_limit_reset_ts), 这里不猜不修。
+    子进程异常/非 JSON 输出时为空 info。quota_limit 原样透传 (键缺失为
+    None), 合法性校验全在消费端 (quota_limit_reset_ts), 这里不猜不修。
     """
     args = {
         "path": clone,
@@ -635,15 +636,17 @@ def run_review(cfg, clone, base_ref, head_sha):
     except json.JSONDecodeError:
         return False, f"mcp-server 输出非 JSON (exit={p.returncode}): {out[:300]}", info
     result = data.get("result") if isinstance(data.get("result"), dict) else {}
-    if isinstance(result.get("quota_limit"), dict):
-        info["quota_limit"] = result["quota_limit"]
+    # quota_limit 原样透传: 形状校验全在消费端 (quota_limit_reset_ts),
+    # 非 dict 在那里回 None → 正则兜底, 这里不重复判
+    info["quota_limit"] = result.get("quota_limit")
     usage = result.get("usage")
     if isinstance(usage, dict):
         tokens = usage.get("total_tokens")
-        # 信任边界外 (子进程输出): bool 是 int 子类, 显式排除; 非法形状回 0
+        # 信任边界外 (子进程输出): bool 是 int 子类, 显式排除; 非法形状回 0;
+        # 负值是子进程侧 bug, 钳 0 防抵扣 5h 台账 (mcp-server 侧已钳, 这里双保险)
         if isinstance(tokens, bool) or not isinstance(tokens, int):
             tokens = 0
-        info["total_tokens"] = tokens
+        info["total_tokens"] = max(0, tokens)
     if p.returncode != 0 or not data.get("ok"):
         detail = _result_text(data)[:500]
         # 失败时把子进程 stderr 尾部带进错误 (超时/限流等细节都在 stderr)
@@ -1055,6 +1058,10 @@ def quota_limit_reset_ts(quota_limit):
     ts = quota_limit.get("reset_at")
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return None
+    if not math.isfinite(ts):
+        # json.loads 默认接受 NaN/Infinity/-Infinity 字面量, 会穿透 isinstance
+        # 数值判定; 非有限值按形状不符处理 (None → 退正则兜底, 不进墙)
+        return None
     return float(ts)
 
 
@@ -1202,7 +1209,7 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
         # 台账口径 (#42): 记完成时刻 (record_review 默认取 time.time()), 不传
         # 入口捕获的 now — 审查最长可跑 ~3720s, 启动时刻口径最多偏移一个
         # 审查时长; tokens 接结构化透传值, 无 usage 时 0 兜底。
-        state.record_review(count=1, tokens=rinfo.get("total_tokens") or 0, pr=key)
+        state.record_review(tokens=rinfo["total_tokens"], pr=key)
         usage = state.get_5h_usage(now)
         check_watermark(usage, cfg.quota_limit_5h, cfg.quota_tokens_5h)
 
