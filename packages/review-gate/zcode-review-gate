@@ -41,7 +41,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 VERSION = "0.1.0"
 
