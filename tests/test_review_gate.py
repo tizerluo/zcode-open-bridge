@@ -47,6 +47,13 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
     评论 404 甄别三分支 (GET open → comment_failed 缓存+attempts+下轮只补
     评论; GET closed/404 → 静默跳过 INFO 不烧不缓存; GET 5xx → 保守原路径
     WARNING, 下轮全额重审)
+  - 墙自愈环 (#41② 集成级): 轮 1 撞 1308 进墙 → 时间推进墙醒 → 轮 2
+    再撞 1308 (reset 更晚) → 墙态重写为新 reset+buffer (不残留旧值,
+    单调推后), 新墙期内照常拒动 (mcp 计数逐轮钉住不烧额度)
+  - comment_failed 墙期分支序补缺 (#41①): 退避未到点的 comment_failed
+    墙期不被豁免唤醒 (退避门先于墙豁免, 无待审早退语义不变); head 变化
+    的 comment_failed 不算补评论 (墙期整仓跳过 entry 原样, 墙醒后新
+    head 复活全额重审, 缓存不沿用)
 
 运行: python3 tests/test_review_gate.py
 依赖: 仅 Python 标准库
@@ -156,6 +163,153 @@ class _GateCase(_EnvGuard):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
         super().tearDown()
+
+
+class _OnceEndToEndBase(_GateCase):
+    """--once 全链路测试的公共 fake 基座: 同一套 urlopen/git/mcp fake +
+    config 写入 + run_once + state 读取, 各测试类继承后只保留行为差异。
+
+    可配置点 (setUp 后按需覆写):
+      - pr_list / comment_behavior (ok | retryable | ratelimited | 404)
+      - pr_get_behavior: 单 PR GET (#43 甄别器) 分流, None=不接此类请求
+        (open | closed | error5xx | gone404 | nostate)
+      - review_report: 覆写默认成功报告 (超长/带标记场景)
+      - mcp_rc/mcp_stdout/mcp_stderr: --call 固定返回 (mcp_rc=None 时走
+        成功报告路径); mcp_flip_phase: --call 返回前回调 (切 fake time 相位)
+    记录: api_calls[(method, url, body)] / mcp_calls[审查 args dict] /
+    git_calls[(cmd, env)]
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GITHUB_TOKEN"] = "fake-token-123"
+        os.environ.pop("GH_TOKEN", None)
+        self.pr_sha = "a" * 40
+        self.pr_list = [self._mkpr(5, self.pr_sha)]
+        self.comment_behavior = "ok"
+        self.pr_get_behavior = None
+        self.review_report = None    # 覆写默认报告 (超长/带标记场景)
+        self.mcp_rc = None
+        self.mcp_stdout = None
+        self.mcp_stderr = ""
+        self.mcp_flip_phase = None
+        self.api_calls = []    # (method, url, body)
+        self.mcp_calls = []    # 审查 args dict
+        self.git_calls = []    # (cmd list, env)
+
+    def _mkpr(self, number, sha, base="main"):
+        return {"number": number, "title": f"pr {number}",
+                "head": {"sha": sha}, "base": {"ref": base}}
+
+    def _fake_urlopen(self, req, timeout=None, **kw):
+        url = req.full_url
+        body = json.loads(req.data.decode("utf-8")) if req.data else None
+        self.api_calls.append((req.get_method(), url, body))
+        if "/pulls?" in url:
+            return _FakeResp(self.pr_list)
+        if "/pulls/" in url:              # 单 PR GET (#43 甄别器)
+            if self.pr_get_behavior == "open":
+                return _FakeResp({"number": 5, "state": "open"})
+            if self.pr_get_behavior == "closed":
+                return _FakeResp({"number": 5, "state": "closed"})
+            if self.pr_get_behavior == "error5xx":
+                raise _make_http_error(502)
+            if self.pr_get_behavior == "gone404":
+                raise _make_http_error(404)
+            if self.pr_get_behavior == "nostate":
+                return _FakeResp({"number": 5})    # 200 但缺 state 键
+            raise AssertionError(
+                f"未预期单 PR GET (pr_get_behavior="
+                f"{self.pr_get_behavior!r}): {url}")
+        if url.endswith("/comments"):
+            if self.comment_behavior == "retryable":
+                raise _make_http_error(500)
+            if self.comment_behavior == "ratelimited":
+                raise _make_http_error(403, {"X-RateLimit-Remaining": "0",
+                                             "X-RateLimit-Reset": "1893456000"})
+            if self.comment_behavior == "404":
+                raise _make_http_error(404)
+            return _FakeResp(
+                {"html_url": "https://github.com/octo/hello#issuecomment-1"})
+        raise AssertionError(f"未预期 URL: {url}")
+
+    def _fake_run(self, cmd, *a, **kw):
+        if cmd[0] == "git":
+            self.git_calls.append((list(cmd), kw.get("env")))
+            if "clone" in cmd:
+                # 假 clone 也要建出 .git, 否则每轮都重复 clone
+                os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
+            if "checkout" in cmd:
+                # issue #17: 记住工作区切到的 sha, 供 rev-parse HEAD 回读
+                self.checked_out = cmd[-1]
+            if "rev-parse" in cmd and cmd[-1] == "HEAD":
+                return _CP(returncode=0,
+                           stdout=getattr(self, "checked_out", "") + "\n",
+                           stderr="")
+            return _CP(returncode=0, stdout="", stderr="")
+        if "--call" in cmd:
+            idx = cmd.index("--call")
+            self.assertEqual(cmd[idx + 1], "zcode_pr_review")
+            self.mcp_calls.append(json.loads(cmd[idx + 2]))
+            if self.mcp_flip_phase is not None:
+                self.mcp_flip_phase()
+            if self.mcp_rc is not None:
+                return _CP(returncode=self.mcp_rc, stdout=self.mcp_stdout,
+                           stderr=self.mcp_stderr)
+            report = self.review_report or (
+                "汇总: P0: 0 条, P1: 0 条, P2: 2 条\n一切正常。")
+            payload = {"ok": True, "result": {
+                "content": [{"type": "text", "text": report}]}}
+            return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
+        raise AssertionError(f"未预期命令: {cmd}")
+
+    def _write_config(self, repos=("octo/hello",), quota=None):
+        cfg = {"repos": list(repos),
+               "state_file": os.path.join(self.tmp, "state.json"),
+               "clone_root": os.path.join(self.tmp, "clones"),
+               "review": {"depth": "deep", "focus": ""},
+               "retry": {"base_seconds": 300, "max_seconds": 3600,
+                         "max_attempts": 5},
+               "comment": {"enabled": True, "max_body": 60000}}
+        if quota is not None:
+            cfg["quota"] = quota
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        return path
+
+    def _run_once(self, cfg_path, extra_args=()):
+        with mock.patch.object(self.mod.subprocess, "run", self._fake_run), \
+             mock.patch.object(self.mod.urllib.request, "urlopen",
+                               self._fake_urlopen):
+            return self.mod.main(["--once", "--config", cfg_path,
+                                  *extra_args])
+
+    def _run_once_at(self, cfg_path, now):
+        """--once + fake time (1308 墙态机轮: 同轮内多处 time.time() 须取
+        同值; now 传数值恒值, 或无参回调 (审查完成切相位场景))"""
+        fake_time = now if callable(now) else (lambda: now)
+        with mock.patch.object(self.mod.subprocess, "run", self._fake_run), \
+             mock.patch.object(self.mod.urllib.request, "urlopen",
+                               self._fake_urlopen), \
+             mock.patch.object(self.mod.time, "time", fake_time):
+            return self.mod.main(["--once", "--config", cfg_path])
+
+    def _state(self):
+        with open(os.path.join(self.tmp, "state.json")) as f:
+            return json.load(f)
+
+    def _state_entry(self, key="octo/hello#5"):
+        return self._state()["prs"][key]
+
+    def _force_retry_due(self, key="octo/hello#5"):
+        """模拟退避到点: 把 next_retry_at 拨回过去 (不等真实 300s)"""
+        path = os.path.join(self.tmp, "state.json")
+        with open(path) as f:
+            st = json.load(f)
+        st["prs"][key]["next_retry_at"] = 0
+        with open(path, "w") as f:
+            json.dump(st, f)
 
 
 # ============================================================
@@ -1129,105 +1283,9 @@ class TestRunReview(_GateCase):
 
 
 # ============================================================
-# --once 全链路 (全 fake)
+# --once 全链路 (全 fake, 公共 harness 见 _OnceEndToEndBase)
 # ============================================================
-class TestOnceEndToEnd(_GateCase):
-    def setUp(self):
-        super().setUp()
-        os.environ["GITHUB_TOKEN"] = "fake-token-123"
-        os.environ.pop("GH_TOKEN", None)
-        self.pr_sha = "a" * 40
-        self.pr_list = [self._mkpr(5, self.pr_sha)]
-        self.comment_behavior = "ok"     # ok | retryable | ratelimited
-        self.api_calls = []    # (method, url, body)
-        self.mcp_calls = []    # 审查 args dict
-        self.git_calls = []    # (cmd list, env)
-        self.review_report = None  # 覆盖 _fake_run 默认报告 (超长/带标记场景)
-
-    def _mkpr(self, number, sha, base="main"):
-        return {"number": number, "title": f"pr {number}",
-                "head": {"sha": sha}, "base": {"ref": base}}
-
-    def _fake_urlopen(self, req, timeout=None, **kw):
-        url = req.full_url
-        method = req.get_method()
-        body = json.loads(req.data.decode("utf-8")) if req.data else None
-        self.api_calls.append((method, url, body))
-        if "/pulls?" in url:
-            return _FakeResp(self.pr_list)
-        if url.endswith("/comments"):
-            if self.comment_behavior == "retryable":
-                raise _make_http_error(500)
-            if self.comment_behavior == "ratelimited":
-                raise _make_http_error(403, {"X-RateLimit-Remaining": "0",
-                                             "X-RateLimit-Reset": "1893456000"})
-            return _FakeResp(
-                {"html_url": "https://github.com/octo/hello#issuecomment-1"})
-        raise AssertionError(f"未预期 URL: {url}")
-
-    def _fake_run(self, cmd, *a, **kw):
-        if cmd[0] == "git":
-            self.git_calls.append((list(cmd), kw.get("env")))
-            if "clone" in cmd:
-                # 假 clone 也要建出 .git, 否则每轮都重复 clone
-                os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
-            if "checkout" in cmd:
-                # issue #17: 记住工作区切到的 sha, 供 rev-parse HEAD 回读
-                self.checked_out = cmd[-1]
-            if "rev-parse" in cmd and cmd[-1] == "HEAD":
-                return _CP(returncode=0,
-                           stdout=getattr(self, "checked_out", "") + "\n",
-                           stderr="")
-            return _CP(returncode=0, stdout="", stderr="")
-        if "--call" in cmd:
-            idx = cmd.index("--call")
-            self.assertEqual(cmd[idx + 1], "zcode_pr_review")
-            self.mcp_calls.append(json.loads(cmd[idx + 2]))
-            report = self.review_report or (
-                "汇总: P0: 0 条, P1: 0 条, P2: 2 条\n一切正常。")
-            payload = {"ok": True, "result": {
-                "content": [{"type": "text", "text": report}]}}
-            return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
-        raise AssertionError(f"未预期命令: {cmd}")
-
-    def _write_config(self, repos=("octo/hello",), quota=None):
-        cfg = {"repos": list(repos),
-               "state_file": os.path.join(self.tmp, "state.json"),
-               "clone_root": os.path.join(self.tmp, "clones"),
-               "review": {"depth": "deep", "focus": ""},
-               "retry": {"base_seconds": 300, "max_seconds": 3600,
-                         "max_attempts": 5},
-               "comment": {"enabled": True, "max_body": 60000}}
-        if quota is not None:
-            cfg["quota"] = quota
-        path = os.path.join(self.tmp, "config.json")
-        with open(path, "w") as f:
-            json.dump(cfg, f)
-        return path
-
-    def _run_once(self, cfg_path, extra_args=()):
-        with mock.patch.object(self.mod.subprocess, "run", self._fake_run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen",
-                               self._fake_urlopen):
-            return self.mod.main(["--once", "--config", cfg_path,
-                                  *extra_args])
-
-    def _state(self):
-        with open(os.path.join(self.tmp, "state.json")) as f:
-            return json.load(f)["prs"]
-
-    def _state_entry(self, key="octo/hello#5"):
-        return self._state()[key]
-
-    def _force_retry_due(self, key="octo/hello#5"):
-        """模拟退避到点: 把 next_retry_at 拨回过去 (不等真实 300s)"""
-        path = os.path.join(self.tmp, "state.json")
-        with open(path) as f:
-            st = json.load(f)
-        st["prs"][key]["next_retry_at"] = 0
-        with open(path, "w") as f:
-            json.dump(st, f)
-
+class TestOnceEndToEnd(_OnceEndToEndBase):
     def test_full_cycle_dedup_and_new_sha(self):
         cfg_path = self._write_config()
 
@@ -1300,31 +1358,23 @@ class TestOnceEndToEnd(_GateCase):
         """审查失败 → failed + 退避; 第二轮退避未到 → 跳过不再调审查。
         同时钉住语义: 有 PR 失败时 --once 仍 exit 0 (失败记在 state, 不传染退出码)"""
         cfg_path = self._write_config()
-        fail_payload = {"ok": False, "result": {
-            "content": [{"type": "text", "text": "炸了"}], "isError": True}}
+        self.mcp_rc = 2
+        self.mcp_stdout = json.dumps({"ok": False, "result": {
+            "content": [{"type": "text", "text": "炸了"}], "isError": True}})
 
-        def failing_run(cmd, *a, **kw):
-            if "--call" in cmd:
-                return _CP(returncode=2, stdout=json.dumps(fail_payload),
-                           stderr="")
-            return self._fake_run(cmd, *a, **kw)
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["attempts"], 1)
+        self.assertGreater(entry["next_retry_at"], 0)
+        # 评论不应发出 (审查就失败了)
+        self.assertEqual(
+            len([c for c in self.api_calls if c[0] == "POST"]), 0)
 
-        with mock.patch.object(self.mod.subprocess, "run", failing_run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen",
-                                self._fake_urlopen):
-            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
-            entry = self._state_entry()
-            self.assertEqual(entry["status"], "failed")
-            self.assertEqual(entry["attempts"], 1)
-            self.assertGreater(entry["next_retry_at"], 0)
-            # 评论不应发出 (审查就失败了)
-            self.assertEqual(
-                len([c for c in self.api_calls if c[0] == "POST"]), 0)
-
-            # 第二轮: 退避未到, 不再调审查, 退出码仍 0
-            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
-            entry = self._state_entry()
-            self.assertEqual(entry["attempts"], 1)  # 没增加
+        # 第二轮: 退避未到, 不再调审查, 退出码仍 0
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["attempts"], 1)  # 没增加
 
     def test_comment_retryable_failure_caches_and_comment_only_retry(self):
         """审查成功+评论 RetryableError → comment_failed+退避+缓存;
@@ -1444,8 +1494,8 @@ class TestOnceEndToEnd(_GateCase):
         self.assertEqual(rc, 0)
         gets = [u for m, u, _b in self.api_calls if m == "GET"]
         self.assertTrue(all("/repos/octo/other/" in u for u in gets))
-        self.assertIn("octo/other#5", self._state())
-        self.assertNotIn("octo/hello#5", self._state())
+        self.assertIn("octo/other#5", self._state()["prs"])
+        self.assertNotIn("octo/hello#5", self._state()["prs"])
 
     def test_pr_filter(self):
         """--pr 只处理指定 PR"""
@@ -1457,8 +1507,8 @@ class TestOnceEndToEnd(_GateCase):
         posts = [c for c in self.api_calls if c[0] == "POST"]
         self.assertEqual(len(posts), 1)
         self.assertIn("issues/6/comments", posts[0][1])
-        self.assertIn("octo/hello#6", self._state())
-        self.assertNotIn("octo/hello#5", self._state())
+        self.assertIn("octo/hello#6", self._state()["prs"])
+        self.assertNotIn("octo/hello#5", self._state()["prs"])
 
     def test_instance_lock_blocks_second_run(self):
         """狗食 review P1-1 (PR #18): 已有实例持锁 → 第二实例退出码 2 且
@@ -1948,110 +1998,57 @@ class TestStateStoreDirtyDefense(_GateCase):
         m_log.assert_not_called()
 
 
-class TestFakeMcpServerQuotaWallIntegration(_GateCase):
-    """F6 集成验证: fake mcp-server 两形 1308 首撞进墙 + 墙期拒动 (计数断言) + 醒后自愈 + 负控。"""
-
-    def setUp(self):
-        super().setUp()
-        os.environ["GITHUB_TOKEN"] = "fake-token-123"
-        self.mcp_calls = []
-        self.api_calls = []
-
-    def _fake_urlopen(self, req, timeout=None, **kw):
-        url = req.full_url
-        method = req.get_method()
-        body = json.loads(req.data.decode("utf-8")) if req.data else None
-        self.api_calls.append((method, url, body))
-        if "/pulls?" in url:
-            return _FakeResp(self.pr_list)
-        if url.endswith("/comments"):
-            return _FakeResp({"html_url": "https://github.com/octo/hello#issuecomment-1"})
-        raise AssertionError(f"未预期 URL: {url}")
-
-    def _fake_run_factory(self, mcp_returncode, mcp_stdout, mcp_stderr):
-        def _run(cmd, *a, **kw):
-            if cmd[0] == "git":
-                if "clone" in cmd:
-                    os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
-                if "checkout" in cmd:
-                    self.checked_out = cmd[-1]
-                if "rev-parse" in cmd and cmd[-1] == "HEAD":
-                    return _CP(returncode=0, stdout=getattr(self, "checked_out", "") + "\n", stderr="")
-                return _CP(returncode=0, stdout="", stderr="")
-            if "--call" in cmd:
-                self.mcp_calls.append(json.loads(cmd[cmd.index("--call") + 2]))
-                return _CP(returncode=mcp_returncode, stdout=mcp_stdout, stderr=mcp_stderr)
-            raise AssertionError(f"未预期命令: {cmd}")
-        return _run
-
-    def _write_config(self):
-        cfg = {"repos": ["octo/hello"],
-               "state_file": os.path.join(self.tmp, "state.json"),
-               "clone_root": os.path.join(self.tmp, "clones"),
-               "review": {"depth": "deep", "focus": ""},
-               "retry": {"base_seconds": 300, "max_seconds": 3600, "max_attempts": 5},
-               "comment": {"enabled": True, "max_body": 60000}}
-        path = os.path.join(self.tmp, "config.json")
-        with open(path, "w") as f:
-            json.dump(cfg, f)
-        return path
+class TestFakeMcpServerQuotaWallIntegration(_OnceEndToEndBase):
+    """F6 集成验证: fake mcp-server 两形 1308 首撞进墙 + 墙期拒动 (计数断言) +
+    醒后自愈 + 醒后再撞重写墙 (#41②) + 负控。墙态轮统一走 _run_once_at
+    (fake time: 同轮内多处 time.time() 取同值)。"""
 
     def test_form1_1308_stderr_first_hit_enters_wall_and_second_refuses(self):
         """形 1 (stderr 包含 1308 实测文本): 首撞进墙 + 同轮/下轮墙期拒动 (不发起子进程, 计数断言)"""
         cfg_path = self._write_config()
-        self.pr_list = [
-            {"number": 5, "title": "pr 5", "head": {"sha": "a" * 40}, "base": {"ref": "main"}},
-            {"number": 6, "title": "pr 6", "head": {"sha": "b" * 40}, "base": {"ref": "main"}}
-        ]
+        self.pr_list = [self._mkpr(5, "a" * 40), self._mkpr(6, "b" * 40)]
         now = 1789724596.0  # 18:43:16 (+08:00 = 1789728196) 的 1 小时前
-        stderr_1308 = (
+        self.mcp_rc = 1
+        self.mcp_stdout = json.dumps(
+            {"ok": False, "result": {"content": [{"type": "text", "text": "error"}]}})
+        self.mcp_stderr = (
             "ProviderBusinessError: [1308][Usage limit reached for 5 hour. "
             "Your limit will reset at 2026-09-18 18:43:16][req-form1]"
         )
-        fake_run = self._fake_run_factory(1, json.dumps({"ok": False, "result": {"content": [{"type": "text", "text": "error"}]}}), stderr_1308)
 
-        with mock.patch.object(self.mod.subprocess, "run", fake_run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now):
-            rc = self.mod.main(["--once", "--config", cfg_path])
-            self.assertEqual(rc, 0)
+        self.assertEqual(self._run_once_at(cfg_path, now), 0)
 
-            # 计数断言: PR#5 首撞进墙 (第 1 次调 mcp-server);
-            # 紧接着处理 PR#6 时已被墙拦住, 绝对不发起第 2 次 mcp 子进程!
-            self.assertEqual(len(self.mcp_calls), 1)
+        # 计数断言: PR#5 首撞进墙 (第 1 次调 mcp-server);
+        # 紧接着处理 PR#6 时已被墙拦住, 绝对不发起第 2 次 mcp 子进程!
+        self.assertEqual(len(self.mcp_calls), 1)
 
-            with open(os.path.join(self.tmp, "state.json")) as f:
-                st = json.load(f)
+        st = self._state()
+        # 墙态落盘: wall_until = 1789728196 + 120 = 1789728316
+        self.assertEqual(st["quota_wall_until"], 1789728316.0)
 
-            # 墙态落盘: wall_until = 1789728196 + 120 = 1789728316
-            self.assertEqual(st["quota_wall_until"], 1789728316.0)
+        # 条目不衰老: PR#5 保持 pending, attempts=0
+        p5 = st["prs"]["octo/hello#5"]
+        self.assertEqual(p5["status"], "pending")
+        self.assertEqual(p5["attempts"], 0)
 
-            # 条目不衰老: PR#5 保持 pending, attempts=0
-            p5 = st["prs"]["octo/hello#5"]
-            self.assertEqual(p5["status"], "pending")
-            self.assertEqual(p5["attempts"], 0)
-
-            # PR#6 也被跳过: 保持 pending, attempts=0
-            p6 = st["prs"]["octo/hello#6"]
-            self.assertEqual(p6["status"], "pending")
-            self.assertEqual(p6["attempts"], 0)
+        # PR#6 也被跳过: 保持 pending, attempts=0
+        p6 = st["prs"]["octo/hello#6"]
+        self.assertEqual(p6["status"], "pending")
+        self.assertEqual(p6["attempts"], 0)
 
         # 下一轮轮询 (仍处于墙期内, now 推进 300s): 再次拒动
-        now_r2 = now + 300.0
-        with mock.patch.object(self.mod.subprocess, "run", fake_run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now_r2):
-            rc = self.mod.main(["--once", "--config", cfg_path])
-            self.assertEqual(rc, 0)
-            # 计数断言: mcp-server 仍为 1 次!
-            self.assertEqual(len(self.mcp_calls), 1)
+        self.assertEqual(self._run_once_at(cfg_path, now + 300.0), 0)
+        # 计数断言: mcp-server 仍为 1 次!
+        self.assertEqual(len(self.mcp_calls), 1)
 
     def test_form2_1308_stdout_hours_and_wake_up_self_healing(self):
-        """形 2 (stdout 错误文本 + hours 复数): 首撞进墙 + 到点自醒续审 + 醒后再撞重写墙 (自愈环)"""
+        """形 2 (stdout 错误文本 + hours 复数): 首撞进墙 → 到点自醒续审成功
+        (醒后恰发起第 2 次调用, verdict/台账照常)。醒后再撞 1308 重写墙态
+        的集成级自愈环由 test_wake_then_rehit_1308_rewrites_wall 单独覆盖。"""
         cfg_path = self._write_config()
-        self.pr_list = [{"number": 5, "title": "pr 5", "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         now = 1789724596.0  # 18:43:16 的 1 小时前
-        stdout_1308 = json.dumps({
+        self.mcp_rc = 1
+        self.mcp_stdout = json.dumps({
             "ok": False,
             "result": {
                 "content": [{
@@ -2061,138 +2058,121 @@ class TestFakeMcpServerQuotaWallIntegration(_GateCase):
                 "isError": True
             }
         })
-        run_form2 = self._fake_run_factory(1, stdout_1308, "")
 
         # 1. 首撞进墙
-        with mock.patch.object(self.mod.subprocess, "run", run_form2), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now):
-            rc = self.mod.main(["--once", "--config", cfg_path])
-            self.assertEqual(rc, 0)
-            self.assertEqual(len(self.mcp_calls), 1)
+        self.assertEqual(self._run_once_at(cfg_path, now), 0)
+        self.assertEqual(len(self.mcp_calls), 1)
 
-            with open(os.path.join(self.tmp, "state.json")) as f:
-                st = json.load(f)
-            self.assertEqual(st["quota_wall_until"], 1789728316.0)
-            self.assertEqual(st["prs"]["octo/hello#5"]["status"], "pending")
-            self.assertEqual(st["prs"]["octo/hello#5"]["attempts"], 0)
+        st = self._state()
+        self.assertEqual(st["quota_wall_until"], 1789728316.0)
+        self.assertEqual(st["prs"]["octo/hello#5"]["status"], "pending")
+        self.assertEqual(st["prs"]["octo/hello#5"]["attempts"], 0)
 
         # 2. 到点自醒 (now 推进到 reset+2min 之后: 1789728317.0)
         now_wake = 1789728317.0
         ok_report = "汇总: P0: 0 条, P1: 0 条, P2: 1 条\nMERGE: yes"
-        ok_stdout = json.dumps({"ok": True, "result": {"content": [{"type": "text", "text": ok_report}]}})
-        run_ok = self._fake_run_factory(0, ok_stdout, "")
+        self.mcp_rc = 0
+        self.mcp_stdout = json.dumps(
+            {"ok": True, "result": {"content": [{"type": "text", "text": ok_report}]}})
+        self.mcp_stderr = ""
 
-        with mock.patch.object(self.mod.subprocess, "run", run_ok), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now_wake):
-            rc = self.mod.main(["--once", "--config", cfg_path])
-            self.assertEqual(rc, 0)
-            # 计数断言: 成功发起第 2 次调用
-            self.assertEqual(len(self.mcp_calls), 2)
+        self.assertEqual(self._run_once_at(cfg_path, now_wake), 0)
+        # 计数断言: 成功发起第 2 次调用
+        self.assertEqual(len(self.mcp_calls), 2)
 
-            with open(os.path.join(self.tmp, "state.json")) as f:
-                st = json.load(f)
-            self.assertEqual(st["prs"]["octo/hello#5"]["status"], "reviewed")
-            self.assertEqual(st["prs"]["octo/hello#5"]["verdict"], "pass")
-            self.assertEqual(len(st.get("quota_ledger", [])), 1)
+        st = self._state()
+        self.assertEqual(st["prs"]["octo/hello#5"]["status"], "reviewed")
+        self.assertEqual(st["prs"]["octo/hello#5"]["verdict"], "pass")
+        self.assertEqual(len(st.get("quota_ledger", [])), 1)
+
+    def test_wake_then_rehit_1308_rewrites_wall(self):
+        """(#41② 集成级自愈环) 轮 1 撞 1308 进墙 (reset=now+1h) → 时间推进
+        墙醒 → 轮 2 再撞 1308 (reset 更晚 now+2h) → 墙态被重写为新
+        reset+buffer (非旧值残留, 单调推后); 新墙期内照常拒动。mcp 计数
+        逐轮钉住: 墙期不烧额度, 醒后恰发起一次审查即再撞。"""
+        cfg_path = self._write_config()
+        now0 = 1789724596.0              # reset1 (18:43:16) 的 1 小时前
+        wall1 = 1789728316.0             # reset1 1789728196 + 120 buffer
+        self.mcp_rc = 1
+        self.mcp_stdout = json.dumps(
+            {"ok": False, "result": {"content": [{"type": "text", "text": "error"}]}})
+        self.mcp_stderr = (
+            "ProviderBusinessError: [1308][Usage limit reached for 5 hour. "
+            "Your limit will reset at 2026-09-18 18:43:16][req-r1]"
+        )
+
+        # 轮 1: 首撞进墙
+        self.assertEqual(self._run_once_at(cfg_path, now0), 0)
+        self.assertEqual(len(self.mcp_calls), 1)
+        st = self._state()
+        self.assertEqual(st["quota_wall_until"], wall1)
+        self.assertEqual(st["prs"]["octo/hello#5"]["status"], "pending")
+
+        # 轮 2 (墙期内, now 推进 300s): 拒动, mcp 仍 1 次
+        self.assertEqual(self._run_once_at(cfg_path, now0 + 300.0), 0)
+        self.assertEqual(len(self.mcp_calls), 1)
+
+        # 轮 3: 墙醒 (now 越过 wall1) → 审查启动 → 再撞 1308 (reset 更晚:
+        # 20:45:17 = now3+2h) → 墙态重写为新 reset+buffer
+        now3 = wall1 + 1.0
+        reset2, wall2 = 1789735517.0, 1789735637.0   # now3+7200 (+120 buffer)
+        self.mcp_stderr = (
+            "ProviderBusinessError: [1308][Usage limit reached for 5 hour. "
+            "Your limit will reset at 2026-09-18 20:45:17][req-r2]"
+        )
+        self.assertEqual(self._run_once_at(cfg_path, now3), 0)
+        self.assertEqual(len(self.mcp_calls), 2)     # 醒后恰发起一次
+        st = self._state()
+        self.assertNotEqual(st["quota_wall_until"], wall1)  # 重写非残留
+        self.assertEqual(st["quota_wall_until"],
+                         reset2 + self.mod.WALL_BUFFER_SECONDS)  # 新 reset+buffer
+        self.assertEqual(st["quota_wall_until"], wall2)
+        self.assertGreater(wall2, wall1)                    # 单调推后
+        self.assertEqual(st["prs"]["octo/hello#5"]["status"], "pending")
+        self.assertEqual(st["prs"]["octo/hello#5"]["attempts"], 0)
+
+        # 轮 4 (新墙期内, now 再推进 300s): 新墙照常拒动, mcp 仍 2 次
+        self.assertEqual(self._run_once_at(cfg_path, now3 + 300.0), 0)
+        self.assertEqual(len(self.mcp_calls), 2)
 
     def test_negative_control_401_or_422_normal_backoff(self):
         """负控: 非墙 4xx (401/422/非限流) 行为不变——不进墙, 既有退避路径照旧, attempts+1"""
         cfg_path = self._write_config()
-        self.pr_list = [{"number": 5, "title": "pr 5", "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
-        err_401 = json.dumps({
+        now = 10000.0
+        self.mcp_rc = 1
+        self.mcp_stdout = json.dumps({
             "ok": False,
             "result": {
                 "content": [{"type": "text", "text": "HTTP 401: Unauthorized API key"}],
                 "isError": True
             }
         })
-        run_401 = self._fake_run_factory(1, err_401, "")
 
-        now = 10000.0
-        with mock.patch.object(self.mod.subprocess, "run", run_401), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now):
-            rc = self.mod.main(["--once", "--config", cfg_path])
-            self.assertEqual(rc, 0)
-            self.assertEqual(len(self.mcp_calls), 1)
+        self.assertEqual(self._run_once_at(cfg_path, now), 0)
+        self.assertEqual(len(self.mcp_calls), 1)
 
-            with open(os.path.join(self.tmp, "state.json")) as f:
-                st = json.load(f)
-            # 墙态不应被设置 (0.0)
-            self.assertEqual(st.get("quota_wall_until", 0.0), 0.0)
-            entry = st["prs"]["octo/hello#5"]
-            # 走既有退避: status=failed, attempts=1, next_retry_at 设定
-            self.assertEqual(entry["status"], "failed")
-            self.assertEqual(entry["attempts"], 1)
-            self.assertEqual(entry["next_retry_at"], now + 300.0)
+        st = self._state()
+        # 墙态不应被设置 (0.0)
+        self.assertEqual(st.get("quota_wall_until", 0.0), 0.0)
+        entry = st["prs"]["octo/hello#5"]
+        # 走既有退避: status=failed, attempts=1, next_retry_at 设定
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(entry["next_retry_at"], now + 300.0)
 
-        # 第二轮: 退避未到点 (now=10100 < 10300)
-        with mock.patch.object(self.mod.subprocess, "run", run_401), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now + 100.0):
-            rc = self.mod.main(["--once", "--config", cfg_path])
-            self.assertEqual(rc, 0)
-            # 仍未增加调用
-            self.assertEqual(len(self.mcp_calls), 1)
+        # 第二轮: 退避未到点 (now=10100 < 10300), 仍未增加调用
+        self.assertEqual(self._run_once_at(cfg_path, now + 100.0), 0)
+        self.assertEqual(len(self.mcp_calls), 1)
 
 
 # ============================================================
 # #35①/#39/#42: 结构化 quota_limit 消费 + 台账口径
 # ============================================================
-class TestStructuredQuotaIntegration(_GateCase):
+class TestStructuredQuotaIntegration(_OnceEndToEndBase):
     """结构化 1308 集成验证: quota_limit 键优先命中 (无 1308 文本也进墙)、
     结构化 reset_at 异常远期被 is_valid_quota_window 拒绝 (防睡死钉死)、
     键缺失退正则兜底、台账记完成时刻 (#42) 且 tokens 接 usage 透传 (#35②)、
     脏台账端到端 (#36): 成功审查不再被兜底 mark_failure。"""
-
-    def setUp(self):
-        super().setUp()
-        os.environ["GITHUB_TOKEN"] = "fake-token-123"
-        self.mcp_calls = []
-
-    def _fake_urlopen(self, req, timeout=None, **kw):
-        url = req.full_url
-        if "/pulls?" in url:
-            return _FakeResp(self.pr_list)
-        if url.endswith("/comments"):
-            return _FakeResp({"html_url": "https://github.com/octo/hello#issuecomment-1"})
-        raise AssertionError(f"未预期 URL: {url}")
-
-    def _fake_run_factory(self, mcp_returncode, mcp_stdout, mcp_stderr="",
-                          flip_phase=None):
-        """flip_phase: --call 返回前回调 (切换 fake time 相位, 测完成时刻口径)"""
-        def _run(cmd, *a, **kw):
-            if cmd[0] == "git":
-                if "clone" in cmd:
-                    os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
-                if "checkout" in cmd:
-                    self.checked_out = cmd[-1]
-                if "rev-parse" in cmd and cmd[-1] == "HEAD":
-                    return _CP(returncode=0,
-                               stdout=getattr(self, "checked_out", "") + "\n", stderr="")
-                return _CP(returncode=0, stdout="", stderr="")
-            if "--call" in cmd:
-                self.mcp_calls.append(json.loads(cmd[cmd.index("--call") + 2]))
-                if flip_phase is not None:
-                    flip_phase()
-                return _CP(returncode=mcp_returncode, stdout=mcp_stdout,
-                           stderr=mcp_stderr)
-            raise AssertionError(f"未预期命令: {cmd}")
-        return _run
-
-    def _write_config(self):
-        cfg = {"repos": ["octo/hello"],
-               "state_file": os.path.join(self.tmp, "state.json"),
-               "clone_root": os.path.join(self.tmp, "clones"),
-               "review": {"depth": "deep", "focus": ""},
-               "retry": {"base_seconds": 300, "max_seconds": 3600, "max_attempts": 5},
-               "comment": {"enabled": True, "max_body": 60000}}
-        path = os.path.join(self.tmp, "config.json")
-        with open(path, "w") as f:
-            json.dump(cfg, f)
-        return path
 
     def _err_stdout(self, text, quota_limit=None):
         """伪造 mcp-server --call 失败输出 (isError result, 可选结构化键)"""
@@ -2201,26 +2181,18 @@ class TestStructuredQuotaIntegration(_GateCase):
             result["quota_limit"] = quota_limit
         return json.dumps({"ok": False, "result": result})
 
-    def _state(self):
-        with open(os.path.join(self.tmp, "state.json")) as f:
-            return json.load(f)
-
     def test_structured_priority_enters_wall_without_text_hit(self):
         """(#35①) 结构化键优先: payload/正文/stderr 全无 1308 串, 只有
         quota_limit 键 → 仍进墙 (正则路径单独不可能命中, 证明走的是结构化)"""
         cfg_path = self._write_config()
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         now = 1789724596.0                     # reset 前 1 小时
         reset = 1789728196.0                   # now + 3600
-        stdout = self._err_stdout("zcode 调用失败: 额度耗尽",
-                                  quota_limit={"code": 1308, "reset_at": reset})
-        run = self._fake_run_factory(1, stdout, "")
+        self.mcp_rc = 1
+        self.mcp_stdout = self._err_stdout(
+            "zcode 调用失败: 额度耗尽",
+            quota_limit={"code": 1308, "reset_at": reset})
 
-        with mock.patch.object(self.mod.subprocess, "run", run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now):
-            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
+        self.assertEqual(self._run_once_at(cfg_path, now), 0)
 
         self.assertEqual(len(self.mcp_calls), 1)
         st = self._state()
@@ -2233,18 +2205,14 @@ class TestStructuredQuotaIntegration(_GateCase):
         """(#35①) 结构化 reset_at 异常远期 (>5.5h) → is_valid_quota_window
         拒绝, 不进墙走既有退避 (防上游转换 bug 睡死闸的回归钉死)"""
         cfg_path = self._write_config()
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         now = 10000.0
         reset = now + 6 * 3600                 # 6h 后, 超 5.5h 窗
-        stdout = self._err_stdout("zcode 调用失败: 额度耗尽",
-                                  quota_limit={"code": 1308, "reset_at": reset})
-        run = self._fake_run_factory(1, stdout, "")
+        self.mcp_rc = 1
+        self.mcp_stdout = self._err_stdout(
+            "zcode 调用失败: 额度耗尽",
+            quota_limit={"code": 1308, "reset_at": reset})
 
-        with mock.patch.object(self.mod.subprocess, "run", run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now):
-            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
+        self.assertEqual(self._run_once_at(cfg_path, now), 0)
 
         st = self._state()
         self.assertEqual(st.get("quota_wall_until", 0.0), 0.0)  # 不进墙
@@ -2259,19 +2227,14 @@ class TestStructuredQuotaIntegration(_GateCase):
         钉住 process_pr 的 `if reset_ts is None` 回退语义: 结构化命中后不再
         请教正则 — 改成"窗口非法再试正则"会让本测试红。"""
         cfg_path = self._write_config()
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         now = 1789724596.0                     # 正文串 reset 1789728196 = +1h, 窗内
-        stdout = self._err_stdout(
+        self.mcp_rc = 1
+        self.mcp_stdout = self._err_stdout(
             "zcode 调用失败: ProviderBusinessError: [1308][Usage limit reached "
             "for 5 hour. Your limit will reset at 2026-09-18 18:43:16][req-x]",
             quota_limit={"code": 1308, "reset_at": now + 6 * 3600})  # 窗外
-        run = self._fake_run_factory(1, stdout, "")
 
-        with mock.patch.object(self.mod.subprocess, "run", run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now):
-            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
+        self.assertEqual(self._run_once_at(cfg_path, now), 0)
 
         st = self._state()
         self.assertEqual(st.get("quota_wall_until", 0.0), 0.0, "不得进墙")
@@ -2283,19 +2246,14 @@ class TestStructuredQuotaIntegration(_GateCase):
     def test_structured_missing_falls_back_to_regex(self):
         """(#39) 键缺失 (旧 mcp-server 形状) → 正则兜底照常进墙"""
         cfg_path = self._write_config()
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         now = 1789724596.0
         # 正文带 1308 实测文本 (reset 2026-09-18 18:43:16 +08 = 1789728196)
-        stdout = self._err_stdout(
+        self.mcp_rc = 1
+        self.mcp_stdout = self._err_stdout(
             "zcode 调用失败: ProviderBusinessError: [1308][Usage limit reached "
             "for 5 hour. Your limit will reset at 2026-09-18 18:43:16][req-x]")
-        run = self._fake_run_factory(1, stdout, "")
 
-        with mock.patch.object(self.mod.subprocess, "run", run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now):
-            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
+        self.assertEqual(self._run_once_at(cfg_path, now), 0)
 
         st = self._state()
         self.assertEqual(st["quota_wall_until"], 1789728196.0 + 120.0)
@@ -2305,8 +2263,6 @@ class TestStructuredQuotaIntegration(_GateCase):
         """(#42/#35②) 台账记审查完成时刻 (非 process_pr 入口时刻, 消最大
         3720s 偏移); tokens 接结构化 usage.total_tokens 透传"""
         cfg_path = self._write_config()
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         t_start, t_done = 100000.0, 103720.0   # 模拟审查整整跑 3720s
         phase = {"done": False}
 
@@ -2316,16 +2272,14 @@ class TestStructuredQuotaIntegration(_GateCase):
         def flip():
             phase["done"] = True   # --call 返回 = 审查完成, 此后 time.time → t_done
 
-        ok_stdout = json.dumps({"ok": True, "result": {
+        self.mcp_rc = 0
+        self.mcp_stdout = json.dumps({"ok": True, "result": {
             "content": [{"type": "text",
                          "text": "汇总: P0: 0 条, P1: 0 条, P2: 1 条\nMERGE: yes"}],
             "usage": {"total_tokens": 12345}}})
-        run = self._fake_run_factory(0, ok_stdout, "", flip_phase=flip)
+        self.mcp_flip_phase = flip
 
-        with mock.patch.object(self.mod.subprocess, "run", run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", fake_time):
-            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
+        self.assertEqual(self._run_once_at(cfg_path, fake_time), 0)
 
         st = self._state()
         self.assertEqual(st["prs"]["octo/hello#5"]["status"], "reviewed")
@@ -2338,18 +2292,13 @@ class TestStructuredQuotaIntegration(_GateCase):
     def test_ledger_tokens_zero_without_usage(self):
         """(#35②) 成功结果无 usage 键 → tokens 0 兜底, 台账照记"""
         cfg_path = self._write_config()
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         now = 10000.0
-        ok_stdout = json.dumps({"ok": True, "result": {
+        self.mcp_rc = 0
+        self.mcp_stdout = json.dumps({"ok": True, "result": {
             "content": [{"type": "text",
                          "text": "汇总: P0: 0 条, P1: 0 条, P2: 1 条\nMERGE: yes"}]}})
-        run = self._fake_run_factory(0, ok_stdout, "")
 
-        with mock.patch.object(self.mod.subprocess, "run", run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now):
-            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
+        self.assertEqual(self._run_once_at(cfg_path, now), 0)
 
         ledger = self._state()["quota_ledger"]
         self.assertEqual(len(ledger), 1)
@@ -2362,8 +2311,6 @@ class TestStructuredQuotaIntegration(_GateCase):
         failed (烧 attempts + 报告未缓存 → 下轮全额重审)。修复后全链路
         不抛: status=reviewed 落盘, 台账首轮自愈 (脏条目淘汰)。"""
         cfg_path = self._write_config()
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         now = 100000.0
         dirty_ledger = [
             {"ts": "not-a-number", "count": 9, "tokens": 900, "pr": "o/r#1"},
@@ -2375,16 +2322,13 @@ class TestStructuredQuotaIntegration(_GateCase):
         with open(os.path.join(self.tmp, "state.json"), "w") as f:
             json.dump({"prs": {}, "quota_ledger": dirty_ledger}, f)
 
-        ok_stdout = json.dumps({"ok": True, "result": {
+        self.mcp_rc = 0
+        self.mcp_stdout = json.dumps({"ok": True, "result": {
             "content": [{"type": "text",
                          "text": "汇总: P0: 0 条, P1: 0 条, P2: 1 条\nMERGE: yes"}],
             "usage": {"total_tokens": 500}}})
-        run = self._fake_run_factory(0, ok_stdout, "")
 
-        with mock.patch.object(self.mod.subprocess, "run", run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen", self._fake_urlopen), \
-             mock.patch.object(self.mod.time, "time", return_value=now):
-            self.assertEqual(self.mod.main(["--once", "--config", cfg_path]), 0)
+        self.assertEqual(self._run_once_at(cfg_path, now), 0)
 
         st = self._state()
         entry = st["prs"]["octo/hello#5"]
@@ -2578,73 +2522,11 @@ class TestReportPersistenceAndRotation(_GateCase):
 # ============================================================
 # #38 墙期上提检查: 整仓跳过 clone/fetch
 # ============================================================
-class TestWallSkipsRepoCloneFetch(_GateCase):
+class TestWallSkipsRepoCloneFetch(_OnceEndToEndBase):
     """(#38) 有待审 PR 且处于 1308 墙期内 → 本轮整仓跳过 clone/fetch
     (git 子进程零发起, 计数断言); 墙外正常路径 clone/fetch 照跑; todo
     为空时先走「无待审新 head」早退, 墙检查不触发额外行为 (该早退语义
     不许变 — 墙检查必须放在 todo 判空之后)。"""
-
-    def setUp(self):
-        super().setUp()
-        os.environ["GITHUB_TOKEN"] = "fake-token-123"
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
-        self.comment_behavior = "ok"     # ok | retryable (评论 500)
-        self.git_calls = []
-        self.mcp_calls = []
-        self.api_calls = []
-
-    def _fake_urlopen(self, req, timeout=None, **kw):
-        url = req.full_url
-        self.api_calls.append((req.get_method(), url))
-        if "/pulls?" in url:
-            return _FakeResp(self.pr_list)
-        if url.endswith("/comments"):
-            if self.comment_behavior == "retryable":
-                raise _make_http_error(500)
-            return _FakeResp(
-                {"html_url": "https://github.com/octo/hello#issuecomment-1"})
-        raise AssertionError(f"未预期 URL: {url}")
-
-    def _fake_run(self, cmd, *a, **kw):
-        if cmd[0] == "git":
-            self.git_calls.append(list(cmd))
-            if "clone" in cmd:
-                # 假 clone 也要建出 .git, 否则每轮都重复 clone
-                os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
-            if "checkout" in cmd:
-                self.checked_out = cmd[-1]
-            if "rev-parse" in cmd and cmd[-1] == "HEAD":
-                return _CP(returncode=0,
-                           stdout=getattr(self, "checked_out", "") + "\n",
-                           stderr="")
-            return _CP(returncode=0, stdout="", stderr="")
-        if "--call" in cmd:
-            self.mcp_calls.append(json.loads(cmd[cmd.index("--call") + 2]))
-            payload = {"ok": True, "result": {
-                "content": [{"type": "text",
-                             "text": "汇总: P0: 0 条, P1: 0 条, P2: 1 条"}]}}
-            return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
-        raise AssertionError(f"未预期命令: {cmd}")
-
-    def _write_config(self):
-        cfg = {"repos": ["octo/hello"],
-               "state_file": os.path.join(self.tmp, "state.json"),
-               "clone_root": os.path.join(self.tmp, "clones"),
-               "review": {"depth": "deep", "focus": ""},
-               "retry": {"base_seconds": 300, "max_seconds": 3600,
-                         "max_attempts": 5},
-               "comment": {"enabled": True, "max_body": 60000}}
-        path = os.path.join(self.tmp, "config.json")
-        with open(path, "w") as f:
-            json.dump(cfg, f)
-        return path
-
-    def _run_once(self, cfg_path):
-        with mock.patch.object(self.mod.subprocess, "run", self._fake_run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen",
-                               self._fake_urlopen):
-            return self.mod.main(["--once", "--config", cfg_path])
 
     def _set_wall(self, until):
         """把墙态直接写进 state 文件 (模拟上一轮撞 1308 进墙)"""
@@ -2655,26 +2537,13 @@ class TestWallSkipsRepoCloneFetch(_GateCase):
         with open(path, "w") as f:
             json.dump(st, f)
 
-    def _read_entry(self, key="octo/hello#5"):
-        with open(os.path.join(self.tmp, "state.json")) as f:
-            return json.load(f)["prs"][key]
-
-    def _force_retry_due(self, key="octo/hello#5"):
-        """模拟退避到点: 把 next_retry_at 拨回过去"""
-        path = os.path.join(self.tmp, "state.json")
-        with open(path) as f:
-            st = json.load(f)
-        st["prs"][key]["next_retry_at"] = 0
-        with open(path, "w") as f:
-            json.dump(st, f)
-
     def test_wall_round_runs_zero_git_subprocess(self):
         cfg_path = self._write_config()
 
         # 墙外正常路径: clone/fetch 照跑 (git 子进程非零, 含 clone 与 fetch)
         self.assertEqual(self._run_once(cfg_path), 0)
-        self.assertTrue(any("clone" in c for c in self.git_calls))
-        self.assertTrue(any("fetch" in c for c in self.git_calls))
+        self.assertTrue(any("clone" in c for c, _e in self.git_calls))
+        self.assertTrue(any("fetch" in c for c, _e in self.git_calls))
         git_after = len(self.git_calls)
         mcp_after = len(self.mcp_calls)
 
@@ -2694,7 +2563,7 @@ class TestWallSkipsRepoCloneFetch(_GateCase):
         self.assertIn(wall_msgs[0].args[1:], ((), ("INFO",)))
         # 早退发生在 process_pr 之前: 新 head 重置逻辑未执行 — entry 仍是
         # 首轮的 reviewed + 旧 head (若漏进循环会被新 head 重置成 pending)
-        entry = self._read_entry()
+        entry = self._state_entry()
         self.assertEqual(entry["head_sha"], "a" * 40)
         self.assertEqual(entry["status"], "reviewed")
 
@@ -2724,7 +2593,7 @@ class TestWallSkipsRepoCloneFetch(_GateCase):
         # 第一轮: 评论 500 → comment_failed + report 缓存 + 退避
         self.comment_behavior = "retryable"
         self.assertEqual(self._run_once(cfg_path), 0)
-        entry = self._read_entry()
+        entry = self._state_entry()
         self.assertEqual(entry["status"], "comment_failed")
         self.assertTrue(entry["report"])
         mcp_after = len(self.mcp_calls)
@@ -2750,18 +2619,94 @@ class TestWallSkipsRepoCloneFetch(_GateCase):
         self.assertEqual(len(self.mcp_calls), mcp_after)
         self.assertEqual(len([c for c in self.api_calls if c[0] == "POST"]),
                          posts_before + 1)
-        self.assertEqual(self._read_entry()["status"], "reviewed")
+        self.assertEqual(self._state_entry()["status"], "reviewed")
         # 新 head PR 本轮未审: 连 entry 都未建 (下轮墙醒再审)
-        with open(os.path.join(self.tmp, "state.json")) as f:
-            self.assertNotIn("octo/hello#6", json.load(f)["prs"])
+        self.assertNotIn("octo/hello#6", self._state()["prs"])
         # clone/fetch 照跑 (有意取舍, 见 docstring)
         self.assertGreater(len(self.git_calls), git_before)
+
+    def test_wall_skips_comment_failed_backoff_not_due(self):
+        """(#41①) 墙期豁免不越过退避门: comment_failed 退避未到点 →
+        needs_review=False 不进 todo, 走「无待审新 head」早退 — 不审不评
+        不 clone, 退避值原样 (墙检查在 todo 判空后, 不触发额外行为)"""
+        cfg_path = self._write_config()
+        self.comment_behavior = "retryable"
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "comment_failed")
+        self.assertTrue(entry["report"])
+        mcp_after, git_after = len(self.mcp_calls), len(self.git_calls)
+        posts_after = len([c for c in self.api_calls if c[0] == "POST"])
+        retry_at = entry["next_retry_at"]
+
+        # 进墙 + 退避仍未到点 (next_retry_at = 首轮 now+300 > 本轮 now)
+        self._set_wall(time.time() + 3600.0)
+        with mock.patch.object(self.mod, "log") as m_log:
+            self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertEqual(len(self.mcp_calls), mcp_after)   # 不重审
+        self.assertEqual(len(self.git_calls), git_after)   # 不 clone
+        self.assertEqual(len([c for c in self.api_calls if c[0] == "POST"]),
+                         posts_after)                      # 不补评论
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "comment_failed")   # 原样
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(entry["next_retry_at"], retry_at)    # 退避未被动
+        # 墙检查未触发 (退避门先于墙豁免): 无待审早退, 不打墙期 INFO
+        self.assertEqual([c for c in m_log.call_args_list
+                          if "额度墙期内" in c.args[0]], [])
+        self.assertTrue(any("无待审新 head" in c.args[0]
+                            for c in m_log.call_args_list))
+
+    def test_wall_comment_failed_new_head_not_comment_only(self):
+        """(#41①) head 变化的 comment_failed 不算补评论: 缓存判定的
+        head_sha 比对在墙期过滤里生效 — 墙期该 PR 整仓跳过 (entry 原样,
+        新 head 重置未发生); 墙醒后新 head 复活, 全额重审 (缓存不沿用)"""
+        cfg_path = self._write_config()
+        self.comment_behavior = "retryable"
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "comment_failed")
+        self.assertTrue(entry["report"])
+        mcp_after, git_after = len(self.mcp_calls), len(self.git_calls)
+        posts_after = len([c for c in self.api_calls if c[0] == "POST"])
+
+        # 进墙 + PR#5 推了新提交 (head 变化)
+        self._set_wall(time.time() + 3600.0)
+        self.pr_list = [self._mkpr(5, "b" * 40)]
+        with mock.patch.object(self.mod, "log") as m_log:
+            self.assertEqual(self._run_once(cfg_path), 0)
+        # 不审不评不 clone: 整仓跳过 (不是「只处理 N 个补评论」)
+        self.assertEqual(len(self.mcp_calls), mcp_after)
+        self.assertEqual(len(self.git_calls), git_after)
+        self.assertEqual(len([c for c in self.api_calls if c[0] == "POST"]),
+                         posts_after)
+        self.assertTrue(any("额度墙期内" in c.args[0]
+                            and "跳过 1 个待审 PR 与 clone/fetch" in c.args[0]
+                            for c in m_log.call_args_list))
+        # entry 未被触碰: process_pr 没跑, 新 head 重置未发生
+        entry = self._state_entry()
+        self.assertEqual(entry["head_sha"], "a" * 40)
+        self.assertEqual(entry["status"], "comment_failed")
+        self.assertTrue(entry["report"])
+
+        # 墙醒: 新 head 复活 → 全额重审 (mcp+1, 缓存不沿用), 评论成功落 reviewed
+        self._set_wall(time.time() - 1.0)
+        self.comment_behavior = "ok"
+        self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertEqual(len(self.mcp_calls), mcp_after + 1)
+        self.assertEqual(len([c for c in self.api_calls if c[0] == "POST"]),
+                         posts_after + 1)
+        entry = self._state_entry()
+        self.assertEqual(entry["head_sha"], "b" * 40)
+        self.assertEqual(entry["status"], "reviewed")
+        self.assertEqual(entry["attempts"], 0)
+        self.assertIsNone(entry["report"])
 
 
 # ============================================================
 # #43 评论 404 甄别器 (三分支)
 # ============================================================
-class TestComment404Disambiguation(_GateCase):
+class TestComment404Disambiguation(_OnceEndToEndBase):
     """(#43) 评论 POST 404 后 GET 单 PR 甄别 (fake urlopen 按 URL 分流):
       ① GET open    → 判瞬态竞态: comment_failed + report 缓存 + attempts=1,
                       退避到点后同 head 只补评论 (mcp 调用计数不再 +1);
@@ -2772,93 +2717,9 @@ class TestComment404Disambiguation(_GateCase):
 
     def setUp(self):
         super().setUp()
-        os.environ["GITHUB_TOKEN"] = "fake-token-123"
-        os.environ.pop("GH_TOKEN", None)
-        self.pr_list = [{"number": 5, "title": "pr 5",
-                         "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         self.comment_behavior = "404"     # 404 | ok
         self.pr_get_behavior = "open"     # open | closed | error5xx | gone404
                                            # | nostate (200 但缺 state 键)
-        self.api_calls = []
-        self.mcp_calls = []
-
-    def _fake_urlopen(self, req, timeout=None, **kw):
-        url = req.full_url
-        method = req.get_method()
-        body = json.loads(req.data.decode("utf-8")) if req.data else None
-        self.api_calls.append((method, url, body))
-        if "/pulls?" in url:
-            return _FakeResp(self.pr_list)
-        if "/pulls/" in url:              # 单 PR GET (#43 甄别器)
-            if self.pr_get_behavior == "open":
-                return _FakeResp({"number": 5, "state": "open"})
-            if self.pr_get_behavior == "closed":
-                return _FakeResp({"number": 5, "state": "closed"})
-            if self.pr_get_behavior == "error5xx":
-                raise _make_http_error(502)
-            if self.pr_get_behavior == "gone404":
-                raise _make_http_error(404)
-            if self.pr_get_behavior == "nostate":
-                return _FakeResp({"number": 5})    # 200 但缺 state 键
-            raise AssertionError(
-                f"未预期 pr_get_behavior: {self.pr_get_behavior}")
-        if url.endswith("/comments"):
-            if self.comment_behavior == "404":
-                raise _make_http_error(404)
-            return _FakeResp(
-                {"html_url": "https://github.com/octo/hello#issuecomment-1"})
-        raise AssertionError(f"未预期 URL: {url}")
-
-    def _fake_run(self, cmd, *a, **kw):
-        if cmd[0] == "git":
-            if "clone" in cmd:
-                os.makedirs(os.path.join(cmd[-1], ".git"), exist_ok=True)
-            if "checkout" in cmd:
-                self.checked_out = cmd[-1]
-            if "rev-parse" in cmd and cmd[-1] == "HEAD":
-                return _CP(returncode=0,
-                           stdout=getattr(self, "checked_out", "") + "\n",
-                           stderr="")
-            return _CP(returncode=0, stdout="", stderr="")
-        if "--call" in cmd:
-            self.mcp_calls.append(json.loads(cmd[cmd.index("--call") + 2]))
-            payload = {"ok": True, "result": {
-                "content": [{"type": "text",
-                             "text": "汇总: P0: 0 条, P1: 0 条, P2: 1 条"}]}}
-            return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
-        raise AssertionError(f"未预期命令: {cmd}")
-
-    def _write_config(self):
-        cfg = {"repos": ["octo/hello"],
-               "state_file": os.path.join(self.tmp, "state.json"),
-               "clone_root": os.path.join(self.tmp, "clones"),
-               "review": {"depth": "deep", "focus": ""},
-               "retry": {"base_seconds": 300, "max_seconds": 3600,
-                         "max_attempts": 5},
-               "comment": {"enabled": True, "max_body": 60000}}
-        path = os.path.join(self.tmp, "config.json")
-        with open(path, "w") as f:
-            json.dump(cfg, f)
-        return path
-
-    def _run_once(self, cfg_path):
-        with mock.patch.object(self.mod.subprocess, "run", self._fake_run), \
-             mock.patch.object(self.mod.urllib.request, "urlopen",
-                               self._fake_urlopen):
-            return self.mod.main(["--once", "--config", cfg_path])
-
-    def _state_entry(self, key="octo/hello#5"):
-        with open(os.path.join(self.tmp, "state.json")) as f:
-            return json.load(f)["prs"][key]
-
-    def _force_retry_due(self, key="octo/hello#5"):
-        """模拟退避到点: 把 next_retry_at 拨回过去"""
-        path = os.path.join(self.tmp, "state.json")
-        with open(path) as f:
-            st = json.load(f)
-        st["prs"][key]["next_retry_at"] = 0
-        with open(path, "w") as f:
-            json.dump(st, f)
 
     def test_404_get_open_transient_race_caches_report(self):
         """① 评论 404 + GET open (新建 PR 竞态): comment_failed + 缓存 +
