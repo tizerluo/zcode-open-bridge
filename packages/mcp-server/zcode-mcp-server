@@ -1657,12 +1657,10 @@ def _tail_verdict_marker(text):
 
 def _verdict_marker_consistent(vm, zm):
     """尾置两行的标记数值与 VERDICT 行一致 (本函数自产形态的必然性质)。"""
-    vm_p3 = int(vm.group(4)) if vm.group(4) is not None else 0
-    zm_p3 = int(zm.group(4)) if zm.group(4) is not None else 0
     return (int(vm.group(1)) == int(zm.group(1))
             and int(vm.group(2)) == int(zm.group(2))
             and int(vm.group(3)) == int(zm.group(3))
-            and vm_p3 == zm_p3
+            and int(vm.group(4) or 0) == int(zm.group(4) or 0)
             and ((vm.group(5).lower() == "yes") == (zm.group(5) == "true")))
 
 
@@ -1722,7 +1720,7 @@ def _append_verdict_marker(text):
         return body
     p0, p1, p2 = int(verdict_m.group(1)), int(verdict_m.group(2)), \
         int(verdict_m.group(3))
-    p3 = int(verdict_m.group(4)) if verdict_m.group(4) is not None else 0
+    p3 = int(verdict_m.group(4) or 0)
     merge = "true" if verdict_m.group(5).lower() == "yes" else "false"
     marker = (f'<!-- zob-verdict:{{"P0":{p0},"P1":{p1},"P2":{p2},"P3":{p3},'
               f'"merge":{merge}}} -->')

@@ -101,7 +101,8 @@ class _EnvGuard(unittest.TestCase):
     """保存/恢复本文件用到的环境变量 (与 test_security_review 同惯例)。"""
 
     ENV_KEYS = ("GITHUB_TOKEN", "GH_TOKEN", "GATE_CONFIG", "GATE_STATE_FILE",
-                "GATE_CLONE_ROOT", "GATE_MCP_SERVER", "GATE_POLL_INTERVAL",
+                "GATE_CLONE_ROOT", "GATE_REPORTS_DIR", "GATE_REPORTS_MAX_KEPT",
+                "GATE_MCP_SERVER", "GATE_POLL_INTERVAL",
                 "GATE_QUOTA_LIMIT_5H", "GATE_QUOTA_TOKENS_5H")
 
     def setUp(self):
@@ -559,6 +560,13 @@ class TestCommentBody(_GateCase):
             "pass", (1, 2, 3, 4), self.SHA, "报告正文", 60000)
         self.assertIn("P0 × 1 · P1 × 2 · P2 × 3 · P3 × 4", body)
 
+    def test_three_length_counts_p3_defaults_zero(self):
+        # 旧 state 三长 counts (无 P3 桶) 流入 build_comment_body 不炸
+        # (len 守卫兜住), P3 桶缺省显示 × 0
+        body = self.mod.build_comment_body(
+            "pass", [0, 0, 1], self.SHA, "报告正文", 60000)
+        self.assertIn("P0 × 0 · P1 × 0 · P2 × 1 · P3 × 0", body)
+
     def test_truncation_preserves_tail_verdict_and_marker(self):
         # #32: 掐中段保首尾 — 构造超长报告 (含尾部 marker + VERDICT 行)
         # 截断后评论体 marker + VERDICT 行存活且总长 <= max_body
@@ -591,6 +599,18 @@ class TestCommentBody(_GateCase):
             "pass", (0, 0, 0, 0), self.SHA, report, max_body=60000)
         self.assertNotIn("截断", body)
         self.assertIn(report, body)
+
+    def test_truncation_strips_inherited_truncation_mark(self):
+        # 防双截断标记: 入参 report 已带一个 _TRUNC_MARK (comment_failed
+        # 保尾缓存的形态) 且落在保留的头段内 → 截断分支先剥旧标记,
+        # 输出只含一个「已截断」标记
+        report = ("【头部摘要】\n" + self.mod._TRUNC_MARK
+                  + "超长分析细节内容" * 8000
+                  + "\nVERDICT: P0=0 P1=0 P2=0 P3=0 MERGE=yes")
+        body = self.mod.build_comment_body(
+            "pass", (0, 0, 0, 0), self.SHA, report, max_body=5000)
+        self.assertIn("报告超长已截断", body)
+        self.assertEqual(body.count("报告超长已截断"), 1)
 
 
 # ============================================================
@@ -643,6 +663,9 @@ class TestConfig(_GateCase):
         self.assertTrue(
             cfg.state_file.endswith(".local/state/zcode-review-gate/state.json"))
         self.assertEqual(cfg.mcp_server, "zcode-mcp-server")
+        self.assertEqual(cfg.reports_dir,
+                         os.path.expanduser(self.mod.DEFAULT_REPORTS_DIR))
+        self.assertEqual(cfg.reports_max_kept, 50)
 
     def test_env_overrides(self):
         os.environ["GATE_STATE_FILE"] = "/tmp/x/state.json"
@@ -661,6 +684,46 @@ class TestConfig(_GateCase):
     def test_bad_depth_falls_back(self):
         cfg = self.mod.GateConfig({"review": {"depth": "ultra"}})
         self.assertEqual(cfg.review_depth, "deep")
+
+    def test_reports_dir_three_sources(self):
+        # 优先级链: GATE_REPORTS_DIR env > 配置文件显式 reports_dir >
+        # GATE_STATE_FILE 派生 > 默认目录 (test_defaults 已钉默认值)
+        explicit = os.path.join(self.tmp, "explicit-reports")
+        cfg = self.mod.GateConfig({"reports_dir": explicit})
+        self.assertEqual(cfg.reports_dir, explicit)
+        # config 显式 reports_dir + env 只设 GATE_STATE_FILE → 仍是配置值
+        # (GATE_STATE_FILE 派生不碾显式配置, README 承诺的优先级)
+        os.environ["GATE_STATE_FILE"] = os.path.join(self.tmp, "st", "state.json")
+        cfg = self.mod.GateConfig({"reports_dir": explicit})
+        cfg.apply_env_overrides()
+        self.assertEqual(cfg.reports_dir, explicit)
+        # 无显式配置时 GATE_STATE_FILE 派生 state 同目录 reports/
+        cfg = self.mod.GateConfig({})
+        cfg.apply_env_overrides()
+        self.assertEqual(cfg.reports_dir, os.path.join(self.tmp, "st", "reports"))
+        # GATE_REPORTS_DIR 覆盖一切 (含覆盖显式配置)
+        os.environ["GATE_REPORTS_DIR"] = os.path.join(self.tmp, "env-reports")
+        cfg = self.mod.GateConfig({"reports_dir": explicit})
+        cfg.apply_env_overrides()
+        self.assertEqual(cfg.reports_dir, os.path.join(self.tmp, "env-reports"))
+
+    def test_reports_max_kept_zero_clamped_to_one(self):
+        # 0 份等于落盘即删, 钳到 1
+        os.environ["GATE_REPORTS_MAX_KEPT"] = "0"
+        cfg = self.mod.GateConfig({})
+        cfg.apply_env_overrides()
+        self.assertEqual(cfg.reports_max_kept, 1)
+
+    def test_bare_state_file_reports_dir_falls_back_to_default(self):
+        # 裸文件名 state_file 的 dirname 为空 → 不派生相对路径 "reports",
+        # 回退默认目录 (config 与 env 两路都钉住)
+        default_reports = os.path.expanduser(self.mod.DEFAULT_REPORTS_DIR)
+        cfg = self.mod.GateConfig({"state_file": "state.json"})
+        self.assertEqual(cfg.reports_dir, default_reports)
+        os.environ["GATE_STATE_FILE"] = "state.json"
+        cfg = self.mod.GateConfig({})
+        cfg.apply_env_overrides()
+        self.assertEqual(cfg.reports_dir, default_reports)
 
     def test_lower_bound_clamps(self):
         cfg = self.mod.GateConfig({
@@ -1011,6 +1074,7 @@ class TestOnceEndToEnd(_GateCase):
         self.api_calls = []    # (method, url, body)
         self.mcp_calls = []    # 审查 args dict
         self.git_calls = []    # (cmd list, env)
+        self.review_report = None  # 覆盖 _fake_run 默认报告 (超长/带标记场景)
 
     def _mkpr(self, number, sha, base="main"):
         return {"number": number, "title": f"pr {number}",
@@ -1051,7 +1115,8 @@ class TestOnceEndToEnd(_GateCase):
             idx = cmd.index("--call")
             self.assertEqual(cmd[idx + 1], "zcode_pr_review")
             self.mcp_calls.append(json.loads(cmd[idx + 2]))
-            report = "汇总: P0: 0 条, P1: 0 条, P2: 2 条\n一切正常。"
+            report = self.review_report or (
+                "汇总: P0: 0 条, P1: 0 条, P2: 2 条\n一切正常。")
             payload = {"ok": True, "result": {
                 "content": [{"type": "text", "text": report}]}}
             return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
@@ -1196,6 +1261,14 @@ class TestOnceEndToEnd(_GateCase):
         退避到点后的下一轮: 只补评论, 不重跑 mcp 审查"""
         cfg_path = self._write_config()
         self.comment_behavior = "retryable"   # 评论 500
+        # 超长报告 (超 comment.max_body=60000) 尾部带 VERDICT 行与标记 —
+        # 钉住落盘解耦 (完整原文先于评论落盘) 与重试路径的保尾缓存
+        verdict_line = "VERDICT: P0=0 P1=0 P2=2 P3=0 MERGE=yes"
+        marker = ('<!-- zob-verdict:{"P0":0,"P1":0,"P2":2,"P3":0,'
+                  '"merge":true} -->')
+        self.review_report = ("汇总: P0: 0 条, P1: 0 条, P2: 2 条\n"
+                              + "超长分析细节" * 10000
+                              + f"\n{verdict_line}\n{marker}")
 
         # 第一轮: 审查成功, 评论失败 → comment_failed + 缓存 + attempts=1
         self.assertEqual(self._run_once(cfg_path), 0)
@@ -1208,6 +1281,14 @@ class TestOnceEndToEnd(_GateCase):
         self.assertTrue(entry["report"])          # 审查结果已缓存
         self.assertEqual(entry["verdict"], "pass")
         self.assertEqual(entry["counts"], [0, 0, 2, 0])
+        # 落盘先于评论 (与评论成败解耦): 评论失败时原文已完整落盘
+        self.assertTrue(entry.get("report_path")
+                        and os.path.isfile(entry["report_path"]))
+        with open(entry["report_path"], encoding="utf-8") as f:
+            self.assertEqual(f.read(), self.review_report)  # 完整未截断
+        # 评论缓存保尾截断: 不超 cap, 尾部 VERDICT 行与标记存活
+        self.assertLessEqual(len(entry["report"]), 60000)
+        self.assertIn(marker, entry["report"])
 
         # 退避到点 (拨回 next_retry_at), 评论恢复 → 只补评论
         self.comment_behavior = "ok"
@@ -1224,6 +1305,17 @@ class TestOnceEndToEnd(_GateCase):
         self.assertEqual(entry["status"], "reviewed")
         self.assertIsNone(entry["report"])        # reviewed 后缓存清掉
         self.assertTrue(entry.get("report_path") and os.path.isfile(entry["report_path"]))
+        # 重试轮不重落盘: 指向的仍是首轮的完整未截断原文
+        with open(entry["report_path"], encoding="utf-8") as f:
+            self.assertEqual(f.read(), self.review_report)
+        # 重试轮补发的评论体尾部含 zob-verdict 标记 (保尾缓存生效,
+        # 下游从评论反解标记可行)
+        retry_body = [c for c in self.api_calls if c[0] == "POST"][1][2]["body"]
+        self.assertIn(marker, retry_body)
+        self.assertIn(verdict_line, retry_body)
+        # 缓存自带标记 + 二次截断新插标记 → 只许出现一个「已截断」标记
+        # (build_comment_body 截断分支剥旧标记, 防双标记困惑人读)
+        self.assertEqual(retry_body.count("报告超长已截断"), 1)
         self.assertEqual(entry["attempts"], 0)
 
     def test_comment_ratelimited_no_attempts_burn_comment_only_retry(self):
@@ -1682,6 +1774,21 @@ class TestFakeMcpServerQuotaWallIntegration(_GateCase):
 # #33 报告落盘与轮转 (reports/ 保留近 50 份)
 # ============================================================
 class TestReportPersistenceAndRotation(_GateCase):
+    def _seed_reports(self, reports_dir, step=10):
+        """手搓 55 份报告文件, mtime 从 1700000000 按 step 递增 (索引小=旧)。
+
+        返回路径列表 (索引序即 mtime 序)。
+        """
+        created_paths = []
+        for i in range(55):
+            p = os.path.join(reports_dir, f"octo__repo#{i}-{'0' * 12}.md")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(f"report {i}")
+            mtime = 1700000000.0 + i * step
+            os.utime(p, (mtime, mtime))
+            created_paths.append(p)
+        return created_paths
+
     def test_save_report_and_rotate_normal(self):
         reports_dir = os.path.join(self.tmp, "reports")
         report_content = "# 审查报告\nVERDICT: P0=0 P1=0 P2=0 P3=0 MERGE=yes"
@@ -1697,27 +1804,55 @@ class TestReportPersistenceAndRotation(_GateCase):
     def test_rotation_keeps_max_50_and_purges_oldest(self):
         reports_dir = os.path.join(self.tmp, "reports")
         os.makedirs(reports_dir, exist_ok=True)
-        created_paths = []
+        created_paths = self._seed_reports(reports_dir)
         base_time = 1700000000.0
-        # 创建 55 份报告, 按 mtime 顺序排列
-        for i in range(55):
-            p = os.path.join(reports_dir, f"octo__repo#{i}-{'0'*12}.md")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(f"report {i}")
-            mtime = base_time + i * 10
-            os.utime(p, (mtime, mtime))
-            created_paths.append(p)
+        # 混入两份经 save_report_and_rotate 真实生成的报告 (内部轮转传大
+        # max_kept 防提前删, mtime 编排成全场最旧/最新) — save 产出的文件名
+        # 必被白名单计数, 未来改文件名格式忘同步 _RE_REPORT_FILE 时这里会红
+        real_oldest = self.mod.save_report_and_rotate(
+            reports_dir, "real", "repo", 101, "b" * 40, "真实生成-最旧",
+            max_kept=100)
+        real_newest = self.mod.save_report_and_rotate(
+            reports_dir, "real", "repo", 102, "c" * 40, "真实生成-最新",
+            max_kept=100)
+        os.utime(real_oldest, (base_time - 100.0, base_time - 100.0))
+        os.utime(real_newest, (base_time + 100000.0, base_time + 100000.0))
 
         self.mod.rotate_reports(reports_dir, max_kept=50)
 
+        # 真生成文件参与轮转: 最旧的被删, 最新的留存
+        self.assertFalse(os.path.exists(real_oldest))
+        self.assertTrue(os.path.exists(real_newest))
         remaining = [os.path.join(reports_dir, f) for f in os.listdir(reports_dir) if f.endswith(".md")]
         self.assertEqual(len(remaining), 50)
-        # 最旧的 5 份 (0..4) 被删
-        for old_p in created_paths[:5]:
+        # 共删 7 份最旧: 真生成最旧 + 手搓 0..5
+        for old_p in created_paths[:6]:
             self.assertFalse(os.path.exists(old_p))
-        # 较新的 50 份 (5..54) 留存
-        for new_p in created_paths[5:]:
+        # 手搓 6..54 (49 份) + 真生成最新留存
+        for new_p in created_paths[6:]:
             self.assertTrue(os.path.exists(new_p))
+
+    def test_rotation_ignores_unrelated_and_tmp_files(self):
+        # 轮转白名单: reports_dir 被指到已有内容的目录时, 不匹配报告命名
+        # 模式的无关文件 (notes.txt) 不被误删; 落盘 tmp 中转残留 (<名>.tmp.
+        # <pid>, 不以 .md 结尾) 同样不进轮转; 真报告照常只留 50 份
+        reports_dir = os.path.join(self.tmp, "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        unrelated = os.path.join(reports_dir, "notes.txt")
+        with open(unrelated, "w", encoding="utf-8") as f:
+            f.write("运维手记, 与轮转无关")
+        tmp_residue = os.path.join(
+            reports_dir, f"octo__repo#99-{'a' * 12}.md.tmp.{os.getpid()}")
+        with open(tmp_residue, "w", encoding="utf-8") as f:
+            f.write("落盘中断残留")
+        self._seed_reports(reports_dir)
+
+        self.mod.rotate_reports(reports_dir, max_kept=50)
+
+        md_left = [f for f in os.listdir(reports_dir) if f.endswith(".md")]
+        self.assertEqual(len(md_left), 50)
+        self.assertTrue(os.path.exists(unrelated))
+        self.assertTrue(os.path.exists(tmp_residue))
 
     def test_save_report_failure_logs_warning_and_does_not_crash(self):
         # 模拟 reports_dir 无法创建 (例如是一个已存在的文件)
@@ -1743,8 +1878,37 @@ class TestReportPersistenceAndRotation(_GateCase):
             self.assertTrue(os.path.isfile(path))
             self.assertTrue(any(call.args[1] == "WARNING" for call in m_log.call_args_list))
 
+    def test_write_failure_cleans_up_tmp_residue(self):
+        # 写入成功但 os.replace 失败 → best-effort 清理 tmp 中转残留,
+        # 目录不留 .tmp.<pid> 垃圾, 目标文件也不存在
+        reports_dir = os.path.join(self.tmp, "reports")
+
+        def fake_replace(src, dst):
+            raise OSError("replace boomed")
+
+        with mock.patch.object(self.mod.os, "replace", fake_replace), \
+             mock.patch.object(self.mod, "log") as m_log:
+            result = self.mod.save_report_and_rotate(
+                reports_dir, "octo", "hello", 1, "a" * 40, "报告正文")
+        self.assertIsNone(result)
+        self.assertTrue(any(call.args[1] == "WARNING" for call in m_log.call_args_list))
+        self.assertEqual(os.listdir(reports_dir), [])
+
+    def test_unencodable_report_returns_none_without_raising(self):
+        # report 含孤立代理字符 → utf-8 文本写抛 UnicodeEncodeError
+        # (ValueError 子类, 非 OSError) — 须按写失败吞掉: 返回 None 不外抛
+        # (成功审查不能被落盘失败炸掉缓存/评论/烧满重试), tmp 残留也清掉
+        reports_dir = os.path.join(self.tmp, "reports")
+        with mock.patch.object(self.mod, "log") as m_log:
+            result = self.mod.save_report_and_rotate(
+                reports_dir, "octo", "hello", 1, "a" * 40, "报告\ud800正文")
+        self.assertIsNone(result)
+        self.assertTrue(any(call.args[1] == "WARNING" for call in m_log.call_args_list))
+        self.assertEqual(os.listdir(reports_dir), [])
+
     def test_state_backward_compatibility_without_report_path(self):
         # 旧 state.json 没有 report_path 字段, StateStore 仍能正常读取与写回
+        # (counts 用三长 — 旧代码只有 P0-P2 三桶, 写不出四长形态)
         path = os.path.join(self.tmp, "old_state.json")
         old_data = {
             "prs": {
@@ -1752,7 +1916,7 @@ class TestReportPersistenceAndRotation(_GateCase):
                     "head_sha": "a" * 40,
                     "status": "reviewed",
                     "verdict": "pass",
-                    "counts": [0, 0, 1, 0],
+                    "counts": [0, 0, 1],
                     "report": None,
                     "attempts": 0,
                     "next_retry_at": 0.0,

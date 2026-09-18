@@ -4,7 +4,9 @@
 `zcode_pr_review` 完成审查（git diff + mimosa 深扫 + findings 按 diff
 文件过滤/已知基线去重 + ZCode 只读复核），
 把带 verdict（pass / concerns / 需人工核对）的结果回贴为 PR 评论。同一
-head sha 不重复审（state 文件去重），失败按指数退避重试。审查前会把
+head sha 不重复审（state 文件去重），失败按指数退避重试。审查成功即把
+完整报告原文落盘到 `reports_dir`（默认保留近 50 份，超出按 mtime 删最旧，
+与评论成败解耦）。审查前会把
 clone 工作区 **checkout 到被审 head sha 并回读校验**——mimosa 扫的是
 工作区文件，不 checkout 会扫在旧代码上（issue #17）。公开、通用，任何
 GitHub 仓库可用。
@@ -19,10 +21,11 @@ GitHub API ──轮询 open PR──► review-gate (state 文件去重/指数�
              zcode-mcp-server 子进程 (git diff + mimosa 深扫 + findings 按 diff
                              文件过滤/已知基线去重 + ZCode 只读复核;
                              锁/限流重试/只读护栏全在 bridge 侧同源复用)
-                               │ 报告 → 解析 P0/P1/P2 → verdict
+                               │ 报告 → 解析 P0/P1/P2/P3 → verdict
                                ▼
              PR 评论: ✅ pass / ⚠️ concerns / ❓ 需人工核对
                      + 完整报告 (details 折叠)
+             + 报告原文落盘 reports/ (保留近 50 份)
 ```
 
 ## 前置条件
@@ -88,6 +91,8 @@ loginctl enable-linger "$USER"
 | `poll_interval_seconds` | `300` | 轮询间隔（秒） |
 | `state_file` | `~/.local/state/zcode-review-gate/state.json` | 状态文件（去重/退避） |
 | `clone_root` | `~/.local/state/zcode-review-gate/clones` | 仓库 clone 存放目录 |
+| `reports_dir` | state 同目录下 `reports/`（未配置 `state_file` 时为 `~/.local/state/zcode-review-gate/reports`） | 成功审查报告原文落盘目录（与评论成败解耦，评论失败/禁用也落盘）；轮转只认报告命名模式 `<owner>__<repo>#<pr>-<sha12>.md`，目录里的无关文件不碰 |
+| `reports_max_kept` | `50` | `reports/` 轮转保留份数（钳下限 1）；超出按 mtime 删最旧 |
 | `mcp_server` | `zcode-mcp-server` | bridge mcp-server 可执行名/路径（须支持 `--call`）。纯命令名且 PATH 找不到时自动回退试 `~/.local/bin/<name>`（存在且可执行才用，log DEBUG 记录解析结果） |
 | `github_api` | `https://api.github.com` | GitHub API base（企业版可改）。clone 的 web 宿主按惯例推导：`api.github.com`→`github.com`，`<host>/api/v3`→`<host>`（GHE），其他形态回退 `github.com` |
 | `review.depth` | `deep` | 审查深度：`normal`（快扫）/ `deep`（含业务逻辑投研） |
@@ -105,10 +110,14 @@ loginctl enable-linger "$USER"
 | `GATE_CONFIG` | 配置文件路径本身（等价 `--config`） |
 | `GATE_STATE_FILE` | `state_file` |
 | `GATE_CLONE_ROOT` | `clone_root` |
+| `GATE_REPORTS_DIR` | `reports_dir` |
+| `GATE_REPORTS_MAX_KEPT` | `reports_max_kept` |
 | `GATE_MCP_SERVER` | `mcp_server` |
 | `GATE_POLL_INTERVAL` | `poll_interval_seconds` |
 
-路径值支持 `~` 展开。
+路径值支持 `~` 展开。设 `GATE_STATE_FILE`（且未设
+`GATE_REPORTS_DIR`/配置 `reports_dir`）时，`reports_dir` 派生为 state 文件
+同目录下 `reports/`；state 路径为裸文件名时回退默认 `reports_dir`。
 
 ## 卸载
 
@@ -118,7 +127,7 @@ rm ~/.config/systemd/user/zcode-review-gate.service
 systemctl --user daemon-reload
 # 按需清理: ~/.local/bin/zcode-review-gate
 #           ~/.config/zcode-review-gate/
-#           ~/.local/state/zcode-review-gate/   (state + clones, 可能很大)
+#           ~/.local/state/zcode-review-gate/   (state + clones + reports, 可能很大)
 ```
 
 ## 运维
@@ -167,14 +176,17 @@ systemd 用 `systemctl --user edit zcode-review-gate` 加 `Environment=` 行）�
 
 state 文件（默认 `~/.local/state/zcode-review-gate/state.json`）记录每个 PR 的
 审查状态：`head_sha` / `status` / `verdict` / `counts` / `report` /
-`attempts` / `next_retry_at` / `comment_url` / `error`。
+`report_path` / `attempts` / `next_retry_at` / `comment_url` / `error`。
 `status ∈ pending|reviewed|failed|comment_failed|gave_up`：`pending` 是
 一轮处理中的瞬态；`comment_failed` 表示审查已成功但评论没发出去——此时
 `report`/`verdict`/`counts` 已缓存，重试时同 head **只补评论不重跑审查**；
 `reviewed` 后 `report` 缓存清空。
+`report_path` 指向成功审查落盘的原文（`reports_dir` 下，审查成功即写入、
+与评论成败解耦）；`null` = 落盘失败或旧 state 条目。
 **想强制重审某个 PR：删掉对应条目**（或把 PR 推一个新 commit，head 变化会
 自动复活重审）。
-注意：`gave_up` 时缓存的 `report`（每条最多 `comment.max_body` 字符）会
+注意：`gave_up` 时缓存的 `report`（超长时掐中段保首尾截断到
+`comment.max_body`，尾部 VERDICT 行与标记存活）会
 留在 state 文件里供人工排查——长期积攒关注 state 文件体量，可定期清理
 已完结 PR 的条目。
 
@@ -191,8 +203,9 @@ zcode。
   重试，而 GitHub issue comments 没有幂等键——极端情况下同一 head 可能
   出现重复评论，属已知限制（方向仍是宁多勿漏）。
 - **verdict 依赖报告文本解析**：优先读报告尾的 `zob-verdict` 结构化标记
-  （mcp-server 要求 zcode 以严格单行 `VERDICT: P0=n P1=n P2=n MERGE=yes|no`
-  收尾并转写成 HTML 注释，issue #16）；标记缺失时退回报告开头的正则解析。
+  （mcp-server 要求 zcode 以严格单行 `VERDICT: P0=n P1=n P2=n P3=n MERGE=yes|no`
+  收尾并转写成 HTML 注释，issue #16；P3 为非阻断桶，P3>0 不挡合并）；
+  标记缺失时退回报告开头的正则解析。
   两者都失败时 verdict 为 **需人工核对**（❓ unresolved）——不再误标
   concerns：假红灯曾让下游把"可以合并"误读成"闸门卡死"。
   **防伪造**（狗食 review P1-1）：标记只认完整注释形态且取最后一个匹配
@@ -205,9 +218,10 @@ zcode。
   ≤9 位（P2-4：≥4301 位整数串会让 Python ≥3.11 的 `int()` 抛错、烧满
   重审）。标记明说 `merge=no` 时即使 P0/P1 全 0 也不给 pass（P2-1）。
   **截断注意**：报告超 `ZCODE_BRIDGE_MAX_OUTPUT` 截断会切掉尾部 VERDICT 行
-  （标记缺失、退正则兜底，日志有提示）；评论超 `max_body` 截断时贴出的
-  评论可能不含标记（verdict 在截断前已解析，表头仍正确；未来若有下游从
-  评论 HTML 反解标记需知此限制）。
+  （标记缺失、退正则兜底，日志有提示）；评论超 `max_body` 截断时**掐中段
+  保首尾**——尾部 VERDICT 行与 zob-verdict 标记存活（#32），下游可从评论
+  HTML 反解标记；评论失败重试路径的 state 缓存同规则截断，重试补发的
+  评论尾部同样带标记。
 - **单线程串行**：逐仓逐 PR 串行审查；并发安全靠 bridge mcp-server 侧的
   跨进程文件锁兜底（多实例同时跑也不会并发打爆 zcode 限流）。**同一
   state 文件（同一部署）只允许一个 gate 实例**：启动时对
