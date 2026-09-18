@@ -30,8 +30,9 @@ zcode-review-gate — PR 自动审查闸门守护进程 (zcode-open-bridge 第 4
     完成时刻且接 usage.total_tokens 透传 (#42/#35②)。state 的墙/台账
     两键脏值读取侧防御 (#36): 墙脏按无墙、台账脏条目按窗外淘汰
     (prune 自愈), 成功审查不被脏 state 炸成 failed。
-  - 运行期行为 (#38/#40/#43): 墙期内有待审 PR 时整仓跳过 clone/fetch
-    (per-PR 墙检查保留作双保险); 水位巡检按档位去重 — 严格升档才报
+  - 运行期行为 (#38/#40/#43): 墙期内有待审 PR 时跳过重审与 clone/fetch
+    (comment_failed 补评论组豁免 — 补评论不耗额度; per-PR 墙检查保留
+    作双保险); 水位巡检按档位去重 — 严格升档才报
     WARNING, 回落 <80% 才复位 (state.watermark_last_tier 跨轮持久);
     评论 404 先 GET 单 PR 甄别: open 判列表→评论竞态走 comment_failed
     缓存补评论, 确认关闭/删除才静默跳过, 甄别不可得保守走原 404 路径。
@@ -143,6 +144,11 @@ def log(msg, level="INFO"):
         return
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
+
+
+def _fmt_ts(ts):
+    """unix 秒 → \"YYYY-mm-dd HH:MM:SS\" 本地时区显示串 (墙/重试日志共用)。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
 # ============================================================
@@ -410,8 +416,9 @@ def classify_comment_404(token, api_base, owner, repo, pr_number):
       - PR 在列表拉取后被关闭/删除: 下轮列表自然收敛, 静默跳过即可。
     返回三态:
       "open"    — GET 200 且 state=open (竞态);
-      "gone"    — GET 200 且 state!=open, 或 GET 404 (确认关闭/删除);
-      "unknown" — GET 其他错误 (5xx/网络/限流): 甄别不可得, 保守按原
+      "gone"    — GET 200 且 state≠open (closed 等), 或 GET 404 (确认关闭/删除);
+      "unknown" — GET 200 但形状异常 (非 dict/缺 state 键), 或 GET 其他
+                  错误 (5xx/网络/限流): 甄别不可得, 保守按原
                   RepoHardError 路径处理 — 不烧 attempts 不启用缓存,
                   下轮全额重审。宁可浪费一次审查, 也不据不可得的甄别
                   信息判定终态。
@@ -423,10 +430,19 @@ def classify_comment_404(token, api_base, owner, repo, pr_number):
     except RepoHardError:
         return "gone"
     except (RetryableError, RateLimited):
+        # RateLimited 归 unknown 是有意取舍 (与全码库「限流即停轮」口径
+        # 不一致): 甄别 GET 撞限流时保守按原 404 路径跳过本 PR, 不烧
+        # attempts; 本轮后续 PR 的 post_comment 再撞限流会照常上抛停轮
+        # 兜底 — 代价有界 (至多本 PR 多等一轮)。
         return "unknown"
     if not isinstance(pr, dict):
         return "unknown"
-    return "open" if pr.get("state") == "open" else "gone"
+    state = pr.get("state")
+    if state is None:
+        # (R1 P3-3) 缺 state 键属形状异常: 归 unknown 保留 WARNING 排查
+        # 线索, 不据残缺载荷判 gone (静默) 走掉
+        return "unknown"
+    return "open" if state == "open" else "gone"
 
 
 # ============================================================
@@ -944,9 +960,11 @@ class StateStore:
     def get_watermark_last_tier(self):
         """(#40) 读水位档位键 (0/1/2); 脏值 (非数字/嵌套/NaN·Infinity/
         超 float 上限巨整) 经 _safe_float + _as_int 双层防御回退 0=未报过
-        (#36 同口径), 结果钳回 [0,2] — 手编越界档位不外溢进升档比较。"""
+        (#36 同口径: 失败打 WARNING 且按 key 进程内去重只报一次),
+        结果钳回 [0,2] — 手编越界档位不外溢进升档比较。"""
         tier = _as_int(
-            _safe_float(self.data.get("watermark_last_tier"), 0.0), 0)
+            _safe_float(self.data.get("watermark_last_tier"), 0.0,
+                        warn_key="watermark_last_tier"), 0)
         return min(max(tier, 0), 2)
 
     def set_watermark_last_tier(self, tier):
@@ -1032,6 +1050,20 @@ def needs_review(entry, head_sha, now):
         return False                                    # 退避未到点
     return True                     # failed 到点重试 / comment_failed 补评论
                                     # / pending 断点恢复
+
+
+def _is_comment_only_retry(entry, head_sha):
+    """(#38 R1 P2-1) 「沿用缓存审查结果、只补评论」路径的共用判定。
+
+    process_pr 缓存分支 (审查已成功、只欠评论) 与 process_repo 墙期过滤
+    共用同一判定, 避免两处条件漂移: 同 head 的 comment_failed 且 report
+    缓存非空。head_sha 必须比对 — process_pr 顶部对新 head 换新 entry
+    (复活重审), head 变化的 comment_failed 不走缓存分支, 也不算补评论。
+    """
+    return (entry is not None
+            and entry.get("head_sha") == head_sha
+            and entry.get("status") == "comment_failed"
+            and bool(entry.get("report")))
 
 
 def mark_failure(entry, error, now, cfg, status="failed"):
@@ -1238,6 +1270,9 @@ def check_watermark(usage, state, limit_count=0, limit_tokens=0, log_fn=log):
         levels.append((ratio, f"token 用量 {usage['tokens']}/{limit_tokens}"))
 
     if not levels:
+        # (R1 P3-1) 配额关闭即巡检状态作废: 复位旧档位, 防限额移除又
+        # 重配后首报被吞 (如旧 tier=2 时重配后爬回 80/95 档不再报)
+        state.set_watermark_last_tier(0)
         return None
 
     max_ratio, desc = max(levels, key=lambda x: x[0])
@@ -1300,7 +1335,7 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
                  "comment_url": "", "error": ""}
         state.put(key, entry)
 
-    if entry.get("status") == "comment_failed" and entry.get("report"):
+    if _is_comment_only_retry(entry, head_sha):
         # 审查已成功过、只是评论没发出去: 沿用缓存结果, 只补评论,
         # 不为一次评论失败重跑昂贵的 zcode 审查
         report = entry["report"]
@@ -1311,8 +1346,7 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
         # 启动审查前查墙: 若处于 1308 额度墙期内, 跳过审查启动 (保持 pending 不衰老, 不烧 attempts)
         if is_quota_wall_active(state, now):
             until = state.get_quota_wall_until()
-            until_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
-            log(f"{key}: 处于 1308 额度墙期内 (至 {until_str}), 跳过审查启动 "
+            log(f"{key}: 处于 1308 额度墙期内 (至 {_fmt_ts(until)}), 跳过审查启动 "
                 "(保持 pending, 不计失败)")
             entry["status"] = "pending"
             return
@@ -1344,9 +1378,8 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
             if reset_ts is not None and is_valid_quota_window(reset_ts, now):
                 wall_until = reset_ts + WALL_BUFFER_SECONDS
                 state.set_quota_wall_until(wall_until)
-                until_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(wall_until))
-                reset_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_ts))
-                log(f"{key}: 触发 1308 额度墙 (reset at {reset_str}, 锁墙至 {until_str}, "
+                log(f"{key}: 触发 1308 额度墙 (reset at {_fmt_ts(reset_ts)}, "
+                    f"锁墙至 {_fmt_ts(wall_until)}, "
                     f"含 {int(WALL_BUFFER_SECONDS)}s buffer), 保持 pending (不计失败)")
                 entry["status"] = "pending"
                 entry["error"] = payload[:500]
@@ -1483,18 +1516,29 @@ def process_repo(cfg, state, token, repo_full, pr_filter):
         return
     log(f"{repo_full}: {len(infos)} 个 open PR, {len(todo)} 个待审")
 
-    # (#38) 墙期上提检查: 有待审 PR 但处于 1308 额度墙期内 → 本轮跳过
-    # 整仓的 clone/fetch — 墙最长 5.5h, 每轮白跑 repo 级 git 网络操作
-    # 纯属浪费 (INFO 一句, 不打 WARNING 刷屏)。语义红线: 必须在 todo
+    # (#38) 墙期上提检查: 有待审 PR 但处于 1308 额度墙期内 → 跳过需重审
+    # PR 的处理与 clone/fetch — 墙最长 5.5h, 每轮白跑 repo 级 git 网络
+    # 操作纯属浪费 (INFO 一句, 不打 WARNING 刷屏)。语义红线: 必须在 todo
     # 判空之后 — 无待审 PR 时本来就不 clone, 该早退语义不变。
+    # (R1 P2-1) comment_failed+缓存 PR 豁免: 补评论路径在 process_pr 缓存
+    # 分支先于 per-PR 墙检查 (补评论不耗额度, 既有代码刻意豁免墙), 仓级
+    # 过滤不得误伤。全是待重审组 (无可补评论) 才整仓早退。
     # process_pr 内的 per-PR 墙检查保留不动, 作双保险: 防将来这里的
     # 上提检查被重构掉后, 墙期又漏跑审查烧额度。
     if is_quota_wall_active(state, now):
-        until = state.get_quota_wall_until()
-        until_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
-        log(f"{repo_full}: 处于 1308 额度墙期内 (至 {until_str}), "
-            f"跳过 {len(todo)} 个待审 PR 与 clone/fetch")
-        return
+        until_str = _fmt_ts(state.get_quota_wall_until())
+        comment_only = [
+            i for i in todo if _is_comment_only_retry(
+                state.get(f"{owner}/{repo}#{i['number']}"), i["head_sha"])]
+        if not comment_only:
+            log(f"{repo_full}: 处于 1308 额度墙期内 (至 {until_str}), "
+                f"跳过 {len(todo)} 个待审 PR 与 clone/fetch")
+            return
+        if len(todo) > len(comment_only):
+            log(f"{repo_full}: 处于 1308 额度墙期内 (至 {until_str}), "
+                f"本轮跳过 {len(todo) - len(comment_only)} 个待重审 PR, "
+                f"只处理 {len(comment_only)} 个补评论")
+        todo = comment_only
 
     try:
         clone = ensure_clone(cfg, token, owner, repo)

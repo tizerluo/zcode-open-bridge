@@ -39,8 +39,9 @@ subprocess.run 与 urllib.request.urlopen 一律 mock 掉: 不碰真实网络、
   - 评论失败两路径: RetryableError → comment_failed+退避+缓存, 下轮只补评论;
     RateLimited → 不烧 attempts 有缓存, 下轮只补评论
   - CLI: --repo 覆盖配置 repos; --pr 过滤生效; 有 PR 失败 --once 仍 exit 0
-  - 运行期行为 (#38/#40/#43): 墙期内整仓跳过 clone/fetch (git 子进程计数
-    为 0, 一条 INFO 不刷 WARNING; 墙外照跑; todo 空 → 早退语义不变);
+  - 运行期行为 (#38/#40/#43): 墙期内跳过待重审 PR 与 clone/fetch (git
+    子进程计数为 0, 一条 INFO 不刷 WARNING; comment_failed 补评论组墙期
+    豁免照常只补评论; 墙外照跑; todo 空 → 早退语义不变);
     水位巡检档位去重 (严格升档才报 / 80→95 再报 / 同档一次 / 回落 <80
     复位后再爬回再报 / 脏档位回退 0 / watermark_last_tier 跨轮落盘生效);
     评论 404 甄别三分支 (GET open → comment_failed 缓存+attempts+下轮只补
@@ -113,6 +114,16 @@ def _make_http_error(code, headers=None):
         hdrs[k] = v
     return urllib.error.HTTPError("https://api.github.com/x", code,
                                   "err", hdrs, None)
+
+
+def _log_sink():
+    """fake_log 收集器: 返回 (logs, fn), fn 把 (level, msg) 元组收进 logs"""
+    logs = []
+
+    def fake_log(msg, level="INFO"):
+        logs.append((level, msg))
+
+    return logs, fake_log
 
 
 class _EnvGuard(unittest.TestCase):
@@ -1662,10 +1673,7 @@ class TestQuotaLedgerMath(_GateCase):
         """(#40) 档位去重: 严格升档才报 WARNING (80→95 必须再报), 同档
         只报一次; 回落 <80% 才复位 (95→82 中途降档不复位), 复位后再爬回
         80% 会再报。observe-only 语义不变: 只打日志不断供不告警。"""
-        logs = []
-
-        def fake_log(msg, level="INFO"):
-            logs.append((level, msg))
+        logs, fake_log = _log_sink()
 
         store = self.mod.StateStore(os.path.join(self.tmp, "state.json"))
         limit = 10
@@ -1723,6 +1731,9 @@ class TestQuotaLedgerMath(_GateCase):
         with open(path, "w") as f:
             json.dump({"prs": {}, "watermark_last_tier": "abc"}, f)
         store = self.mod.StateStore(path)
+        # (F8) 落盘脏形态先钉一脚: JSON 往返后的 "abc" 同样回退 0
+        # (否则上面的初始 dump 是死 setup)
+        self.assertEqual(store.get_watermark_last_tier(), 0)
         # JSON 落盘的脏形态 + 进程内直塞的脏形态一并钉住 (bool 除外:
         # _safe_float 口径明确容忍 bool — float(True)=1 有限, 结果 fail-safe)
         for dirty in ["abc", None, {"k": 1}, [1, 2], float("inf"),
@@ -1741,16 +1752,47 @@ class TestQuotaLedgerMath(_GateCase):
         self.assertEqual(store.get_watermark_last_tier(), 0)
 
         # 功能面: 脏档位下 80% 照常报 (不因脏值误判"已报过"而漏报)
-        logs = []
-
-        def fake_log(msg, level="INFO"):
-            logs.append((level, msg))
-
+        logs, fake_log = _log_sink()
         store.data["watermark_last_tier"] = {"dirty": 1}
         ret = self.mod.check_watermark({"count": 8, "tokens": 0}, store,
                                        limit_count=10, log_fn=fake_log)
         self.assertEqual(ret, "80%")
         self.assertTrue(any("80%" in m and lvl == "WARNING" for lvl, m in logs))
+
+    def test_watermark_no_limits_resets_tier(self):
+        """(R1 P3-1) 配额关闭 (limit 均为 0) → 巡检状态作废复位: 防限额
+        移除又重配后首报被旧档位吞掉 (旧 tier=2 时重配后爬回 80/95 不报)"""
+        store = self.mod.StateStore(os.path.join(self.tmp, "state.json"))
+        store.set_watermark_last_tier(2)
+        self.assertIsNone(
+            self.mod.check_watermark({"count": 9, "tokens": 90000}, store))
+        self.assertEqual(store.get_watermark_last_tier(), 0)
+        # 重配限额后爬回 80% 档 → 首报不被旧档位吞
+        logs, fake_log = _log_sink()
+
+        ret = self.mod.check_watermark({"count": 8, "tokens": 0}, store,
+                                       limit_count=10, log_fn=fake_log)
+        self.assertEqual(ret, "80%")
+        self.assertTrue(any("80%" in m and lvl == "WARNING" for lvl, m in logs))
+
+    def test_watermark_max_of_count_and_tokens_dims(self):
+        """(R1 P3-6) max(levels) 双维度定档: count 与 tokens 两把尺子里
+        取更高比率定档 — tokens 维度更高时按 tokens 报, 反之按 count"""
+        for usage, limits, expect in (
+                ({"count": 5, "tokens": 96000}, (10, 100000), "95%"),  # 50% / 96%
+                ({"count": 10, "tokens": 1000}, (10, 100000), "95%"),  # 100% / 1%
+                ({"count": 8, "tokens": 5000}, (10, 100000), "80%"),   # 80% / 5%
+                ({"count": 7, "tokens": 85000}, (10, 100000), "80%"),  # 70% / 85%
+        ):
+            with self.subTest(usage=usage):
+                store = self.mod.StateStore(
+                    os.path.join(self.tmp, f"st-{usage['count']}.json"))
+                self.assertEqual(
+                    self.mod.check_watermark(usage, store,
+                                             limit_count=limits[0],
+                                             limit_tokens=limits[1],
+                                             log_fn=lambda *a, **kw: None),
+                    expect)
 
 
 class TestStateStoreDirtyDefense(_GateCase):
@@ -2547,14 +2589,19 @@ class TestWallSkipsRepoCloneFetch(_GateCase):
         os.environ["GITHUB_TOKEN"] = "fake-token-123"
         self.pr_list = [{"number": 5, "title": "pr 5",
                          "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
+        self.comment_behavior = "ok"     # ok | retryable (评论 500)
         self.git_calls = []
         self.mcp_calls = []
+        self.api_calls = []
 
     def _fake_urlopen(self, req, timeout=None, **kw):
         url = req.full_url
+        self.api_calls.append((req.get_method(), url))
         if "/pulls?" in url:
             return _FakeResp(self.pr_list)
         if url.endswith("/comments"):
+            if self.comment_behavior == "retryable":
+                raise _make_http_error(500)
             return _FakeResp(
                 {"html_url": "https://github.com/octo/hello#issuecomment-1"})
         raise AssertionError(f"未预期 URL: {url}")
@@ -2608,6 +2655,19 @@ class TestWallSkipsRepoCloneFetch(_GateCase):
         with open(path, "w") as f:
             json.dump(st, f)
 
+    def _read_entry(self, key="octo/hello#5"):
+        with open(os.path.join(self.tmp, "state.json")) as f:
+            return json.load(f)["prs"][key]
+
+    def _force_retry_due(self, key="octo/hello#5"):
+        """模拟退避到点: 把 next_retry_at 拨回过去"""
+        path = os.path.join(self.tmp, "state.json")
+        with open(path) as f:
+            st = json.load(f)
+        st["prs"][key]["next_retry_at"] = 0
+        with open(path, "w") as f:
+            json.dump(st, f)
+
     def test_wall_round_runs_zero_git_subprocess(self):
         cfg_path = self._write_config()
 
@@ -2632,10 +2692,11 @@ class TestWallSkipsRepoCloneFetch(_GateCase):
         self.assertEqual(len(wall_msgs), 1)
         # 默认级 INFO (log 不带 level 参数即 INFO): 不打 WARNING 刷屏
         self.assertIn(wall_msgs[0].args[1:], ((), ("INFO",)))
-        # 早退发生在 process_pr 之前: 新 head 连 entry 都未建 (per-PR 的
-        # pending 标记路径未到达 — 上提检查先兜住了)
-        with open(os.path.join(self.tmp, "state.json")) as f:
-            self.assertEqual(list(json.load(f)["prs"]), ["octo/hello#5"])
+        # 早退发生在 process_pr 之前: 新 head 重置逻辑未执行 — entry 仍是
+        # 首轮的 reviewed + 旧 head (若漏进循环会被新 head 重置成 pending)
+        entry = self._read_entry()
+        self.assertEqual(entry["head_sha"], "a" * 40)
+        self.assertEqual(entry["status"], "reviewed")
 
     def test_empty_todo_wall_check_inert(self):
         # todo 为空 (同 head 已 reviewed): 仍走「无待审新 head」早退 —
@@ -2652,6 +2713,49 @@ class TestWallSkipsRepoCloneFetch(_GateCase):
         self.assertEqual(wall_msgs, [])
         self.assertTrue(any("无待审新 head" in c.args[0]
                             for c in m_log.call_args_list))
+
+    def test_wall_still_processes_comment_only_retry(self):
+        """(R1 P2-1) 墙期豁免只补评论路径: comment_failed+缓存 PR 墙期内
+        照常补评论 (POST +1、mcp 不增); 同轮的新 head PR 被过滤本轮不审
+        (下轮墙醒再审)。clone/fetch 照跑 (循环外准备, 有意取舍 — 比 5.5h
+        整轮全挡好, 补评论一两个周期内即收敛)"""
+        cfg_path = self._write_config()
+
+        # 第一轮: 评论 500 → comment_failed + report 缓存 + 退避
+        self.comment_behavior = "retryable"
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._read_entry()
+        self.assertEqual(entry["status"], "comment_failed")
+        self.assertTrue(entry["report"])
+        mcp_after = len(self.mcp_calls)
+        git_before = len(self.git_calls)
+        posts_before = len([c for c in self.api_calls if c[0] == "POST"])
+
+        # 进墙 + 退避到点: PR#5 (comment_failed 同 head) + PR#6 (新 head)
+        self._set_wall(time.time() + 3600.0)
+        self._force_retry_due()
+        self.comment_behavior = "ok"
+        self.pr_list = [
+            {"number": 5, "title": "pr 5",
+             "head": {"sha": "a" * 40}, "base": {"ref": "main"}},
+            {"number": 6, "title": "pr 6",
+             "head": {"sha": "b" * 40}, "base": {"ref": "main"}}]
+        with mock.patch.object(self.mod, "log") as m_log:
+            self.assertEqual(self._run_once(cfg_path), 0)
+        # 一句 INFO 涵盖被跳过的待重审 PR
+        self.assertTrue(any("额度墙期内" in c.args[0]
+                            and "只处理 1 个补评论" in c.args[0]
+                            for c in m_log.call_args_list))
+        # 缓存 PR 照常补评论: POST +1, 不重审 (mcp 不增), 落 reviewed
+        self.assertEqual(len(self.mcp_calls), mcp_after)
+        self.assertEqual(len([c for c in self.api_calls if c[0] == "POST"]),
+                         posts_before + 1)
+        self.assertEqual(self._read_entry()["status"], "reviewed")
+        # 新 head PR 本轮未审: 连 entry 都未建 (下轮墙醒再审)
+        with open(os.path.join(self.tmp, "state.json")) as f:
+            self.assertNotIn("octo/hello#6", json.load(f)["prs"])
+        # clone/fetch 照跑 (有意取舍, 见 docstring)
+        self.assertGreater(len(self.git_calls), git_before)
 
 
 # ============================================================
@@ -2674,6 +2778,7 @@ class TestComment404Disambiguation(_GateCase):
                          "head": {"sha": "a" * 40}, "base": {"ref": "main"}}]
         self.comment_behavior = "404"     # 404 | ok
         self.pr_get_behavior = "open"     # open | closed | error5xx | gone404
+                                           # | nostate (200 但缺 state 键)
         self.api_calls = []
         self.mcp_calls = []
 
@@ -2693,6 +2798,8 @@ class TestComment404Disambiguation(_GateCase):
                 raise _make_http_error(502)
             if self.pr_get_behavior == "gone404":
                 raise _make_http_error(404)
+            if self.pr_get_behavior == "nostate":
+                return _FakeResp({"number": 5})    # 200 但缺 state 键
             raise AssertionError(
                 f"未预期 pr_get_behavior: {self.pr_get_behavior}")
         if url.endswith("/comments"):
@@ -2779,6 +2886,10 @@ class TestComment404Disambiguation(_GateCase):
         entry = self._state_entry()
         self.assertEqual(entry["status"], "reviewed")
         self.assertIsNone(entry["report"])
+        # (R1 P3-6) 第二轮评论成功 → 缓存分支不再发起甄别 GET:
+        # /pulls/5 GET 总数仍为 1 (只有第一轮 404 后那一次)
+        self.assertEqual(len([c for c in self.api_calls if c[0] == "GET"
+                              and "/pulls/5" in c[1]]), 1)
 
     def test_404_get_closed_silent_skip(self):
         """② 评论 404 + 确认关闭/删除 (GET closed / GET 404): 静默跳过 —
@@ -2799,11 +2910,11 @@ class TestComment404Disambiguation(_GateCase):
                          if c.args[1:] == ("INFO",) and "404" in c.args[0]]
                 self.assertEqual(len(skips), 1)
 
-    def test_404_get_5xx_unknown_keeps_original_hard_error_path(self):
-        """③ 评论 404 + GET 5xx: 甄别不可得 → 保守走原 RepoHardError 路径
-        (WARNING + 不烧 attempts 不缓存); 下轮同 head 全额重审"""
+    def _assert_unknown_branch(self, behavior):
+        """(#43) unknown 分支共享断言: 不烧 attempts 不启用缓存 (status
+        保持 pending), 一条 WARNING 留排查线索; 返回 cfg_path 供续测"""
         cfg_path = self._write_config()
-        self.pr_get_behavior = "error5xx"
+        self.pr_get_behavior = behavior
         with mock.patch.object(self.mod, "log") as m_log:
             self.assertEqual(self._run_once(cfg_path), 0)
         entry = self._state_entry()
@@ -2812,12 +2923,23 @@ class TestComment404Disambiguation(_GateCase):
         warns = [c for c in m_log.call_args_list
                  if c.args[1:] == ("WARNING",) and "404" in c.args[0]]
         self.assertEqual(len(warns), 1)
+        return cfg_path
+
+    def test_404_get_5xx_unknown_keeps_original_hard_error_path(self):
+        """③ 评论 404 + GET 5xx: 甄别不可得 → 保守走原 RepoHardError 路径
+        (WARNING + 不烧 attempts 不缓存); 下轮同 head 全额重审"""
+        cfg_path = self._assert_unknown_branch("error5xx")
 
         # 下轮 (pending 无退避立即可审): 全额重跑 deep 审查 (保守取舍)
         self.assertEqual(self._run_once(cfg_path), 0)
         self.assertEqual(len(self.mcp_calls), 2)
         self.assertEqual(
             len([c for c in self.api_calls if c[0] == "POST"]), 2)
+
+    def test_404_get_200_missing_state_key_unknown(self):
+        """(R1 P3-3) GET 200 但 dict 缺 state 键 (形状异常) → 归 unknown:
+        保守走原路径 (WARNING 留排查线索), 不据残缺载荷判 gone 静默走掉"""
+        self._assert_unknown_branch("nostate")
 
 
 if __name__ == "__main__":
