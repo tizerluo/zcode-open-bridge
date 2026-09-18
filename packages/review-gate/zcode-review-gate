@@ -23,6 +23,11 @@ zcode-review-gate — PR 自动审查闸门守护进程 (zcode-open-bridge 第 4
   - verdict 解析: 优先读报告尾 zob-verdict 结构化标记 (mcp-server 侧从
     严格单行 VERDICT 结论转写), 无标记退正文正则; 都失败标 unresolved
     ("需人工核对") 而非误标 concerns (issue #16: 假红灯曾致下游停工)。
+  - 1308 额度墙判据 (#35①): 优先读 mcp-server result 顶层的结构化
+    quota_limit 键 (reset_at 已是 unix 秒), 键缺失退失败 payload 正则
+    兜底 (#39: 最左命中依赖 run_review 的拼接顺序); 两条路径同过
+    is_valid_quota_window 防异常远期 reset_at 睡死闸。5h 台账记审查
+    完成时刻且接 usage.total_tokens 透传 (#42/#35②)。
 
 依赖: 仅 Python3 标准库 (零第三方依赖)
 日志: 全部走 stderr (带时间戳前缀)
@@ -588,7 +593,7 @@ def _resolve_mcp_server(cfg):
 
 
 def run_review(cfg, clone, base_ref, head_sha):
-    """经 mcp-server --call 调 zcode_pr_review, 返回 (ok, 报告正文 | 错误描述)。
+    """经 mcp-server --call 调 zcode_pr_review, 返回 (ok, 报告正文|错误描述, info)。
 
     锁/限流重试/只读护栏全在 mcp-server 侧 (TOOL_HANDLERS 同源路径), 这里
     只做进程调用与结果解包。base 必须带 origin/ 前缀 — mcp-server 的 diff
@@ -597,6 +602,13 @@ def run_review(cfg, clone, base_ref, head_sha):
     mcp-server 侧 zcode 审查默认 300s 超时, deep 档远远不够; gate 自身
     等子进程的总超时 REVIEW_TIMEOUT 在此基础上再加 120s, 留给 mimosa
     扫描与进程收尾, 防 zcode 报告已出却被 gate 提前掐掉。
+
+    info (#35) 结构化旁路信息, 从 result 顶层附加键直读:
+      quota_limit: {"code": 1308, "reset_at": <unix 秒>} | None — 仅 stderr
+        命中 1308 才有 (mcp-server 侧已完成北京 naive → unix 转换);
+      total_tokens: int — 成功时 usage.total_tokens 透传, 无则 0。
+    子进程异常/非 JSON 输出时为空 info。仅作形状预筛, 键的合法性校验在
+    消费端 (quota_limit_reset_ts), 这里不猜不修。
     """
     args = {
         "path": clone,
@@ -609,29 +621,40 @@ def run_review(cfg, clone, base_ref, head_sha):
            json.dumps(args, ensure_ascii=False)]
     env = dict(os.environ)
     env["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = str(ZCODE_REVIEW_TIMEOUT)
+    info = {"quota_limit": None, "total_tokens": 0}
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=REVIEW_TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
-        return False, f"审查子进程超时 ({REVIEW_TIMEOUT}s)"
+        return False, f"审查子进程超时 ({REVIEW_TIMEOUT}s)", info
     except OSError as e:
-        return False, f"无法执行 mcp-server ({cfg.mcp_server}): {e}"
+        return False, f"无法执行 mcp-server ({cfg.mcp_server}): {e}", info
     out = (p.stdout or "").strip()
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
-        return False, f"mcp-server 输出非 JSON (exit={p.returncode}): {out[:300]}"
+        return False, f"mcp-server 输出非 JSON (exit={p.returncode}): {out[:300]}", info
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    if isinstance(result.get("quota_limit"), dict):
+        info["quota_limit"] = result["quota_limit"]
+    usage = result.get("usage")
+    if isinstance(usage, dict):
+        tokens = usage.get("total_tokens")
+        # 信任边界外 (子进程输出): bool 是 int 子类, 显式排除; 非法形状回 0
+        if isinstance(tokens, bool) or not isinstance(tokens, int):
+            tokens = 0
+        info["total_tokens"] = tokens
     if p.returncode != 0 or not data.get("ok"):
         detail = _result_text(data)[:500]
         # 失败时把子进程 stderr 尾部带进错误 (超时/限流等细节都在 stderr)
         stderr_tail = (p.stderr or "").strip()[-500:]
         if stderr_tail:
             detail = f"{detail} | stderr: {stderr_tail}"
-        return False, f"审查失败 (exit={p.returncode}): {detail}"
+        return False, f"审查失败 (exit={p.returncode}): {detail}", info
     text = _result_text(data)
     if not text:
-        return False, "mcp-server 返回空报告"
-    return True, text
+        return False, "mcp-server 返回空报告", info
+    return True, text, info
 
 
 # ============================================================
@@ -995,6 +1018,12 @@ def parse_1308_reset_time(error_text):
     - 1309 (周窗/月窗) 及其他未分类错误一律返回 None (不进墙, 防睡死);
     - reset 为 naive 字符串无时区, 强制按 +08:00 (北京时间) 解析并转为 unix timestamp;
     - 格式非法或解析异常返回 None。
+    - 多枚 1308 串取最左命中 (search) 之所以安全 (#39): 本函数的输入是
+      run_review 拼好的失败 payload — result 正文 (detail, 出自最终那次
+      尝试的错误回显) 在前, stderr_tail 在后, 且 1308 不进 mcp-server
+      重试 (error_kind=provider_error), 同一 payload 里的多枚串源自同一
+      次事件、reset 相同。上游若改拼接顺序或让 1308 参与重试, "最左=
+      最新"会静默翻转 — 动 run_review 的 payload 拼接时须同步重估此处。
     """
     if not error_text:
         return None
@@ -1008,6 +1037,25 @@ def parse_1308_reset_time(error_text):
         return dt.timestamp()
     except (ValueError, OverflowError, OSError):
         return None
+
+
+def quota_limit_reset_ts(quota_limit):
+    """从 mcp-server 结构化 quota_limit 键提取 1308 reset unix 秒 (#35①)。
+
+    载荷契约: {"code": 1308, "reset_at": <unix 秒 int>} (mcp-server 侧已完成
+    北京 naive → unix 转换)。键缺失/形状不符 (非 dict、code≠1308、reset_at
+    非数值, bool 也不算) 返回 None — 调用方退正则兜底。结构化命中同样必须
+    过 is_valid_quota_window (与正则路径同一道闸, 防上游转换 bug 给出异常
+    远期 reset_at 睡死闸), 本函数只做形状校验不做窗口判断。
+    """
+    if not isinstance(quota_limit, dict):
+        return None
+    if quota_limit.get("code") != 1308:
+        return None
+    ts = quota_limit.get("reset_at")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return float(ts)
 
 
 def is_valid_quota_window(reset_ts, now=None):
@@ -1128,9 +1176,15 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
 
         log(f"{key}: 开始审查 head={head_sha[:12]} "
             f"base=origin/{info['base_ref']} depth={cfg.review_depth}")
-        ok, payload = run_review(cfg, clone, info["base_ref"], head_sha)
+        ok, payload, rinfo = run_review(cfg, clone, info["base_ref"], head_sha)
         if not ok:
-            reset_ts = parse_1308_reset_time(payload)
+            # 判据优先级 (#35①): 结构化 quota_limit 键优先 (mcp-server 侧已转
+            # unix 秒), 键缺失/形状不符退正则兜底 (旧 mcp-server 兼容)。两条
+            # 路径汇成同一个 reset_ts 后过同一道 is_valid_quota_window —
+            # 结构化分支不得绕过 (防上游 bug 给出异常远期 reset_at 睡死闸)。
+            reset_ts = quota_limit_reset_ts(rinfo.get("quota_limit"))
+            if reset_ts is None:
+                reset_ts = parse_1308_reset_time(payload)
             if reset_ts is not None and is_valid_quota_window(reset_ts, now):
                 wall_until = reset_ts + WALL_BUFFER_SECONDS
                 state.set_quota_wall_until(wall_until)
@@ -1145,7 +1199,10 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
             return
 
         report = payload
-        state.record_review(now, count=1, tokens=0, pr=key)
+        # 台账口径 (#42): 记完成时刻 (record_review 默认取 time.time()), 不传
+        # 入口捕获的 now — 审查最长可跑 ~3720s, 启动时刻口径最多偏移一个
+        # 审查时长; tokens 接结构化透传值, 无 usage 时 0 兜底。
+        state.record_review(count=1, tokens=rinfo.get("total_tokens") or 0, pr=key)
         usage = state.get_5h_usage(now)
         check_watermark(usage, cfg.quota_limit_5h, cfg.quota_tokens_5h)
 
