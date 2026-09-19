@@ -209,6 +209,8 @@ PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮�
 
 安装、配置参考、systemd 部署与运维详见 [packages/review-gate/README.md](packages/review-gate/README.md)。
 
+> **拒审 = 终态告警**（issue #49 洞三）：被审分支含 `zcode.json` / `.zcode/config.json` 时，mcp-server 返回结构化 `refusal` 键，gate 对该 head 立即 `gave_up` 并回贴「🚫 审查被拒绝（安全策略）」评论（同 head 不重试、新 head 自动复活）；告警评论发布失败（限流/网络）会缓存原文，下一轮只补发拒审评论、不重跑审查。判定只认结构化键——报告正文/错误文本里的 `ZOB-REFUSED` 字样不参与（防伪造，R1 P2-2）。
+
 > 配套能力：mcp-server 新增 `--call TOOL '<json>'` 一次性调用模式（脚本化入口，exit 0/1/2 分别对应 成功 / 用法错误或 handler 异常 / tool 执行失败），stdio 模式行为不变。
 
 ## 会话存储
@@ -261,6 +263,7 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 | 机制 | 行为 | 配置 |
 |------|------|------|
 | **进程级文件锁** | 多个 MCP client 并发调用时，串行化 headless review，防并发触发限流 | `ZCODE_BRIDGE_REVIEW_LOCK=0` 关闭 |
+| **项目配置拒审**（issue #49 洞三） | 被审目录链（cwd 到 git 根）存在 `zcode.json` / `.zcode/config.json` 时 **fail-closed 拒审**（`isError` + 顶层结构化 `refusal` 键；review-gate 据此按终态告警处理，不当临时失败重试）——该文件的 `mcp.servers` 会被 zcode 启动时直接 spawn。审查子进程 `--cwd` 恒为隔离沙箱（含空 `.git` 阻断配置上溯），被审仓库根目录经 prompt 以绝对路径提供 | `ZCODE_BRIDGE_TRUST_PROJECT_CONFIG=1` 显式放行可信仓库（`0/false/no/off/disabled` 均视为关） |
 | **provider 错误解析** | 识别 429 / 1302 / `Too Many Requests` / `请求过于频繁` / `retry-after`，区分限流/配额/其他 | — |
 | **有限重试 + 退避** | 仅对**限流**错误重试（配额/Unauthorized 不重试），退避用 retry-after 或指数退避（`2^n+1`） | `ZCODE_BRIDGE_MAX_RETRIES`（默认 3） |
 | **单次调用超时** | review 单次 zcode 调用超时 | `ZCODE_BRIDGE_REVIEW_TIMEOUT`（默认 300s，下限 30s） |

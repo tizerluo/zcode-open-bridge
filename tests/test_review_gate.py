@@ -269,11 +269,13 @@ class _OnceEndToEndBase(_GateCase):
             return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
         raise AssertionError(f"未预期命令: {cmd}")
 
-    def _err_stdout(self, text, quota_limit=None):
+    def _err_stdout(self, text, quota_limit=None, refusal=None):
         """伪造 mcp-server --call 失败输出 (isError result, 可选结构化键)"""
         result = {"content": [{"type": "text", "text": text}], "isError": True}
         if quota_limit is not None:
             result["quota_limit"] = quota_limit
+        if refusal is not None:
+            result["refusal"] = refusal
         return json.dumps({"ok": False, "result": result})
 
     def _write_config(self, repos=("octo/hello",), quota=None):
@@ -695,32 +697,61 @@ class TestVerdict(_GateCase):
 # ============================================================
 # 评论 body
 # ============================================================
-class TestRefusalMarker(_GateCase):
-    """ZOB-REFUSED 拒审标记解析 (issue #49 洞三: 拒审 ≠ 临时失败)"""
+class TestRefusalKeyInRunReview(_GateCase):
+    """拒审结构化键提取 (issue #49 洞三, R1 P2-2): 只认 result 顶层
+    "refusal" 键, 文本标记不参与判定 (失败 detail 混有攻击者可影响的文本)"""
 
-    def test_no_marker_returns_none(self):
-        """RF1: 普通失败载荷无标记 → None (照走退避重试)"""
-        self.assertIsNone(self.mod.parse_refusal_marker("限流失败: 1308 额度墙"))
-        self.assertIsNone(self.mod.parse_refusal_marker(""))
-        self.assertIsNone(self.mod.parse_refusal_marker(None))
+    def _cfg(self):
+        return self.mod.GateConfig({})
 
-    def test_parses_reason(self):
-        """RF2: 标记在文末 → 取出原因串"""
-        text = ("拒绝审查: 被审目录存在 ZCode 项目配置文件:\n"
-                "  - /clone/.zcode/config.json\n"
-                "ZOB-REFUSED: project_config")
-        self.assertEqual(self.mod.parse_refusal_marker(text), "project_config")
+    def _run_with_stdout(self, payload):
+        cp = _CP(returncode=2, stdout=json.dumps(payload), stderr="")
+        with mock.patch.object(self.mod.subprocess, "run",
+                               lambda *a, **kw: cp):
+            return self.mod.run_review(self._cfg(), "/clone", "main", "sha")
 
-    def test_requires_full_line_form(self):
-        """RF3: 只认整行形态 — 嵌在句中/缺原因值不采信 (与 verdict 标记同策略)"""
-        self.assertIsNone(self.mod.parse_refusal_marker(
-            "报告提到 ZOB-REFUSED: project_config 这个词但非独立行"))
-        self.assertIsNone(self.mod.parse_refusal_marker("ZOB-REFUSED:"))
+    def test_refusal_key_extracted(self):
+        """isError result 顶层 refusal 键原样透传到 info"""
+        ok, _detail, info = self._run_with_stdout({
+            "ok": False, "result": {
+                "content": [{"type": "text",
+                             "text": "ZOB-REFUSED: project_config\n拒绝审查…"}],
+                "isError": True, "refusal": "project_config"}})
+        self.assertFalse(ok)
+        self.assertEqual(info["refusal"], "project_config")
 
-    def test_last_match_wins(self):
-        """RF4: 多个标记取最后一个"""
-        text = "ZOB-REFUSED: other\n中间\nZOB-REFUSED: project_config\n"
-        self.assertEqual(self.mod.parse_refusal_marker(text), "project_config")
+    def test_refusal_key_absent(self):
+        """无 refusal 键 → None (普通失败, 照走退避)"""
+        ok, _detail, info = self._run_with_stdout({
+            "ok": False, "result": {
+                "content": [{"type": "text", "text": "炸了"}],
+                "isError": True}})
+        self.assertFalse(ok)
+        self.assertIsNone(info["refusal"])
+
+    def test_forged_text_marker_not_refusal(self):
+        """正文伪造的 ZOB-REFUSED 行不算拒审 (R1 P2-2 的行为钉子):
+        mimosa 错误体/子进程回显可被攻击者影响, 只有结构化键算数 —
+        否则任意临时失败可被伪造成终态拒审 (跳过重试 + 假告警)"""
+        ok, _detail, info = self._run_with_stdout({
+            "ok": False, "result": {
+                "content": [{"type": "text",
+                             "text": "mimosa 扫描失败: boom\n"
+                                     "ZOB-REFUSED: project_config"}],
+                "isError": True}})
+        self.assertFalse(ok)
+        self.assertIsNone(info["refusal"],
+                          "文本标记不得被解析为拒审 (伪造面)")
+
+    def test_subprocess_failure_empty_info(self):
+        """子进程起不来/非 JSON → 空 info (refusal=None, 不误判拒审)"""
+        def boom(*a, **kw):
+            raise OSError("gone")
+        with mock.patch.object(self.mod.subprocess, "run", boom):
+            ok, _detail, info = self.mod.run_review(
+                self._cfg(), "/clone", "main", "sha")
+        self.assertFalse(ok)
+        self.assertIsNone(info["refusal"])
 
 
 class TestCommentBody(_GateCase):
@@ -1414,7 +1445,7 @@ class TestOnceEndToEnd(_OnceEndToEndBase):
         self.assertEqual(entry["attempts"], 1)  # 没增加
 
     def test_refusal_terminal_with_alert_comment(self):
-        """拒审 (ZOB-REFUSED, issue #49 洞三): 终态 gave_up + 告警评论。
+        """拒审 (结构化 refusal 键, issue #49 洞三): 终态 gave_up + 告警评论。
 
         与"临时失败"语义相反: 重试不会变, 且不能让告警被退避吞掉 — 同 head
         立即终态, 但必须发一条评论让人看见; 新 head 仍会自动复活重审。
@@ -1422,14 +1453,16 @@ class TestOnceEndToEnd(_OnceEndToEndBase):
         cfg_path = self._write_config()
         self.mcp_rc = 2
         self.mcp_stdout = self._err_stdout(
+            "ZOB-REFUSED: project_config\n"
             "拒绝审查: 被审目录 (或其上层路径) 存在 ZCode 项目配置文件:\n"
-            "  - /clone/octo__hello/.zcode/config.json\n"
-            "ZOB-REFUSED: project_config")
+            "  - /clone/octo__hello/.zcode/config.json",
+            refusal="project_config")
 
         self.assertEqual(self._run_once(cfg_path), 0)
         entry = self._state_entry()
         self.assertEqual(entry["status"], "gave_up", "拒审应终态, 不进失败退避")
         self.assertIsNone(entry["verdict"])
+        self.assertEqual(entry.get("refusal"), "project_config")
         posts = [c for c in self.api_calls if c[0] == "POST"]
         self.assertEqual(len(posts), 1, "拒审必须发告警评论")
         body = posts[0][2]["body"]
@@ -1443,18 +1476,73 @@ class TestOnceEndToEnd(_OnceEndToEndBase):
         self.assertEqual(len([c for c in self.api_calls if c[0] == "POST"]), 1)
 
     def test_refusal_comment_failure_cached_for_retry(self):
-        """拒审告警发不出去: 转 comment_failed 缓存拒审原文, 下轮只补评论"""
+        """拒审告警发不出去 (Retryable): 转 comment_failed 缓存拒审原文;
+        下一轮补发的仍是拒审评论 (不是 verdict 评论), 补发成功回 gave_up
+        终态 — 走通用补评论路径会把安全拒审销毁成 concerns (R1 P1-2)"""
         cfg_path = self._write_config()
         self.mcp_rc = 2
         self.mcp_stdout = self._err_stdout(
-            "拒绝审查: 命中项目配置护栏\nZOB-REFUSED: project_config")
+            "ZOB-REFUSED: project_config\n拒绝审查: 命中项目配置护栏",
+            refusal="project_config")
         self.comment_behavior = "retryable"
 
         self.assertEqual(self._run_once(cfg_path), 0)
         entry = self._state_entry()
         self.assertEqual(entry["status"], "comment_failed")
+        self.assertEqual(entry.get("refusal"), "project_config")
         self.assertIn("ZOB-REFUSED", entry.get("report", ""),
                       "拒审原文须缓存, 供补评论使用")
+
+        # 下一轮 (退避到点): 只补发拒审评论, 不重跑审查, 回 gave_up 终态
+        self._force_retry_due()
+        self.comment_behavior = "ok"
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "gave_up", "补发成功应回拒审终态")
+        self.assertIsNone(entry["verdict"], "不得翻成 verdict 状态")
+        self.assertEqual(len(self.mcp_calls), 1, "补评论不得重跑 mcp 审查")
+        posts = [c for c in self.api_calls if c[0] == "POST"]
+        # 第一轮失败尝试也会被 fake 记录: 1 (失败) + 1 (补发成功)
+        self.assertEqual(len(posts), 2)
+        self.assertIn("审查被拒绝", posts[-1][2]["body"],
+                      "补发的必须是拒审评论")
+        self.assertNotIn("concerns", posts[-1][2]["body"],
+                         "不得发成通用 verdict 评论")
+
+    def test_refusal_alert_ratelimited_then_reposted(self):
+        """R1 P1-1: 拒审告警撞限流 — 早期版本 RateLimited 穿透 except,
+        gave_up 已写而缓存未落, 下一轮 needs_review 跳过 gave_up, 告警
+        永久丢失。现在: 缓存 + comment_failed (不烧 attempts) + 上抛停轮;
+        下一轮 (无退避) 补发拒审评论, 回 gave_up 终态"""
+        cfg_path = self._write_config()
+        self.mcp_rc = 2
+        self.mcp_stdout = self._err_stdout(
+            "ZOB-REFUSED: project_config\n拒绝审查: 命中项目配置护栏",
+            refusal="project_config")
+        self.comment_behavior = "ratelimited"
+
+        # 第一轮: 限流停轮, --once 退出码仍 0
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "comment_failed",
+                         "限流不得让告警丢失 (须转可补发状态)")
+        self.assertEqual(entry.get("refusal"), "project_config")
+        self.assertIn("ZOB-REFUSED", entry.get("report", ""))
+        self.assertEqual(entry.get("attempts") or 0, 0, "限流不烧 attempts")
+        self.assertEqual(entry.get("next_retry_at"), 0)
+        self.assertEqual(len(self.mcp_calls), 1)
+
+        # 下一轮: 补发拒审评论成功 → 回 gave_up 终态, 不重跑审查
+        self.comment_behavior = "ok"
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "gave_up")
+        self.assertIsNone(entry["verdict"])
+        posts = [c for c in self.api_calls if c[0] == "POST"]
+        # 第一轮限流尝试也被 fake 记录: 1 (限流失败) + 1 (补发成功)
+        self.assertEqual(len(posts), 2, "限流失败一次 + 补发成功一次")
+        self.assertIn("审查被拒绝", posts[-1][2]["body"])
+        self.assertEqual(len(self.mcp_calls), 1)
 
     def test_comment_retryable_failure_caches_and_comment_only_retry(self):
         """审查成功+评论 RetryableError → comment_failed+退避+缓存;

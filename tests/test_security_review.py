@@ -101,16 +101,11 @@ class _EnvGuard(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-
-class TestReviewCmd(_EnvGuard):
-    """只读护栏: 命令构造 + prompt 约束"""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.mod = _load_mcp_module()
-
     def _capture_cmd(self, **kwargs):
-        """patch subprocess.run 捕获 cmd, 返回 (cmd, result)。"""
+        """patch subprocess.run 捕获 cmd, 返回 (cmd, result)。
+
+        (R1 精简 #4: 原为 TestReviewCmd 私有, PG9 同形状需求, 上移共用。)
+        """
         mod = self.mod
         captured = {}
 
@@ -126,6 +121,14 @@ class TestReviewCmd(_EnvGuard):
         finally:
             mod.subprocess.run = saved
         return captured["cmd"], result
+
+
+class TestReviewCmd(_EnvGuard):
+    """只读护栏: 命令构造 + prompt 约束"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
 
     def test_rc0_yolo_not_plan(self):
         """RC0: 用 --mode yolo, 绝不再出现 plan"""
@@ -293,6 +296,15 @@ class TestProjectConfigGuard(_EnvGuard):
         self.assertEqual(len(got), 1)
         self.assertTrue(got[0].endswith("zcode.json"))
 
+    def test_pg2b_symlink_resolved(self):
+        """PG2b: realpath 先解析符号链接 (R1 P3-4), 经链接进入的仓库照常识别"""
+        real = self._mk_repo("r2b-real", rel="zcode.json")
+        link = os.path.join(self._tmp, "r2b-link")
+        os.symlink(real, link)
+        got = self.mod._project_config_files(link)
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].endswith("zcode.json"))
+
     def test_pg3_clean_repo_is_empty(self):
         """PG3: 干净仓库无命中"""
         root = self._mk_repo("r3")
@@ -321,44 +333,49 @@ class TestProjectConfigGuard(_EnvGuard):
     # ---------- _project_config_guard ----------
 
     def test_pg6_guard_blocks_and_allows(self):
-        """PG6: 命中即拒审 (isError); 显式放行开关生效"""
+        """PG6: 命中即拒审 (isError, 带结构化 refusal 键); 放行开关值矩阵"""
         root = self._mk_repo("r6", rel=".zcode/config.json")
         res = self.mod._project_config_guard(root)
         self.assertIsNotNone(res)
         self.assertTrue(res["isError"])
-        self.assertIn("拒绝审查", res["content"][0]["text"])
-        self.assertIn("ZCODE_BRIDGE_TRUST_PROJECT_CONFIG", res["content"][0]["text"])
-        # 机器可读标记: review-gate 靠它把"拒审"与"临时失败"分开
-        self.assertIn("ZOB-REFUSED: project_config", res["content"][0]["text"])
-        os.environ["ZCODE_BRIDGE_TRUST_PROJECT_CONFIG"] = "1"
-        try:
-            self.assertIsNone(self.mod._project_config_guard(root))
-        finally:
-            os.environ.pop("ZCODE_BRIDGE_TRUST_PROJECT_CONFIG", None)
+        # 机器契约: 结构化 refusal 键 (R1 P2-2), gate 只认它判定拒审
+        self.assertEqual(res.get("refusal"), "project_config")
+        text = res["content"][0]["text"]
+        self.assertIn("拒绝审查", text)
+        self.assertIn("ZCODE_BRIDGE_TRUST_PROJECT_CONFIG", text)
+        # 文本标记保留在首行, 仅供肉眼/日志 grep
+        self.assertIn("ZOB-REFUSED: project_config", text)
+        # 放行开关值矩阵 (R1 P3-1): off/disabled 是"关"不是"开" —
+        # 关安全护栏的开关, 反直觉值不得触发放行
+        for v in ("1", "yes", "true"):
+            os.environ["ZCODE_BRIDGE_TRUST_PROJECT_CONFIG"] = v
+            self.assertIsNone(
+                self.mod._project_config_guard(root), f"TRUST={v!r} 应放行")
+        for v in ("0", "false", "no", "off", "disabled"):
+            os.environ["ZCODE_BRIDGE_TRUST_PROJECT_CONFIG"] = v
+            self.assertIsNotNone(
+                self.mod._project_config_guard(root), f"TRUST={v!r} 不应放行")
+        os.environ.pop("ZCODE_BRIDGE_TRUST_PROJECT_CONFIG", None)
 
     def test_pg7_guard_passes_clean(self):
         """PG7: 干净目录放行"""
         self.assertIsNone(self.mod._project_config_guard(self._mk_repo("r7")))
 
-    def test_pg7b_marker_survives_gate_truncation(self):
-        """PG7b: 标记必须落在失败文本前 500 字符内。
+    def test_pg7b_structured_refusal_key(self):
+        """PG7b: 拒审 result 带结构化 refusal 键 (机器契约)。
 
-        review-gate 的 run_review 只取 detail[:500] 再解析 ZOB-REFUSED —
-        标记若被长路径/多文件顶出窗口, 拒审会被误判成临时失败 (退避重试,
-        告警被吞)。故钉住: 真实长路径下标记仍在窗口内。
+        R1 P2-2: 失败 detail 会混入 mimosa 错误体/子进程回显等攻击者可影响
+        的文本, gate 解析文本标记存在伪造面 (可把临时失败伪造成终态拒审),
+        故机器契约改为 result 顶层 "refusal" 键 — 只有本护栏会写它;
+        文本首行的 ZOB-REFUSED 保留, 仅供肉眼/日志 grep。
         """
-        deep = self._mk_repo("r7b-deep", rel=".zcode/config.json", git=False)
-        # 造一个足够长的路径 (贴近 GC-8G 克隆目录的真实长度)
-        long_dir = os.path.join(deep, *(["clones", "openagentemail__openagentemail"] * 2))
-        os.makedirs(long_dir, exist_ok=True)
-        with open(os.path.join(long_dir, "zcode.json"), "w") as f:
-            f.write("{}")
-        res = self.mod._project_config_guard(deep)
+        root = self._mk_repo("r7b", rel=".zcode/config.json", git=False)
+        res = self.mod._project_config_guard(root)
         self.assertIsNotNone(res)
-        text = res["content"][0]["text"]
-        self.assertIn("ZOB-REFUSED: project_config", text[:500],
-                      "标记被顶出 500 字符窗口 → 闸会误判为临时失败")
-        self.assertTrue(text.startswith("ZOB-REFUSED: project_config"))
+        self.assertTrue(res["isError"])
+        self.assertEqual(res.get("refusal"), "project_config")
+        self.assertTrue(res["content"][0]["text"].startswith(
+            "ZOB-REFUSED: project_config"), "文本标记保持首行, 便于日志 grep")
 
     # ---------- 命令构造: 干净工作目录 + prompt 带仓库根 ----------
 
@@ -372,25 +389,25 @@ class TestProjectConfigGuard(_EnvGuard):
                         "沙箱须含空 .git 令 zcode 的配置发现链止步")
         self.assertFalse(os.path.exists(os.path.join(cwd, "zcode.json")))
 
+    def test_pg8b_scratch_cwd_cleanup(self):
+        """PG8b: 沙箱目录退出时清理 (atexit), 清理后可重建 (R1 P2-3)"""
+        mod = self.mod
+        d1 = mod._review_scratch_cwd()
+        self.assertTrue(os.path.isdir(d1))
+        mod._cleanup_scratch_cwd()
+        self.assertFalse(os.path.exists(d1), "清理后目录应删除")
+        self.assertIsNone(mod._scratch_cwd_cache)
+        d2 = mod._review_scratch_cwd()
+        self.assertNotEqual(d1, d2)
+        self.assertTrue(os.path.isdir(os.path.join(d2, ".git")),
+                        "重建的沙箱同样含空 .git")
+
     def test_pg9_review_prompt_carries_repo_root(self):
         """PG9: tool_zcode_review 的 prompt 带被审仓库绝对路径"""
         repo = self._mk_repo("r9")
-        mod = self.mod
-        captured = {}
-
-        def fake_run(cmd, *a, **kw):
-            captured["cmd"] = cmd
-            return _FakeCompletedProcess(returncode=0, stdout="OK", stderr="")
-
-        saved = mod.subprocess.run
-        mod.subprocess.run = fake_run
-        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
-        try:
-            result = mod.tool_zcode_review({"code": "print(1)", "cwd": repo})
-        finally:
-            mod.subprocess.run = saved
+        cmd, result = self._capture_cmd(cwd=repo)
         self.assertNotIn("isError", result)
-        prompt = captured["cmd"][captured["cmd"].index("--prompt") + 1]
+        prompt = cmd[cmd.index("--prompt") + 1]
         self.assertIn(f"被审仓库根目录: {os.path.abspath(repo)}", prompt)
 
     def test_pg10_tool_refuses_project_config(self):

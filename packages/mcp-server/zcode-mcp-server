@@ -18,6 +18,7 @@ Claude Code、Cursor 等) 能标准化地发现并调用 headless zcode。
 依赖: 仅 Python3 标准库 (零第三方依赖)
 """
 
+import atexit
 import fcntl
 import hashlib
 import json
@@ -1119,12 +1120,6 @@ def _extract_response(output):
     return output, None
 
 
-def _env_truthy(name):
-    """读布尔型环境开关: 非空且非 0/false/no 视为开。"""
-    v = (os.environ.get(name) or "").strip().lower()
-    return v not in ("", "0", "false", "no")
-
-
 # ============================================================
 # 项目配置防护 (2026-09-19, issue #49 洞三)
 # ------------------------------------------------------------
@@ -1148,47 +1143,60 @@ _TRUST_PROJECT_CONFIG_ENV = "ZCODE_BRIDGE_TRUST_PROJECT_CONFIG"
 _scratch_cwd_cache = None
 
 
+def _cleanup_scratch_cwd():
+    """清掉沙箱目录并置空缓存 (atexit 注册, 幂等可重入)。"""
+    global _scratch_cwd_cache
+    if _scratch_cwd_cache:
+        shutil.rmtree(_scratch_cwd_cache, ignore_errors=True)
+        _scratch_cwd_cache = None
+
+
 def _review_scratch_cwd():
-    """审查用的干净工作目录 (只含一个空 .git, 令配置发现链止步于此)。"""
+    """审查用的干净工作目录 (只含一个空 .git, 令配置发现链止步于此)。
+
+    进程退出时清理 (R1 P2-3): gate 的 --call 模式一次审查一个进程,
+    不清理则每审漏一个目录无限缓慢累积; stdio 常驻模式进程级一份, 退出即清。
+    """
     global _scratch_cwd_cache
     if _scratch_cwd_cache and os.path.isdir(_scratch_cwd_cache):
         return _scratch_cwd_cache
     d = tempfile.mkdtemp(prefix="zcode-review-cwd-")
     os.mkdir(os.path.join(d, ".git"))  # 空目录即可: zcode 见到 .git 就停止上溯
+    atexit.register(_cleanup_scratch_cwd)
     _scratch_cwd_cache = d
     return d
 
 
 def _project_config_files(root):
-    """沿 root → git 根 (含) 列出存在的 zcode 项目配置文件 (与 zcode 发现范围一致)。"""
+    """沿 root → git 根 (含) 列出存在的 zcode 项目配置文件 (与 zcode 发现范围一致)。
+
+    realpath 先解析符号链接: 与 zcode 落地后的真实 cwd 对齐, 链接链上的
+    配置不漏报 (报警器层; 主锁是 --cwd 沙箱, 不依赖本函数的完整性)。
+    """
+    start = Path(os.path.realpath(root))
     found = []
-    cur = os.path.abspath(root)
-    while True:
-        for rel in _PROJECT_CONFIG_RELS:
-            p = os.path.join(cur, rel)
-            if os.path.exists(p):
-                found.append(p)
-        if os.path.exists(os.path.join(cur, ".git")):
+    for d in (start, *start.parents):
+        found += [str(d / rel) for rel in _PROJECT_CONFIG_RELS if (d / rel).exists()]
+        if (d / ".git").exists():
             break
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
     return found
 
 
 def _project_config_guard(root):
     """被审目录链上有 zcode 项目配置文件则返回拒绝 result, 否则 None。"""
-    if _env_truthy(_TRUST_PROJECT_CONFIG_ENV):
+    trust = (os.environ.get(_TRUST_PROJECT_CONFIG_ENV) or "").strip().lower()
+    # off/disabled 也算关 (R1 P3-1): 关安全护栏的开关, 反直觉值不得触发放行
+    if trust not in ("", "0", "false", "no", "off", "disabled"):
         return None
     bad = _project_config_files(root)
     if not bad:
         return None
     log(f"⛔ 拒审: 被审目录链上存在 zcode 项目配置 {bad}")
     return {"content": [{"type": "text", "text": (
-        # 机器可读标记必须在首行: review-gate 只取失败文本前 500 字符
-        # (run_review 的 detail 截断), 放末尾会被长路径/多文件顶出窗口,
-        # 导致拒审被误判为临时失败而退避重试 (告警随之被吞)。
+        # 文本标记放首行便于肉眼/日志 grep; 机器契约是顶层 "refusal" 键
+        # (R1 P2-2): 失败 detail 会混入 mimosa 错误体/子进程回显等攻击者
+        # 可影响的文本, gate 解析文本存在伪造面 (可把临时失败伪造成终态
+        # 拒审), 结构化键只有本护栏会写, 无伪造面。
         "ZOB-REFUSED: project_config\n"
         "拒绝审查: 被审目录 (或其上层路径) 存在 ZCode 项目配置文件:\n"
         + "\n".join(f"  - {p}" for p in bad)
@@ -1199,7 +1207,9 @@ def _project_config_guard(root):
         "克隆副本里做); ② 确认该目录可信 (自己的仓库且确有项目配置): 设 "
         f"{_TRUST_PROJECT_CONFIG_ENV}=1 放行。\n"
         "注意: 沿工作目录到 git 根的整条链都会被 zcode 检查, 不只仓库根。"
-    )}], "isError": True}
+    )}], "isError": True,
+       # 结构化拒审键 (R1 P2-2): review-gate 只认它判定"安全策略拒绝"
+       "refusal": "project_config"}
 
 
 def _build_review_cmd(prompt, repo):
@@ -1525,7 +1535,7 @@ def tool_zcode_security_review(args):
         if focus:
             prompt += f"\n额外审查重点: {focus}。"
 
-        cmd = _build_review_cmd(prompt, args.get("cwd") or scan_path)
+        cmd = _build_review_cmd(prompt, scan_path)
         cmd += ["--attach", tmp_path]
 
         log("调用 zcode 复核 mimosa findings (yolo+只读黑名单)")
@@ -1753,7 +1763,7 @@ def tool_zcode_pr_review(args):
         if focus:
             prompt += f"\n额外审查重点: {focus}。"
 
-        cmd = _build_review_cmd(prompt, args.get("cwd") or scan_path)
+        cmd = _build_review_cmd(prompt, scan_path)
         cmd += ["--attach", tmp_path]
 
         log(f"调用 zcode PR 复核 (yolo+只读黑名单, {len(changed)} 个改动文件)")
