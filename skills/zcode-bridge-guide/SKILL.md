@@ -1,14 +1,14 @@
 ---
 name: zcode-bridge-guide
 version: 1.3.0
-description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.16.1（App 3.6.5）。
+description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.16.9（App 3.14.0）。
 user-invocable: true
 ---
 
 # 驱动 ZCode（三模式通用说明书）
 
 > 本 skill 是 [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) 项目的配套说明书。
-> 兼容 ZCode CLI **0.14.5 ~ 0.16.5**（实测含 App 3.2.1~3.12.3）。新版功能（事件驱动真流式、fork/goal/compact、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`；`session/steer`、`session/rewind*`、`prompt/enhance*` 已于 0.16 移除，调用返回 `-32601`。⚠️ App 3.12.3 的 0.16.5 构建（版本号未变、内容漂移）进一步删除了 workspace/* 面 7/8 方法与 `session/updateRuntimeModelConfig`（详见下文方法表注记与版本表）。
+> 兼容 ZCode CLI **0.14.5 ~ 0.16.9**（实测含 App 3.2.1~3.14.0）。新版功能（事件驱动真流式、fork/goal/compact、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`；`session/steer`、`session/rewind*`、`prompt/enhance*` 已于 0.16 移除，调用返回 `-32601`。⚠️ App 3.12.3 的 0.16.5 构建（版本号未变、内容漂移）进一步删除了 workspace/* 面 7/8 方法与 `session/updateRuntimeModelConfig`（0.16.9/App 3.14.0 复测同面，桥零改动；CLI 旗标面有增删，详见下文方法表注记与版本表）。
 
 ## 前置条件
 
@@ -427,6 +427,7 @@ npm test     # 全量，看实际数字
 
 | ZCode CLI 版本 | 支持情况 | 差异 |
 |:--------------:|:--------:|------|
+| **0.16.9** (App 3.14.0) | ✅ 完整 | 协议面与 3.12.3 的 0.16.5 构建一致（桥零改动，2026-09-19 复测）；变化仅在 CLI 旗标面：`--permission-mode`/`--allow-main-worktree-yolo` 已移除，`--allowed-tools`/`--max-turns` 连帮助文案一并消失，新增 `--cwd`/`--target-replace`/`--browser-use` 等（见 docs/recheck-3.14.0.md） |
 | **0.16.5** (App 3.12.3，同号构建漂移) | ✅ 完整（核心面） | session/* 核心面不变；workspace/* 删 7/8 仅 `generateText` 幸存，`session/updateRuntimeModelConfig`、`updateInteractionPreferences` 已删——桥统一翻译为 `-32601`「已移除该能力」（见 docs/recheck-3.12.3.md） |
 | **0.16.5** (App 3.10.2) | ✅ 完整 | 与 0.16.1 同面 + `automation/*` 全族删除（桥未使用，无影响） |
 | **0.16.1** (App 3.6.5) | ✅ 完整 | ACP bridge 真流式；session/* + workspace/* 可用（steer/rewind*/prompt/enhance* 已于 0.16 移除；updateRuntimeModelConfig 存活但 `runtimeModel.revision` 必填） |

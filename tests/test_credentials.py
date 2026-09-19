@@ -556,8 +556,9 @@ class TestAgentHelp(unittest.TestCase):
         self.assertIn("unknown", out.getvalue())
 
     def test_c12i_overview_tested_against(self):
-        """C12i: OVERVIEW 带 tested_against 语义注记 (P2-6)"""
+        """C12i: OVERVIEW 带 tested_against 语义注记 (P2-6; 0.16.9 复测后双版本在列)"""
         self.assertIn("tested_against", self.ah.OVERVIEW)
+        self.assertIn("0.16.9", self.ah.OVERVIEW["tested_against"])
         self.assertIn("0.16.5", self.ah.OVERVIEW["tested_against"])
 
     def test_c12j_stale_env_diagnosed(self):

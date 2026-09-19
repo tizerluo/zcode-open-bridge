@@ -171,7 +171,7 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 
 > ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除。steer 语义并入 `session/send`（turn 进行中发送即 steer）；rewind 无协议替代，仅剩 slash 命令 `/rewind` 与 `rewind.triggered` 事件。0.16.1 上调用这些方法会收到 `-32601`。
 >
-> ℹ️ **0.16 schema 变更**：`session/updateRuntimeModelConfig` 在 0.16.1 仍存活（实测），但 schema 新要求 `runtimeModel.revision`（string）必填。App 3.12.3 的同号 0.16.5 构建已删除该方法（2026-09-17 实测后端返 -32601），桥透传时降级为「已移除」文案。
+> ℹ️ **0.16 schema 变更**：`session/updateRuntimeModelConfig` 在 0.16.1 仍存活（实测），但 schema 新要求 `runtimeModel.revision`（string）必填。App 3.12.3 的同号 0.16.5 构建已删除该方法（2026-09-17 实测后端返 -32601；0.16.9/App 3.14.0 于 2026-09-19 复测仍删），桥透传时降级为「已移除」文案。
 
 **workspace 级**（按工作区 `{workspacePath, workspaceKey}` 定位，不依赖 sessionId）：
 
@@ -186,7 +186,7 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | `workspace/removeModelProvider` | 移除模型供应商 | `{workspace, providerId, expectedWorkspaceRevision?}` |
 | `workspace/updateProviderRegistry` | 批量更新供应商注册表 | `{workspace, registry, includeWorkspaceState?}` |
 
-> ❌ **App 3.12.3 的 0.16.5 构建已删**：除 `workspace/generateText`（存活）外，上表 7 个 workspace/* 方法均已从 app-server 删除（2026-09-17 实测后端 -32601，且未搬家到 session/ 命名空间）；`updateInteractionPreferences` 同批删除。上表语义适用于 0.15.0 – App 3.10.2 的 0.16.5 构建。桥透传调用会收到「当前 ZCode 版本已移除该能力」降级文案（见下方降级行为）。
+> ❌ **App 3.12.3 的 0.16.5 构建已删**：除 `workspace/generateText`（存活）外，上表 7 个 workspace/* 方法均已从 app-server 删除（2026-09-17 实测后端 -32601，且未搬家到 session/ 命名空间）；`updateInteractionPreferences` 同批删除。0.16.9（App 3.14.0）复测同面（2026-09-19）。上表语义适用于 0.15.0 – App 3.10.2 的 0.16.5 构建。桥透传调用会收到「当前 ZCode 版本已移除该能力」降级文案（见下方降级行为）。
 
 **prompt 级**（提示词增强，App 3.3.0 引入；❌ **0.16 已全部移除**，无替代）：
 
@@ -223,7 +223,7 @@ PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮�
 
 **canonical model id = `~/.zcode/v2/config.json` 里 `models` 的 key 原样**（如 `GLM-5.3`），**不加 provider 前缀**。`shared/credentials.py`、MCP server、ACP bridge、agent-help 四处统一用原始 id。实测（0.16.1 时代）`zai/GLM-5.2` 前缀形式也兼容，但非 canonical，本项目不使用。
 
-模型面现状（App 3.12.3 的 0.16.5 构建实测，2026-09-17）：当前 enabled provider（`builtin:zai-coding-plan`）的 models 为 `GLM-5.3` / `GLM-5.3-Flash`（`GLM-5-Turbo` 已由服务端移除；3.10.2 时代为三者）。
+模型面现状（App 3.12.3 的 0.16.5 构建实测，2026-09-17；0.16.9/App 3.14.0 于 2026-09-19 复测一致）：当前 enabled provider（`builtin:zai-coding-plan`）的 models 为 `GLM-5.3` / `GLM-5.3-Flash`（`GLM-5-Turbo` 已由服务端移除；3.10.2 时代为三者）。
 
 ### 凭证注入：显式环境变量优先
 
@@ -308,6 +308,7 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 
 | ZCode CLI 版本 | 支持情况 | ACP bridge 流式 | 扩展方法 |
 |:--------------:|:--------:|:---------------:|:--------:|
+| **0.16.9**（App 3.14.0） | ✅ 完整（核心面与 3.12.3 的 0.16.5 构建一致） | **真流式**（事件驱动） | ✅ session/*（workspace/* 仍删 7/8 仅 generateText 存活；CLI 旗标面增删：`--permission-mode`/`--allow-main-worktree-yolo` 已移除，新增 `--cwd`/`--target-replace` 等，见 agent-help） |
 | **0.16.5**（App 3.12.3，同版本号构建漂移） | ✅ 完整（核心面） | **真流式**（事件驱动） | ✅ session/*（workspace/* 删 7/8 仅 generateText 存活；updateRuntimeModelConfig/updateInteractionPreferences 已删，透传优雅降级） |
 | **0.16.5**（App 3.10.2） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（与 0.16.1 同面；`automation/*` 未实现不受其删除影响） |
 | **0.16.1**（App 3.6.5） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（`steer`/`rewind*`/`prompt/enhance*` 已于 0.16 移除；`updateRuntimeModelConfig` 存活但 `runtimeModel.revision` 必填） |
@@ -319,7 +320,7 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 | **0.14.5 ~ 0.14.7** | ✅ 兼容 | 伪流式（自动降级轮询） | ❌（旧版协议未实现） |
 | **< 0.14.5** | ⚠️ 未测 | — | — |
 
-> 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改——真正断点是反向调用必须应答、事件模型调整、删除 steer/rewind/enhance（信封去 `jsonrpc`/方法 rename/`deliveryKind` 必填同为协议事实，但桥对内本就用这套调用面），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)（含勘误）。0.16.5 已于 2026-09-01 全链路复测（协议面兼容、桥无需代码改动），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。App 3.12.3 的内嵌 CLI `--version` 仍为 0.16.5 但**构建内容漂移**（同号删了 workspace/* 7/8 等，`--version` 不再是唯一兼容性判据），已于 2026-09-17 复测，详见 [docs/recheck-3.12.3.md](docs/recheck-3.12.3.md)。
+> 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改——真正断点是反向调用必须应答、事件模型调整、删除 steer/rewind/enhance（信封去 `jsonrpc`/方法 rename/`deliveryKind` 必填同为协议事实，但桥对内本就用这套调用面），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)（含勘误）。0.16.5 已于 2026-09-01 全链路复测（协议面兼容、桥无需代码改动），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。App 3.12.3 的内嵌 CLI `--version` 仍为 0.16.5 但**构建内容漂移**（同号删了 workspace/* 7/8 等，`--version` 不再是唯一兼容性判据），已于 2026-09-17 复测，详见 [docs/recheck-3.12.3.md](docs/recheck-3.12.3.md)。0.16.9（App 3.14.0）已于 2026-09-19 复测：协议面与 3.12.3 的 0.16.5 构建完全一致、桥零改动；变化仅在 CLI 旗标面（`--allowed-tools`/`--max-turns` 连帮助文案一并消失，`--permission-mode`/`--allow-main-worktree-yolo` 移除，新增 `--cwd`/`--target-replace`/`--browser-use` 等），详见 [docs/recheck-3.14.0.md](docs/recheck-3.14.0.md)。
 
 **降级行为**：
 - 轮询降级**仅限 legacy（< 0.16）协议模式**：旧版下 `session/subscribe` 不可用时自动切换到轮询 `session/read`（伪流式）。**0.16+ 不再自动降级**——新协议模式下 subscribe 失败直接报错 `-32603`（"0.16+ 必须走事件订阅；轮询降级仅限旧协议模式"）。
