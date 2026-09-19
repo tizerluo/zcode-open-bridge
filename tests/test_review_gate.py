@@ -695,6 +695,34 @@ class TestVerdict(_GateCase):
 # ============================================================
 # 评论 body
 # ============================================================
+class TestRefusalMarker(_GateCase):
+    """ZOB-REFUSED 拒审标记解析 (issue #49 洞三: 拒审 ≠ 临时失败)"""
+
+    def test_no_marker_returns_none(self):
+        """RF1: 普通失败载荷无标记 → None (照走退避重试)"""
+        self.assertIsNone(self.mod.parse_refusal_marker("限流失败: 1308 额度墙"))
+        self.assertIsNone(self.mod.parse_refusal_marker(""))
+        self.assertIsNone(self.mod.parse_refusal_marker(None))
+
+    def test_parses_reason(self):
+        """RF2: 标记在文末 → 取出原因串"""
+        text = ("拒绝审查: 被审目录存在 ZCode 项目配置文件:\n"
+                "  - /clone/.zcode/config.json\n"
+                "ZOB-REFUSED: project_config")
+        self.assertEqual(self.mod.parse_refusal_marker(text), "project_config")
+
+    def test_requires_full_line_form(self):
+        """RF3: 只认整行形态 — 嵌在句中/缺原因值不采信 (与 verdict 标记同策略)"""
+        self.assertIsNone(self.mod.parse_refusal_marker(
+            "报告提到 ZOB-REFUSED: project_config 这个词但非独立行"))
+        self.assertIsNone(self.mod.parse_refusal_marker("ZOB-REFUSED:"))
+
+    def test_last_match_wins(self):
+        """RF4: 多个标记取最后一个"""
+        text = "ZOB-REFUSED: other\n中间\nZOB-REFUSED: project_config\n"
+        self.assertEqual(self.mod.parse_refusal_marker(text), "project_config")
+
+
 class TestCommentBody(_GateCase):
     SHA = "abcdef1234567890" + "0" * 24
 
@@ -1384,6 +1412,49 @@ class TestOnceEndToEnd(_OnceEndToEndBase):
         self.assertEqual(self._run_once(cfg_path), 0)
         entry = self._state_entry()
         self.assertEqual(entry["attempts"], 1)  # 没增加
+
+    def test_refusal_terminal_with_alert_comment(self):
+        """拒审 (ZOB-REFUSED, issue #49 洞三): 终态 gave_up + 告警评论。
+
+        与"临时失败"语义相反: 重试不会变, 且不能让告警被退避吞掉 — 同 head
+        立即终态, 但必须发一条评论让人看见; 新 head 仍会自动复活重审。
+        """
+        cfg_path = self._write_config()
+        self.mcp_rc = 2
+        self.mcp_stdout = self._err_stdout(
+            "拒绝审查: 被审目录 (或其上层路径) 存在 ZCode 项目配置文件:\n"
+            "  - /clone/octo__hello/.zcode/config.json\n"
+            "ZOB-REFUSED: project_config")
+
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "gave_up", "拒审应终态, 不进失败退避")
+        self.assertIsNone(entry["verdict"])
+        posts = [c for c in self.api_calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 1, "拒审必须发告警评论")
+        body = posts[0][2]["body"]
+        self.assertIn("审查被拒绝", body)
+        self.assertIn(".zcode/config.json", body)
+        self.assertIn("/repos/octo/hello/issues/5/comments", posts[0][1])
+
+        # 同 head 第二轮: 终态不处理 (无第二次审查调用, 也不重复评论)
+        self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertEqual(len(self.mcp_calls), 1, "同 head 拒审不应重试")
+        self.assertEqual(len([c for c in self.api_calls if c[0] == "POST"]), 1)
+
+    def test_refusal_comment_failure_cached_for_retry(self):
+        """拒审告警发不出去: 转 comment_failed 缓存拒审原文, 下轮只补评论"""
+        cfg_path = self._write_config()
+        self.mcp_rc = 2
+        self.mcp_stdout = self._err_stdout(
+            "拒绝审查: 命中项目配置护栏\nZOB-REFUSED: project_config")
+        self.comment_behavior = "retryable"
+
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "comment_failed")
+        self.assertIn("ZOB-REFUSED", entry.get("report", ""),
+                      "拒审原文须缓存, 供补评论使用")
 
     def test_comment_retryable_failure_caches_and_comment_only_retry(self):
         """审查成功+评论 RetryableError → comment_failed+退避+缓存;

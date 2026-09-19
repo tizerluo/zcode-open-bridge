@@ -27,6 +27,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -321,12 +322,23 @@ class ReviewFileLock:
 #     而是直接报 "No permission client configured" 失败;
 #   - --allowed-tools / --max-turns 帮助文案有, 但未注册 parseArgs (实测
 #     Unknown option), 不可用; auto 模式是保留值未实现。
+# App 3.14.0 / CLI 0.16.9 补充 (2026-09-19 实测, 与 Node REPL 同族问题):
+#   - 动态工作流工具族 (EvalWorkflowSnippet/CreateWorkflow/...) 是新的执行原语:
+#     snippet 里的 world.run 可跑任意命令, 不在此黑名单时 Bash 禁令形同虚设
+#     (实测: 黑名单原样下 world.run("node", [...fs.writeFileSync...]) 成功写入
+#     文件, 平台自身遥测把 EvalWorkflowSnippet 标为 read_only=0);
+#   - 黑名单按工具名精确匹配 (Write/Bash 被挡住即证), 故按名逐个列; 工具面随
+#     版本增长, 新版本上线后需重新核对下发工具清单 (见 docs/recheck-3.14.0.md)。
 # 组合: --mode yolo (免授权) + 全量写/执行黑名单 (物理只读, 读工具全开)。
 # ============================================================
 REVIEW_DISALLOWED_TOOLS = (
     "Write Edit MultiEdit ApplyPatch Bash "
     "js js_reset js_add_node_module_dir "
-    "mcp__node_repl__js mcp__node_repl__js_reset mcp__node_repl__js_add_node_module_dir"
+    "mcp__node_repl__js mcp__node_repl__js_reset mcp__node_repl__js_add_node_module_dir "
+    # 动态工作流一族 (0.16.9): 漏禁即等于放行任意命令执行与文件写入
+    "EvalWorkflowSnippet CreateWorkflow AmendWorkflow SaveWorkflow "
+    "ListWorkflowRuns GetWorkflowRun ResumeWorkflowRun "
+    "ListSavedWorkflows ResolveWorkflowQuestion"
 )
 
 # deep 轮询: status 单次响应超时的最大连续容忍次数 (复审 P1-3:
@@ -936,7 +948,9 @@ TOOLS = [
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "工作目录 (影响 zcode 的项目上下文),默认当前目录",
+                    "description": "被审仓库根目录 (经 prompt 告知审查模型, 供其用绝对路径"
+                                   "读上下文),默认当前目录。注: zcode 子进程的 --cwd 恒为"
+                                   "隔离沙箱 (防被审目录的项目配置触发命令执行, issue #49)",
                 },
             },
             "additionalProperties": False,
@@ -985,7 +999,8 @@ TOOLS = [
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "zcode 工作目录,默认与 path 相同",
+                    "description": "被审仓库根目录 (经 prompt 告知审查模型),默认与 path 相同。"
+                                   "注: zcode 子进程的 --cwd 恒为隔离沙箱 (issue #49)",
                 },
             },
             "additionalProperties": False,
@@ -1039,7 +1054,8 @@ TOOLS = [
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "zcode 工作目录,默认与 path 相同",
+                    "description": "被审仓库根目录 (经 prompt 告知审查模型),默认与 path 相同。"
+                                   "注: zcode 子进程的 --cwd 恒为隔离沙箱 (issue #49)",
                 },
             },
             "additionalProperties": False,
@@ -1103,14 +1119,103 @@ def _extract_response(output):
     return output, None
 
 
-def _build_review_cmd(prompt, cwd):
-    """构造只读 review 的 zcode 命令 (yolo 免授权 + 写/执行工具物理禁用 + JSON 输出)。"""
+def _env_truthy(name):
+    """读布尔型环境开关: 非空且非 0/false/no 视为开。"""
+    v = (os.environ.get(name) or "").strip().lower()
+    return v not in ("", "0", "false", "no")
+
+
+# ============================================================
+# 项目配置防护 (2026-09-19, issue #49 洞三)
+# ------------------------------------------------------------
+# 被审目录里的 zcode.json / .zcode/config.json 会被 zcode 启动时装载, 其中
+# mcp.servers 定义的工具**进程会被直接 spawn** — 不经过模型、不经过工具黑名单
+# (实测: 黑名单全量在位的 review 调用下, 该文件里的命令照常执行)。发现范围是
+# 从工作目录向上直到 git 根 (实测逆向 zcode bundle 的发现顺序), 所以只清仓库
+# 根不够, 要沿链看。
+#
+# 对策两层:
+#   ① 主门锁 — 审查子进程的 --cwd 改指一个只含空 .git 的临时目录 (发现链就
+#      此终止, 看不到被审仓库); 被审仓库路径改由 prompt 提供。4 样本实测
+#      (2 注入真 bug + 2 真实 diff) 检出能力与读上下文量均不降 (详见
+#      docs/recheck-3.14.0.md)。
+#   ② 报警器 — 本函数: 被审目录链上存在这两个文件时 fail-closed 拒审, 既是
+#      拦截也是"有人在试探"的信号。确信任用时可用环境变量放行。
+# ============================================================
+_PROJECT_CONFIG_RELS = ("zcode.json", os.path.join(".zcode", "config.json"))
+_TRUST_PROJECT_CONFIG_ENV = "ZCODE_BRIDGE_TRUST_PROJECT_CONFIG"
+
+_scratch_cwd_cache = None
+
+
+def _review_scratch_cwd():
+    """审查用的干净工作目录 (只含一个空 .git, 令配置发现链止步于此)。"""
+    global _scratch_cwd_cache
+    if _scratch_cwd_cache and os.path.isdir(_scratch_cwd_cache):
+        return _scratch_cwd_cache
+    d = tempfile.mkdtemp(prefix="zcode-review-cwd-")
+    os.mkdir(os.path.join(d, ".git"))  # 空目录即可: zcode 见到 .git 就停止上溯
+    _scratch_cwd_cache = d
+    return d
+
+
+def _project_config_files(root):
+    """沿 root → git 根 (含) 列出存在的 zcode 项目配置文件 (与 zcode 发现范围一致)。"""
+    found = []
+    cur = os.path.abspath(root)
+    while True:
+        for rel in _PROJECT_CONFIG_RELS:
+            p = os.path.join(cur, rel)
+            if os.path.exists(p):
+                found.append(p)
+        if os.path.exists(os.path.join(cur, ".git")):
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return found
+
+
+def _project_config_guard(root):
+    """被审目录链上有 zcode 项目配置文件则返回拒绝 result, 否则 None。"""
+    if _env_truthy(_TRUST_PROJECT_CONFIG_ENV):
+        return None
+    bad = _project_config_files(root)
+    if not bad:
+        return None
+    log(f"⛔ 拒审: 被审目录链上存在 zcode 项目配置 {bad}")
+    return {"content": [{"type": "text", "text": (
+        # 机器可读标记必须在首行: review-gate 只取失败文本前 500 字符
+        # (run_review 的 detail 截断), 放末尾会被长路径/多文件顶出窗口,
+        # 导致拒审被误判为临时失败而退避重试 (告警随之被吞)。
+        "ZOB-REFUSED: project_config\n"
+        "拒绝审查: 被审目录 (或其上层路径) 存在 ZCode 项目配置文件:\n"
+        + "\n".join(f"  - {p}" for p in bad)
+        + "\n\n原因: zcode 启动时会装载该文件的 mcp.servers 并**直接执行**其中定义的命令"
+        " (进程 spawn, 不经过模型也不受工具黑名单约束) — 审查不受信内容时等于把"
+        "执行权交给被审内容 (issue #49 洞三)。\n"
+        "处理: ① 审查他人代码/PR: 请在副本中删除这两个文件后再审 (review-gate 应在"
+        "克隆副本里做); ② 确认该目录可信 (自己的仓库且确有项目配置): 设 "
+        f"{_TRUST_PROJECT_CONFIG_ENV}=1 放行。\n"
+        "注意: 沿工作目录到 git 根的整条链都会被 zcode 检查, 不只仓库根。"
+    )}], "isError": True}
+
+
+def _build_review_cmd(prompt, repo):
+    """构造只读 review 的 zcode 命令 (yolo 免授权 + 写/执行工具物理禁用 + JSON 输出)。
+
+    --cwd 固定指向干净临时目录 (项目配置防护①): 被审仓库的真实路径由调用方写进
+    prompt ("被审仓库根目录: <abs>"), 审查模型用绝对路径读上下文 — 4 样本实测
+    与 --cwd 指向仓库等价 (读取类工具调用量不降, 注入 bug 检出率相同)。
+    """
     cmd = [ZCODE_BIN, "--prompt", prompt,
            "--mode", "yolo",
            "--disallowed-tools", REVIEW_DISALLOWED_TOOLS,
-           "--no-color", "--json"]
-    if cwd:
-        cmd += ["--cwd", cwd]
+           "--no-color", "--json",
+           "--cwd", _review_scratch_cwd()]
+    if repo:
+        log(f"审查工作目录: {_review_scratch_cwd()} (被审仓库 {repo} 经 prompt 提供)")
     return cmd
 
 
@@ -1280,10 +1385,17 @@ def tool_zcode_review(args):
                 f"\n\n[... code 超 {code_max} 字节已截断; "
                 "超大代码建议改用 files 传文件路径 ...]")
 
+    # 项目配置防护②: 被审目录链上有 zcode 项目配置 → fail-closed (issue #49 洞三)
+    guard = _project_config_guard(cwd or os.getcwd())
+    if guard:
+        return guard
+
     # 构造 prompt — "只审不修"职责钉死在文本层, 写工具在工具集层物理禁用,
     # 双保险防 "审着审着顺手改了" (plan→build 惯性, 2026-08-08 重构动因)。
     prompt = (
         f"你是资深代码审查专家。请审查附件中的代码,重点: {focus}。\n"
+        f"被审仓库根目录: {os.path.abspath(cwd or os.getcwd())}"
+        " (用绝对路径 + 只读工具读上下文; 当前工作目录是隔离沙箱, 不是你审查的仓库)\n"
         "规则:\n"
         "1. 你的任务只是审查并输出报告 — 绝对不要修改、创建或删除任何文件"
         " (写/执行工具已被物理禁用,不要尝试)。\n"
@@ -1357,6 +1469,10 @@ def tool_zcode_security_review(args):
         return {"content": [{"type": "text",
                              "text": f"扫描目录不存在或不是目录: {scan_path}"}],
                 "isError": True}
+    # 项目配置防护②: 被审目录链上有 zcode 项目配置 → fail-closed (issue #49 洞三)
+    guard = _project_config_guard(scan_path)
+    if guard:
+        return guard
 
     root = _find_mimosa_root()
     if not root:
@@ -1395,6 +1511,8 @@ def tool_zcode_security_review(args):
         prompt = (
             f"你是资深安全审查专家。附件是安全扫描器 (mimosa,确定性规则引擎,depth={depth})"
             "对本项目的扫描结果。\n"
+            f"被审仓库根目录: {os.path.abspath(scan_path)}"
+            " (用绝对路径 + 只读工具读上下文; 当前工作目录是隔离沙箱, 不是你审查的仓库)\n"
             "任务:\n"
             "1. 逐条核实每个 finding: 用只读工具 (Read/Grep/Glob) 阅读相关代码,判定为"
             "【确认漏洞】/【误报】/【存疑】,给出依据 (可利用的攻击路径,或为什么不可利用)。\n"
@@ -1446,6 +1564,11 @@ def tool_zcode_pr_review(args):
         return {"content": [{"type": "text",
                              "text": f"仓库目录不存在或不是目录: {scan_path}"}],
                 "isError": True}
+    # 项目配置防护②: 被审目录链上有 zcode 项目配置 → fail-closed (issue #49 洞三)。
+    # PR 审查场景最危险: path 通常是刚 check out 的 PR head 副本, 内容不受信。
+    guard = _project_config_guard(scan_path)
+    if guard:
+        return guard
 
     # ① git diff (只读)
     rc, _, err = _git(scan_path, "rev-parse", "--git-dir")
@@ -1611,6 +1734,8 @@ def tool_zcode_pr_review(args):
             "你是资深安全审查专家。这是一次 PR 审查: 附件含 ① 本 PR 的完整 diff "
             f"(base={base} → {head}, 改动 {len(changed)} 个文件) ② mimosa 安全扫描结果"
             f"(depth={depth}, 业务逻辑复核优先聚焦本次改动文件{findings_scope_note})。\n"
+            f"被审仓库根目录: {os.path.abspath(scan_path)}"
+            " (用绝对路径 + 只读工具读上下文; 当前工作目录是隔离沙箱, 不是你审查的仓库)\n"
             "任务:\n"
             "1. 审查 diff 中新引入的问题, 按 P0(阻断合并)/P1(应修)/P2(建议)/P3(提示) 分级,"
             "每个问题含文件位置/判定依据/修复建议。重点是'新引入';"

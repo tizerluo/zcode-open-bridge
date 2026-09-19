@@ -734,6 +734,39 @@ def parse_verdict_marker(report):
             m.group(5) == "true")
 
 
+# 拒审标记 (issue #49 洞三): mcp-server 的项目配置护栏在拒审文案末尾带此行。
+# review-gate 据此把"安全策略拒绝"与"临时失败"分开 — 前者终态 + 告警评论
+# (重试不会变, 且 5 次后静默 gave_up 会吞掉"有人在投毒"的信号), 后者照旧退避。
+# 只在审查失败 (ok=False) 的载荷上解析: 该文案由 mcp-server 生成, 非模型输出,
+# 无伪造面 (审查报告正文不参与判定)。
+_RE_ZOB_REFUSED = re.compile(r"^ZOB-REFUSED:\s*([A-Za-z0-9_]+)\s*$", re.M)
+
+
+def parse_refusal_marker(text):
+    """读 ZOB-REFUSED 标记, 返回原因串 (如 "project_config") 或 None。"""
+    matches = list(_RE_ZOB_REFUSED.finditer(text or ""))
+    return matches[-1].group(1) if matches else None
+
+
+def build_refusal_comment(head_sha, detail):
+    """拒审告警评论体 (供人工立即看见; 不参与 verdict 解析)。"""
+    return (
+        "## 🚫 审查被拒绝（安全策略）\n\n"
+        "被审分支的仓库里存在 ZCode 项目配置文件（`zcode.json` 或 "
+        "`.zcode/config.json`）。该文件会在审查进程启动时被装载，其中 "
+        "`mcp.servers` 定义的命令会被**直接执行**（进程 spawn，不经过模型、"
+        "不受工具黑名单约束）——等于把执行权交给被审内容；因此本次审查按 "
+        "fail-closed 策略拒绝（zcode-open-bridge issue #49 洞三）。\n\n"
+        f"- head: `{(head_sha or '')[:12]}`\n"
+        "- 同 head 不再重试；推送新 commit 会自动重新触发审查。\n"
+        "- **若这是本 PR 新增的文件**：请从 PR 中移除后重推。\n"
+        "- **若该文件本就在目标分支上**：属仓库自身配置，需人工确认后处理"
+        "（可设 `ZCODE_BRIDGE_TRUST_PROJECT_CONFIG=1` 放行，或在审查副本中移除）。\n\n"
+        "<details><summary>护栏原始输出</summary>\n\n"
+        f"```\n{(detail or '')[:1500]}\n```\n\n</details>"
+    )
+
+
 def parse_severity_counts(report):
     """解析 (P0, P1, P2, P3) 条数; P0/P1/P2 任一缺失 → None, P3 缺省计 0。
 
@@ -1368,6 +1401,34 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
             f"base=origin/{info['base_ref']} depth={cfg.review_depth}")
         ok, payload, rinfo = run_review(cfg, clone, info["base_ref"], head_sha)
         if not ok:
+            # 拒审 (issue #49 洞三): 安全策略拒绝 → 终态 + 告警评论。
+            # 不能当临时失败退避重试: 重试结果不会变, 且 5 次后静默 gave_up
+            # 会把"有人在投毒"的信号吞掉 (mcp-server 侧带 ZOB-REFUSED 标记)。
+            # 复用 gave_up 语义: 同 head 不再动, 新 head 自动复活重审。
+            refused = parse_refusal_marker(payload)
+            if refused:
+                entry["error"] = payload[:500]
+                entry["verdict"] = None
+                entry["status"] = "gave_up"
+                entry["next_retry_at"] = 0.0
+                log(f"{key}: ⛔ 拒审 (ZOB-REFUSED: {refused}), 终态 "
+                    f"(head={head_sha[:12]}) — 发告警评论")
+                if cfg.comment_enabled and token:
+                    try:
+                        resp = post_comment(
+                            token, cfg.github_api, owner, repo, info["number"],
+                            build_refusal_comment(head_sha, payload))
+                        log(f"{key}: 拒审告警已发布 "
+                            f"{(resp or {}).get('html_url') or ''}")
+                    except (RetryableError, RepoHardError) as e:
+                        # 告警发不出去也不能丢: 缓存拒审原文, 下轮只补评论
+                        # (与审查成功但评论失败同一条缓存补发路径)
+                        entry["report"] = payload[:cfg.comment_max_body]
+                        mark_failure(entry, f"拒审告警发布失败: {e}", now, cfg,
+                                     status="comment_failed")
+                else:
+                    log(f"{key}: 拒审告警未发 (评论禁用或无 token), 详见 state/日志")
+                return
             # 判据优先级 (#35①): 结构化 quota_limit 键优先 (mcp-server 侧已转
             # unix 秒), 键缺失/形状不符退正则兜底 (旧 mcp-server 兼容)。两条
             # 路径汇成同一个 reset_ts 后过同一道 is_valid_quota_window —
