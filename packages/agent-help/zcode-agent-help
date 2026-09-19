@@ -162,13 +162,15 @@ def print_injected_env(config_path=None):
 # ============================================================
 OVERVIEW = {
     "tool": "zcode",
-    "version_described": "0.16.5",
+    "version_described": "0.16.9",
     # 整体 review P2-6: version_described 是"静态清单基于该版本实测"的意思;
     # 实际安装版本以 environment.zcode_version (动态探测) 为准, 两者可能不一致。
-    # App 3.12.3 起 --version 同为 0.16.5 但构建内容漂移 (workspace/* 7 个与
-    # updateRuntimeModelConfig 被删, 见 key_methods 各 ❌ 注记), 故不再绑定具体
-    # App 版本号 — 描述对象是 CLI 能力面 (0.16.5), 可用性以各条目注记为准。
-    "tested_against": "0.16.5 (App 3.10.2 / 3.12.3 复测)",
+    # App 3.12.3 起 --version 同号构建内容漂移 (workspace/* 7 个与
+    # updateRuntimeModelConfig 被删, 见 key_methods 各 ❌ 注记), 故不绑定具体
+    # App 版本号 — 描述对象是 CLI 能力面, 可用性以各条目注记为准。
+    # 0.16.9 (App 3.14.0) 复测: 协议面与 3.12.3 的 0.16.5 构建一致 (零代码改动),
+    # 仅 CLI 旗标面有增删 (见 agency/input/permission 各条目 0.16.9 注记)。
+    "tested_against": "0.16.9 (App 3.14.0 复测 2026-09-19; 0.16.5 面 App 3.10.2 / 3.12.3 复测)",
     "what_it_is": (
         "ZCode 是智谱(Z.AI)的 Agentic Coding CLI, 由 GLM 系列模型驱动。"
         "它能自主完成代码编写/审查/调试/分析等任务, 可调用工具(读写文件、"
@@ -328,15 +330,15 @@ NATIVE_CLI = {
         # 自主性
         {"category": "agency", "name": "autonomous-tools", "supported": True,
          "description": "自主调用工具: 读写文件、Bash、Grep、Web 搜索等",
-         "limitations": {"tool_allowlist": "帮助文案有 --allowed-tools, 0.16.1–0.16.5 实测均未接线 "
-                                           "(Unknown option)",
+         "limitations": {"tool_allowlist": "--allowed-tools: 0.16.1–0.16.5 帮助文案在列但 "
+                                           "实测未接线 (Unknown option); 0.16.9 起帮助文案已移除",
                          "tool_denylist": "0.16.1+ 实测可用 (--disallowed-tools, 工具集级物理移除, yolo 也绕不过)",
-                         "max_turns": "帮助文案有 --max-turns, 0.16.1–0.16.5 实测均未接线 "
-                                      "(Unknown option)",
+                         "max_turns": "--max-turns: 0.16.1–0.16.5 帮助文案在列但实测未接线 "
+                                      "(Unknown option); 0.16.9 起帮助文案已移除",
                          "max_budget": "不支持"}},
         {"category": "agency", "name": "tool-allowlist", "supported": False,
-         "description": "工具白名单 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 "
-                        "(Unknown option), 勿用",
+         "description": "工具白名单 — 0.16.1–0.16.5 帮助文案在列但实测未接线 "
+                        "(Unknown option); 0.16.9 起帮助文案已移除, 勿用",
          "arg": "--allowed-tools <list>",
          "since": "0.16.1 (仅文案)"},
         {"category": "agency", "name": "tool-denylist", "supported": True,
@@ -347,33 +349,58 @@ NATIVE_CLI = {
          "example": "zcode --prompt \"整理代码\" --disallowed-tools \"Bash(git *) Edit\"",
          "since": "0.16.1"},
         {"category": "agency", "name": "max-turns", "supported": False,
-         "description": "最大模型轮次 — 帮助文案有但 0.16.1–0.16.5 实测均未接线 "
-                        "(Unknown option), 勿用",
+         "description": "最大模型轮次 — 0.16.1–0.16.5 帮助文案在列但实测未接线 "
+                        "(Unknown option); 0.16.9 起帮助文案已移除, 勿用",
          "arg": "--max-turns <n>",
          "since": "0.16.1 (仅文案)"},
         # 以下 5 项 0.16.5 help 实测在列, 引入版本未考, since 记 0.16.5
+        # (其中 permission-mode / allow-main-worktree-yolo 已于 0.16.9 移除, 见各自 note)
         {"category": "input", "name": "positional-prompt", "supported": True,
-         "description": "以位置参数运行一次性 prompt, 不打开 TUI", "arg": "-p, --print",
+         "description": "以位置参数运行一次性 prompt, 不打开 TUI (0.16.9 help 标签为 -p, --prompt)",
+         "arg": "-p, --prompt",
          "since": "0.16.5"},
         {"category": "output", "name": "surface", "supported": True,
          "description": "headless prompt / app-server 的呈现表面: terminal 或 desktop",
          "arg": "--surface <surface>", "since": "0.16.5"},
         {"category": "provider", "name": "force-mcs", "supported": True,
          "description": "对 Anthropic 供应商强制启用会话中 system 投影 "
-                        "(mid-conversation system projection)",
+                       "(mid-conversation system projection)",
          "arg": "--force-mcs", "since": "0.16.5"},
-        {"category": "permission", "name": "permission-mode", "supported": True,
-         "description": "Legacy 权限模式别名: default / build / edit / plan / yolo",
+        {"category": "permission", "name": "permission-mode", "supported": False,
+         "description": "Legacy 权限模式别名 — 0.16.9 实测已移除 (Unknown option); "
+                        "0.16.5 曾作为 --mode 的 legacy 别名存在 (自 help 文案推断)",
          "arg": "--permission-mode <mode>",
-         "note": "--mode 的 legacy 别名, 行为等价 (自 help 文案推断)",
-         "since": "0.16.5"},
+         "since": "0.16.5; removed in 0.16.9"},
         {"category": "permission", "name": "allow-main-worktree-yolo", "supported": False,
-         "description": "仅为兼容旧版 headless launcher 而接受, 无功能效果 (accepted no-op)",
+         "description": "0.16.9 实测已移除 (Unknown option); 0.16.5 曾仅为兼容旧版 "
+                        "headless launcher 而接受, 无功能效果 (accepted no-op)",
          "arg": "--allow-main-worktree-yolo",
-         "note": "区别于 --allowed-tools (Unknown option): 被接受但无功能效果, 勿依赖",
-         "since": "0.16.5"},
+         "note": "区别于 --allowed-tools (Unknown option): 0.16.5 时被接受但无功能效果, 勿依赖",
+         "since": "0.16.5; removed in 0.16.9"},
+        # 0.16.9 (App 3.14.0) help 新增的旗标, 2026-09-19 实测在列 (--cwd 已验证接线)
+        {"category": "input", "name": "cwd", "supported": True,
+         "description": "从给定目录运行本命令 (实测接线: 路径不可达时报错)",
+         "arg": "--cwd <path>", "since": "0.16.9"},
+        {"category": "agency", "name": "target-replace", "supported": True,
+         "description": "--target 设定 session 目标时, 替换已存在的既有目标 "
+                       "(默认行为是追加/共存)",
+         "arg": "--target-replace", "since": "0.16.9"},
+        {"category": "session", "name": "continue", "supported": True,
+         "description": "续接当前目录最近一次会话 (等价 --resume 省略 id)",
+         "arg": "-c, --continue", "since": "0.16.9"},
+        {"category": "output", "name": "locale", "supported": True,
+         "description": "UI 语言: en-US / zh-CN / auto",
+         "arg": "--locale <locale>", "since": "0.16.9"},
+        {"category": "browser", "name": "browser-use", "supported": True,
+         "description": "启用 Browser Use 后端 (当前支持 headless); "
+                       "--browser-executable 指定 Chrome/Chromium 可执行文件",
+         "arg": "--browser-use <mode> / --browser-executable <path>", "since": "0.16.9"},
+        {"category": "testing", "name": "memory-bench", "supported": True,
+         "description": "随 --prompt 启用自动 Memory 提取并在退出前等待 "
+                       "(需 Memory 功能已启用)",
+         "arg": "--memory-bench", "since": "0.16.9"},
     ],
-    # 子命令 (zcode <command>, 实测自 0.16.5 --help; 9 个子命令逐一核对, 与 0.16.1 相比无新增/删除)
+    # 子命令 (zcode <command>, 实测自 0.16.9 --help 复核; 9 个子命令与 0.16.5 一致, 无新增/删除)
     "subcommands": [
         {"name": "tui", "usage": "zcode tui",
          "description": "打开全屏 TUI (无参数直接运行 zcode 同效)",
@@ -399,8 +426,8 @@ NATIVE_CLI = {
         {"name": "version", "usage": "zcode version",
          "description": "打印 CLI 版本"},
     ],
-    # slash 命令 (TUI 会话内使用; /side /btw 未见于 0.16.1/0.16.5 --help, 出自 App 3.6.5 changelog;
-    # 0.16.5 help 实测 slash 列表 14 个, 与本清单除 /side /btw 外完全一致, 无需增删)
+    # slash 命令 (TUI 会话内使用; /side /btw 未见于 0.16.1/0.16.5/0.16.9 --help, 出自 App 3.6.5 changelog;
+    # 0.16.5 help 实测 slash 列表 14 个; 0.16.9 help 实测 15 个 (新增 /dwf), 与本清单除 /side /btw 外一致)
     "slash_commands": [
         {"command": "/help [command]", "description": "slash 命令帮助"},
         {"command": "/login", "description": "Z.AI OAuth 登录", "since": "0.16.1"},
@@ -408,6 +435,9 @@ NATIVE_CLI = {
         {"command": "/compact [instructions]", "description": "压缩当前对话上下文"},
         {"command": "/expert [status|resume|stop|<task>]",
          "description": "运行或管理 expert 工作流", "since": "0.16.1"},
+        {"command": "/dwf [list|cancel|resume]",
+         "description": "列出/取消/续接 dynamic workflow 运行",
+         "since": "0.16.9", "note": "0.16.9 help 新增 (0.16.5 的 14 个之外)"},
         {"command": "/fork [latest|checkpointId]",
          "description": "从工作区 checkpoint 分叉新会话", "since": "0.14.8"},
         {"command": "/mcp [list|status|connect|disconnect]",
