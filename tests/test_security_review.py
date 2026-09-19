@@ -24,8 +24,10 @@ test_security_review.py — review 只读护栏 + zcode_security_review 管线�
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 
@@ -85,7 +87,9 @@ class _EnvGuard(unittest.TestCase):
                 "ZCODE_BRIDGE_PR_DIFF_MAX",
                 # issue #26/#27: PR findings 过滤/基线开关与基线目录
                 "ZCODE_BRIDGE_PR_FINDINGS_SCOPE", "ZCODE_BRIDGE_PR_BASELINE",
-                "ZCODE_BRIDGE_BASELINE_DIR")
+                "ZCODE_BRIDGE_BASELINE_DIR",
+                # issue #49 洞三: 项目配置拒审的显式放行开关
+                "ZCODE_BRIDGE_TRUST_PROJECT_CONFIG")
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in self.ENV_KEYS}
@@ -97,16 +101,11 @@ class _EnvGuard(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-
-class TestReviewCmd(_EnvGuard):
-    """只读护栏: 命令构造 + prompt 约束"""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.mod = _load_mcp_module()
-
     def _capture_cmd(self, **kwargs):
-        """patch subprocess.run 捕获 cmd, 返回 (cmd, result)。"""
+        """patch subprocess.run 捕获 cmd, 返回 (cmd, result)。
+
+        (R1 精简 #4: 原为 TestReviewCmd 私有, PG9 同形状需求, 上移共用。)
+        """
         mod = self.mod
         captured = {}
 
@@ -122,6 +121,14 @@ class TestReviewCmd(_EnvGuard):
         finally:
             mod.subprocess.run = saved
         return captured["cmd"], result
+
+
+class TestReviewCmd(_EnvGuard):
+    """只读护栏: 命令构造 + prompt 约束"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
 
     def test_rc0_yolo_not_plan(self):
         """RC0: 用 --mode yolo, 绝不再出现 plan"""
@@ -140,6 +147,21 @@ class TestReviewCmd(_EnvGuard):
                      "mcp__node_repl__js", "mcp__node_repl__js_reset",
                      "mcp__node_repl__js_add_node_module_dir"):
             self.assertIn(tool, deny.split(), f"黑名单缺 {tool}")
+
+    def test_rc1b_denylist_blocks_dynamic_workflow_family(self):
+        """RC1b: 黑名单含动态工作流一族 (0.16.9 新增的执行原语)。
+
+        EvalWorkflowSnippet 的 world.run 等价任意命令执行 + 文件写入, 与 Node REPL
+        同族 (2026-09-19 实测复现: 黑名单原样下仍写入成功, 平台遥测标该工具
+        read_only=0; 详见 docs/recheck-3.14.0.md)。漏禁则 Bash/Write 禁令被绕开。
+        """
+        cmd, _ = self._capture_cmd()
+        deny = cmd[cmd.index("--disallowed-tools") + 1].split()
+        for tool in ("EvalWorkflowSnippet", "CreateWorkflow", "AmendWorkflow",
+                     "SaveWorkflow", "ListWorkflowRuns", "GetWorkflowRun",
+                     "ResumeWorkflowRun", "ListSavedWorkflows",
+                     "ResolveWorkflowQuestion"):
+            self.assertIn(tool, deny, f"黑名单缺动态工作流工具 {tool}")
 
     def test_rc2_json_output(self):
         """RC2: 带 --json (结构化输出)"""
@@ -218,6 +240,191 @@ class TestReviewCmd(_EnvGuard):
         self.assertNotIn("isError", result)
         self.assertIn("已截断", captured["content"])
         self.assertLess(len(captured["content"]), 11000, "截断后应在上限附近")
+
+
+class TestProjectConfigGuard(_EnvGuard):
+    """issue #49 洞三防护: 被审目录链上的 zcode 项目配置 → 拒审 + 干净工作目录。
+
+    背景: zcode 启动时装载 cwd 链上的 zcode.json / .zcode/config.json, 其中的
+    mcp.servers **进程会被直接 spawn** (不经过模型/黑名单)。两条护栏:
+      ① _build_review_cmd 的 --cwd 指向只含空 .git 的临时目录 (发现链止步);
+      ② 被审目录链上有这两个文件时 fail-closed 拒审 (可显式放行)。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def setUp(self):
+        super().setUp()
+        mod = self.mod
+        self._tmp = tempfile.mkdtemp(prefix="zob-guard-test-")
+        # scratch 缓存跨测试复用, 置空避免互相影响
+        self._saved_scratch = mod._scratch_cwd_cache
+        mod._scratch_cwd_cache = None
+
+    def tearDown(self):
+        self.mod._scratch_cwd_cache = self._saved_scratch
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        super().tearDown()
+
+    def _mk_repo(self, name, rel=None, git=True):
+        root = os.path.join(self._tmp, name)
+        os.makedirs(root, exist_ok=True)
+        if git:
+            os.mkdir(os.path.join(root, ".git"))
+        if rel:
+            p = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write("{}")
+        return root
+
+    # ---------- _project_config_files ----------
+
+    def test_pg1_finds_dot_zcode_config(self):
+        """PG1: <repo>/.zcode/config.json 被识别"""
+        root = self._mk_repo("r1", rel=".zcode/config.json")
+        got = self.mod._project_config_files(root)
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].endswith(".zcode/config.json"))
+
+    def test_pg2_finds_zcode_json(self):
+        """PG2: <repo>/zcode.json 被识别"""
+        root = self._mk_repo("r2", rel="zcode.json")
+        got = self.mod._project_config_files(root)
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].endswith("zcode.json"))
+
+    def test_pg2b_symlink_resolved(self):
+        """PG2b: realpath 先解析符号链接 (R1 P3-4), 经链接进入的仓库照常识别"""
+        real = self._mk_repo("r2b-real", rel="zcode.json")
+        link = os.path.join(self._tmp, "r2b-link")
+        os.symlink(real, link)
+        got = self.mod._project_config_files(link)
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].endswith("zcode.json"))
+
+    def test_pg3_clean_repo_is_empty(self):
+        """PG3: 干净仓库无命中"""
+        root = self._mk_repo("r3")
+        self.assertEqual(self.mod._project_config_files(root), [])
+
+    def test_pg4_walks_up_to_git_root(self):
+        """PG4: 从子目录向上到 git 根 (含) — 仓库根的配置也被发现"""
+        root = self._mk_repo("r4", rel="zcode.json")
+        sub = os.path.join(root, "pkg", "inner")
+        os.makedirs(sub, exist_ok=True)
+        got = self.mod._project_config_files(sub)
+        self.assertEqual(len(got), 1, "应沿子目录→git 根发现仓库根的配置")
+
+    def test_pg5_stops_at_git_root(self):
+        """PG5: git 根之上不再上溯 (与 zcode 的发现顺序一致)"""
+        outside = os.path.join(self._tmp, "pg5-outside")
+        os.makedirs(outside, exist_ok=True)
+        with open(os.path.join(outside, "zcode.json"), "w") as f:
+            f.write("{}")
+        repo = os.path.join(outside, "repo")
+        os.makedirs(repo)
+        os.mkdir(os.path.join(repo, ".git"))
+        self.assertEqual(self.mod._project_config_files(repo), [],
+                         "git 根之上的配置不属于该项目, 不应误报")
+
+    # ---------- _project_config_guard ----------
+
+    def test_pg6_guard_blocks_and_allows(self):
+        """PG6: 命中即拒审 (isError, 带结构化 refusal 键); 放行开关值矩阵"""
+        root = self._mk_repo("r6", rel=".zcode/config.json")
+        res = self.mod._project_config_guard(root)
+        self.assertIsNotNone(res)
+        self.assertTrue(res["isError"])
+        # 机器契约: 结构化 refusal 键 (R1 P2-2), gate 只认它判定拒审
+        self.assertEqual(res.get("refusal"), "project_config")
+        text = res["content"][0]["text"]
+        self.assertIn("拒绝审查", text)
+        self.assertIn("ZCODE_BRIDGE_TRUST_PROJECT_CONFIG", text)
+        # 文本标记保留在首行, 仅供肉眼/日志 grep
+        self.assertIn("ZOB-REFUSED: project_config", text)
+        # 放行开关值矩阵 (R1 P3-1): off/disabled 是"关"不是"开" —
+        # 关安全护栏的开关, 反直觉值不得触发放行
+        for v in ("1", "yes", "true"):
+            os.environ["ZCODE_BRIDGE_TRUST_PROJECT_CONFIG"] = v
+            self.assertIsNone(
+                self.mod._project_config_guard(root), f"TRUST={v!r} 应放行")
+        for v in ("0", "false", "no", "off", "disabled"):
+            os.environ["ZCODE_BRIDGE_TRUST_PROJECT_CONFIG"] = v
+            self.assertIsNotNone(
+                self.mod._project_config_guard(root), f"TRUST={v!r} 不应放行")
+        os.environ.pop("ZCODE_BRIDGE_TRUST_PROJECT_CONFIG", None)
+
+    def test_pg7_guard_passes_clean(self):
+        """PG7: 干净目录放行"""
+        self.assertIsNone(self.mod._project_config_guard(self._mk_repo("r7")))
+
+    def test_pg7b_structured_refusal_key(self):
+        """PG7b: 拒审 result 带结构化 refusal 键 (机器契约)。
+
+        R1 P2-2: 失败 detail 会混入 mimosa 错误体/子进程回显等攻击者可影响
+        的文本, gate 解析文本标记存在伪造面 (可把临时失败伪造成终态拒审),
+        故机器契约改为 result 顶层 "refusal" 键 — 只有本护栏会写它;
+        文本首行的 ZOB-REFUSED 保留, 仅供肉眼/日志 grep。
+        """
+        root = self._mk_repo("r7b", rel=".zcode/config.json", git=False)
+        res = self.mod._project_config_guard(root)
+        self.assertIsNotNone(res)
+        self.assertTrue(res["isError"])
+        self.assertEqual(res.get("refusal"), "project_config")
+        self.assertTrue(res["content"][0]["text"].startswith(
+            "ZOB-REFUSED: project_config"), "文本标记保持首行, 便于日志 grep")
+
+    # ---------- 命令构造: 干净工作目录 + prompt 带仓库根 ----------
+
+    def test_pg8_review_cmd_uses_scratch_not_repo(self):
+        """PG8: --cwd 指向隔离沙箱 (含空 .git), 不是被审仓库"""
+        repo = self._mk_repo("r8")
+        cmd = self.mod._build_review_cmd("PROMPT", repo)
+        cwd = cmd[cmd.index("--cwd") + 1]
+        self.assertNotEqual(os.path.abspath(cwd), os.path.abspath(repo))
+        self.assertTrue(os.path.isdir(os.path.join(cwd, ".git")),
+                        "沙箱须含空 .git 令 zcode 的配置发现链止步")
+        self.assertFalse(os.path.exists(os.path.join(cwd, "zcode.json")))
+
+    def test_pg8b_scratch_cwd_cleanup(self):
+        """PG8b: 沙箱目录退出时清理 (atexit), 清理后可重建 (R1 P2-3)"""
+        mod = self.mod
+        d1 = mod._review_scratch_cwd()
+        self.assertTrue(os.path.isdir(d1))
+        mod._cleanup_scratch_cwd()
+        self.assertFalse(os.path.exists(d1), "清理后目录应删除")
+        self.assertIsNone(mod._scratch_cwd_cache)
+        d2 = mod._review_scratch_cwd()
+        self.assertNotEqual(d1, d2)
+        self.assertTrue(os.path.isdir(os.path.join(d2, ".git")),
+                        "重建的沙箱同样含空 .git")
+
+    def test_pg9_review_prompt_carries_repo_root(self):
+        """PG9: tool_zcode_review 的 prompt 带被审仓库绝对路径"""
+        repo = self._mk_repo("r9")
+        cmd, result = self._capture_cmd(cwd=repo)
+        self.assertNotIn("isError", result)
+        prompt = cmd[cmd.index("--prompt") + 1]
+        self.assertIn(f"被审仓库根目录: {os.path.abspath(repo)}", prompt)
+
+    def test_pg10_tool_refuses_project_config(self):
+        """PG10: 被审目录含项目配置 → tool_zcode_review 直接拒审, 不调 zcode"""
+        repo = self._mk_repo("r10", rel=".zcode/config.json")
+        mod = self.mod
+        calls = []
+        saved = mod.subprocess.run
+        mod.subprocess.run = lambda *a, **kw: calls.append(a) or _FakeCompletedProcess(0, "OK", "")
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        try:
+            result = mod.tool_zcode_review({"code": "print(1)", "cwd": repo})
+        finally:
+            mod.subprocess.run = saved
+        self.assertTrue(result["isError"])
+        self.assertIn("拒绝审查", result["content"][0]["text"])
+        self.assertEqual(calls, [], "拒审时不应启动 zcode 子进程")
 
 
 class TestExtractResponse(unittest.TestCase):

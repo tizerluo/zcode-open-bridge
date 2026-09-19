@@ -661,6 +661,8 @@ def run_review(cfg, clone, base_ref, head_sha):
     info (#35) 结构化旁路信息, 从 result 顶层附加键直读:
       quota_limit: {"code": 1308, "reset_at": <unix 秒>} | None — 仅 stderr
         命中 1308 才有 (mcp-server 侧已完成北京 naive → unix 转换);
+      refusal: str | None — 安全策略拒审 (issue #49 洞三) 时 mcp-server
+        护栏写入的原因串 (如 "project_config"), 机器契约只此一处;
       total_tokens: int — 成功时 usage.total_tokens 透传, 无则 0。
     子进程异常/非 JSON 输出时为空 info。quota_limit 原样透传 (键缺失为
     None), 合法性校验全在消费端 (quota_limit_reset_ts), 这里不猜不修。
@@ -676,7 +678,7 @@ def run_review(cfg, clone, base_ref, head_sha):
            json.dumps(args, ensure_ascii=False)]
     env = dict(os.environ)
     env["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = str(ZCODE_REVIEW_TIMEOUT)
-    info = {"quota_limit": None, "total_tokens": 0}
+    info = {"quota_limit": None, "total_tokens": 0, "refusal": None}
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=REVIEW_TIMEOUT, env=env)
@@ -693,6 +695,9 @@ def run_review(cfg, clone, base_ref, head_sha):
     # quota_limit 原样透传: 形状校验全在消费端 (quota_limit_reset_ts),
     # 非 dict 在那里回 None → 正则兜底, 这里不重复判
     info["quota_limit"] = result.get("quota_limit")
+    # 拒审原因串原样透传 (#49): 只有 mcp-server 的项目配置护栏会写这个键,
+    # 正文文本不参与判定 (伪造面, R1 P2-2)
+    info["refusal"] = result.get("refusal")
     usage = result.get("usage")
     if isinstance(usage, dict):
         tokens = usage.get("total_tokens")
@@ -732,6 +737,68 @@ def parse_verdict_marker(report):
     p3 = int(m.group(4) or 0)
     return ((int(m.group(1)), int(m.group(2)), int(m.group(3)), p3),
             m.group(5) == "true")
+
+
+# 拒审 (issue #49 洞三): mcp-server 的项目配置护栏在 isError result 顶层附
+# 结构化键 "refusal": "project_config" (文本里那行 ZOB-REFUSED 仅供人看)。
+# gate 只认结构化键判定"安全策略拒绝" (R1 P2-2): 失败 detail 会混入 mimosa
+# 错误体/子进程回显等攻击者可影响的文本, 解析文本可把任意临时失败伪造成
+# 终态拒审 (跳过 5 次重试 + 假告警); 结构化键只有 mcp-server 护栏会写。
+# 拒审按终态处理 (gave_up + 🚫 告警评论), 不当临时失败退避重试:
+# 重试不会变, 且 5 次后静默 gave_up 会吞掉"有人在投毒"的信号。
+
+
+def build_refusal_comment(head_sha, detail):
+    """拒审告警评论体 (供人工立即看见; 不参与 verdict 解析)。"""
+    return (
+        "## 🚫 审查被拒绝（安全策略）\n\n"
+        "被审分支的仓库里存在 ZCode 项目配置文件（`zcode.json` 或 "
+        "`.zcode/config.json`）。该文件会在审查进程启动时被装载，其中 "
+        "`mcp.servers` 定义的命令会被**直接执行**（进程 spawn，不经过模型、"
+        "不受工具黑名单约束）——等于把执行权交给被审内容；因此本次审查按 "
+        "fail-closed 策略拒绝（zcode-open-bridge issue #49 洞三）。\n\n"
+        f"- head: `{(head_sha or '')[:12]}`\n"
+        "- 同 head 不再重试；推送新 commit 会自动重新触发审查。\n"
+        "- **若这是本 PR 新增的文件**：请从 PR 中移除后重推。\n"
+        "- **若该文件本就在目标分支上**：属仓库自身配置，需人工确认后处理"
+        "（可设 `ZCODE_BRIDGE_TRUST_PROJECT_CONFIG=1` 放行，或在审查副本中移除）。\n\n"
+        "<details><summary>护栏原始输出</summary>\n\n"
+        f"```\n{(detail or '')[:1500]}\n```\n\n</details>"
+    )
+
+
+def _post_refusal_alert(cfg, token, entry, key, head_sha, owner, repo,
+                        pr_number, text, now):
+    """发拒审告警评论; 发不出去则缓存原文转 comment_failed 等下轮补发。
+
+    两个调用点共用 (首发于拒审分支 / 补发于 comment_failed 重试轮),
+    失败口径与正常评论路径一致:
+      - RateLimited (R1 P1-1): 仓级事件不烧 attempts, 缓存 + comment_failed
+        后上抛停本轮 — 早期版本只捕 Retryable/RepoHard, RateLimited 穿透时
+        gave_up 已写而缓存未落, 下一轮 needs_review 跳过 gave_up, 告警
+        永久丢失;
+      - Retryable/RepoHard: mark_failure(comment_failed) 走退避, 缓存保留。
+    返回 True=已发布, False=未尝试 (评论禁用/无 token) 或发布失败 (已转
+    comment_failed, 状态见 entry)。
+    """
+    if not (cfg.comment_enabled and token):
+        log(f"{key}: 拒审告警未发 (评论禁用或无 token), 详见 state/日志")
+        return False
+    try:
+        resp = post_comment(token, cfg.github_api, owner, repo, pr_number,
+                            build_refusal_comment(head_sha, text))
+        log(f"{key}: 拒审告警已发布 {(resp or {}).get('html_url') or ''}")
+        return True
+    except RateLimited:
+        entry["report"] = text[:cfg.comment_max_body]
+        entry["status"] = "comment_failed"
+        entry["next_retry_at"] = 0.0
+        raise
+    except (RetryableError, RepoHardError) as e:
+        entry["report"] = text[:cfg.comment_max_body]
+        mark_failure(entry, f"拒审告警发布失败: {e}", now, cfg,
+                     status="comment_failed")
+        return False
 
 
 def parse_severity_counts(report):
@@ -1339,6 +1406,21 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
         # 审查已成功过、只是评论没发出去: 沿用缓存结果, 只补评论,
         # 不为一次评论失败重跑昂贵的 zcode 审查
         report = entry["report"]
+        if entry.get("refusal"):
+            # 拒审告警补发 (R1 P1-2): 缓存的是拒审文案, 补发的必须是拒审
+            # 评论 — 走下方通用路径会把安全拒审销毁成 "concerns 质量告警"
+            # 并翻成 reviewed, 下游读 state 拿到错误结论。
+            if _post_refusal_alert(cfg, token, entry, key, head_sha, owner,
+                                   repo, info["number"], report, now):
+                entry["status"] = "gave_up"   # 补发成功, 回终态
+                entry["next_retry_at"] = 0.0
+                entry["report"] = None
+            elif entry["status"] != "comment_failed":
+                # 未尝试 (评论被禁用/无 token): 烧退避老化, 不无限空转;
+                # 缓存保留, gave_up 后仍可供人工排查
+                mark_failure(entry, "拒审告警未发 (评论禁用或无 token)",
+                             now, cfg, status="comment_failed")
+            return
         verdict = entry.get("verdict") or "concerns"
         counts = tuple(entry["counts"]) if entry.get("counts") else None
         log(f"{key}: 沿用缓存审查结果 (verdict={verdict}), 只补评论")
@@ -1368,6 +1450,23 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
             f"base=origin/{info['base_ref']} depth={cfg.review_depth}")
         ok, payload, rinfo = run_review(cfg, clone, info["base_ref"], head_sha)
         if not ok:
+            # 拒审 (issue #49 洞三): 安全策略拒绝 → 终态 + 告警评论。
+            # 不能当临时失败退避重试: 重试结果不会变, 且 5 次后静默 gave_up
+            # 会把"有人在投毒"的信号吞掉 (判定只认 mcp-server 护栏写的
+            # 结构化 refusal 键, 文本标记仅供人看)。
+            # 复用 gave_up 语义: 同 head 不再动, 新 head 自动复活重审。
+            refused = rinfo.get("refusal")
+            if refused:
+                entry["error"] = payload[:500]
+                entry["verdict"] = None
+                entry["refusal"] = refused
+                entry["status"] = "gave_up"
+                entry["next_retry_at"] = 0.0
+                log(f"{key}: ⛔ 拒审 (refusal: {refused}), 终态 "
+                    f"(head={head_sha[:12]}) — 发告警评论")
+                _post_refusal_alert(cfg, token, entry, key, head_sha, owner,
+                                    repo, info["number"], payload, now)
+                return
             # 判据优先级 (#35①): 结构化 quota_limit 键优先 (mcp-server 侧已转
             # unix 秒), 键缺失/形状不符退正则兜底 (旧 mcp-server 兼容)。两条
             # 路径汇成同一个 reset_ts 后过同一道 is_valid_quota_window —
