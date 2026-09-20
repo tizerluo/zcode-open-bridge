@@ -58,7 +58,9 @@ CLI 0.16.1 适配 (依据 docs/upgrade-0.16.1-spec.md, 全部经实测复核):
 
 能力范围:
   ✅ initialize 握手
-  ✅ session/new → session/create
+  ✅ session/new → session/create (可选 model: "GLM-5.3" 字符串按 create 快照
+     catalog 解析并补默认 reasoningLevel, 或完整 ModelSelection 对象; 经
+     session/setModel 应用, 会话创建即锁定模型 — 0.16.9 实测)
   ✅ session/prompt → 事件驱动真流式 (0.14.8+) / 轮询伪流式 (旧协议降级)
   ✅ 流式文本 (model.streaming → agent_message_chunk 逐段)
   ✅ 工具调用展示 (tool.updated → tool_call/tool_call_update 实时)
@@ -69,6 +71,8 @@ CLI 0.16.1 适配 (依据 docs/upgrade-0.16.1-spec.md, 全部经实测复核):
      cancelBackgroundTask/rewindCascade/setModel/setMode
      (rewindCascade 于 0.16 移除; updateRuntimeModelConfig 于 App 3.12.3 的
       同号 0.16.5 构建移除 — CLI 版本号未变而构建内容漂移, 同号不可靠)
+     setModel 于 0.16 后端要 model 对象 {providerId, modelId, options?},
+     旧 modelId 字符串形态在 0.16 后端从未通过 schema (实测 -32602)
   ✅ workspace/* 方法 (0.15.0+): readState/generateText/setDefault{Model,Mode,ThoughtLevel}/
      upsertModelProvider/removeModelProvider/updateProviderRegistry
      (App 3.12.3 的 0.16.5 构建删 7/8, 仅 generateText 存活, 见
@@ -1319,7 +1323,20 @@ class ACPBridge:
         }
 
     def _on_session_new(self, msg_id, params):
-        """ACP session/new → zcode session/create"""
+        """ACP session/new → zcode session/create
+
+        params: {cwd?, mode?, model?}
+          model 可选, 两种形态:
+            - 字符串: catalog 里的 modelId (如 "GLM-5.3")。用 create 快照的
+              settings.model.available 解析成完整 ModelSelection, 并补
+              reasoningLevel=catalog 默认值。
+            - dict: 完整 ModelSelection 对象, 原样透传。
+          提供时 create 成功后内部调 session/setModel 应用; 失败则 session/new
+          整体报错 (客户端明确知道模型没生效)。不把 model 透传给 create 本身:
+          0.16.9 实测 create 的初始 model 形参接受对象但丢 options, turn 阶段
+          报 "Reasoning level is required" (ModelProtocolError); setModel
+          路径无此问题。
+        """
         self.ensure_backend()
         cwd = params.get("cwd") or os.getcwd()
         # 显式 mode 透传; 缺省用 DEFAULT_ACP_MODE (默认 yolo, 可用环境变量
@@ -1353,9 +1370,53 @@ class ACPBridge:
         # ACP sessionId: 用 zcode 的或生成一个
         acp_sid = zcode_sid  # 格式兼容, 直接用
         self.session_map[acp_sid] = zcode_sid
+
+        # 可选 model: 归一后经 setModel 应用 (见 docstring 为何不走 create 形参)
+        model_param = params.get("model")
+        if model_param is not None:
+            selection = self._resolve_session_model(model_param, result)
+            if isinstance(selection, str):
+                return self._error(msg_id, -32602, f"session/new model 参数无效: {selection}")
+            zc_id = self._next_id()
+            resp, _ = self.backend.request(zc_id, "session/setModel",
+                                           {"sessionId": zcode_sid, "model": selection},
+                                           timeout=15)
+            if "error" in resp:
+                return self._passthrough_error(msg_id, "session/setModel", resp)
+            log(f"  session/new model → {selection.get('providerId', '?')}/"
+                f"{selection.get('modelId', '?')}")
+
         log(f"session/new → {acp_sid}")
 
         return {"jsonrpc": "2.0", "id": msg_id, "result": {"sessionId": acp_sid}}
+
+    @staticmethod
+    def _resolve_session_model(model_param, create_result):
+        """把 session/new 的 model 参数归一成 setModel 的 ModelSelection 对象。
+
+        dict (非空) → 原样返回; 字符串 → 在 create 快照 settings.model.available
+        里按 modelId 精确匹配 (多 provider 同名取第一个; 需要指定 provider 的
+        调用方应直接传对象), 并补 options.reasoningLevel=reasoning.defaultLevel
+        (0.16.9 实测部分模型缺它会 ModelProtocolError)。无法解析时返回错误
+        字符串 (调用方转 -32602)。
+        """
+        if isinstance(model_param, dict):
+            return model_param if model_param else "model 对象为空"
+        if not isinstance(model_param, str) or not model_param.strip():
+            return "model 需为非空字符串或 ModelSelection 对象"
+        wanted = model_param.strip()
+        available = (((create_result.get("settings") or {}).get("model") or {})
+                     .get("available")) or []
+        for entry in available:
+            ref = entry.get("ref") or {}
+            if ref.get("modelId") == wanted:
+                selection = {"providerId": ref.get("providerId"),
+                             "modelId": ref.get("modelId")}
+                default_level = (entry.get("reasoning") or {}).get("defaultLevel")
+                if default_level:
+                    selection["options"] = {"reasoningLevel": default_level}
+                return selection
+        return f"modelId '{wanted}' 不在本会话的模型目录中"
 
     def _on_session_list(self, msg_id, params):
         """ACP session/list → zcode session/list, 转成 ACP SessionInfo[]"""
@@ -1699,22 +1760,32 @@ class ACPBridge:
     def _on_session_set_model(self, msg_id, params):
         """扩展 session/setModel → zcode session/setModel: 切换会话模型。
 
-        (0.14.8 旧方法, bridge 之前未暴露, 本次补齐)
-        params: {sessionId, modelId}
+        params: {sessionId, model}
+          model 是 0.16 后端的 ModelSelection 对象, 原样透传:
+          {providerId, modelId, options?: {reasoningLevel}}。
+          0.16.9 实测: 后端 schema 要 model 对象 (旧 modelId 字符串形态必报
+          -32602 "expected object, received undefined / Unrecognized key";
+          故本参数形态是破坏性修正, 旧形态在 0.16 后端上从未成功过); 缺
+          options.reasoningLevel 时部分模型在 turn 阶段报 ModelProtocolError
+          "Reasoning level is required for <provider>/<model>" — 客户端不
+          确定时应改用 session/new 的 model 字符串形态 (按 create 快照的
+          catalog 默认 reasoningLevel 解析, 见 _resolve_session_model)。
         """
         self.ensure_backend()
         acp_sid = params.get("sessionId")
         zcode_sid = self.session_map.get(acp_sid) or acp_sid
-        model_id = params.get("modelId")
-        if not model_id:
-            return self._error(msg_id, -32602, "setModel 需要 modelId")
-        zc_params = {"sessionId": zcode_sid, "modelId": model_id}
+        model = params.get("model")
+        if not isinstance(model, dict) or not model:
+            return self._error(msg_id, -32602,
+                               "setModel 需要 model 对象 "
+                               "({providerId, modelId, options?: {reasoningLevel}})")
+        zc_params = {"sessionId": zcode_sid, "model": model}
         zc_id = self._next_id()
         resp, _ = self.backend.request(zc_id, "session/setModel", zc_params, timeout=15)
         if "error" in resp:
             return self._passthrough_error(msg_id, "session/setModel", resp)
         result = resp.get("result", {})
-        log(f"session/setModel → {model_id}")
+        log(f"session/setModel → {model.get('providerId', '?')}/{model.get('modelId', '?')}")
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
     def _on_session_set_mode(self, msg_id, params):

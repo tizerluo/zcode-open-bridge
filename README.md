@@ -166,8 +166,10 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | `session/updateRuntimeModelConfig` ❌ | 运行时覆盖会话模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}`（0.16 起 `runtimeModel.revision` 必填） |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
 | `session/rewindCascade` ❌ | 级联回退（与 rewind 同 schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
-| `session/setModel` | 切换会话模型 | 0.14.8 | `{sessionId, modelId}` |
+| `session/setModel` | 切换会话模型 | 0.14.8 | `{sessionId, model}` — model 是 ModelSelection 对象 `{providerId, modelId, options?: {reasoningLevel}}`（0.16 后端 schema 要对象；旧 `modelId` 字符串形态从未通过 0.16 schema，已移除）。缺 `reasoningLevel` 时部分模型 turn 阶段报 `ModelProtocolError: Reasoning level is required` |
 | `session/setMode` | 切换会话权限模式 | 0.14.8 | `{sessionId, mode}` |
+
+> **session/new 可选 `model` 参数**：`{cwd, mode?, model?}` —— model 可传 catalog 里的 modelId 字符串（如 `"GLM-5.3"`，按 create 快照解析成完整 ModelSelection 并补默认 reasoningLevel）或完整对象；create 成功后桥内部经 `session/setModel` 应用，失败则 session/new 整体报错。会话创建即锁定模型，不依赖 App 侧「上次使用」默认（headless 场景刚需）。不透传给 create 本身：0.16.9 实测 create 的初始 model 形参丢 options。
 
 > ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除。steer 语义并入 `session/send`（turn 进行中发送即 steer）；rewind 无协议替代，仅剩 slash 命令 `/rewind` 与 `rewind.triggered` 事件。0.16.1 上调用这些方法会收到 `-32601`。
 >
