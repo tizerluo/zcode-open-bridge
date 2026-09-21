@@ -259,7 +259,7 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 | `session/compact` | 压缩对话上下文 | 0.14.8 | `{sessionId}` |
 | `session/steer` ❌ | turn 进行中追加指令（**0.16 已移除**，语义并入 `session/send`） | 0.14.8 | `{sessionId, content}` |
 | `session/setThoughtLevel` | ⭐ 设置思考强度 | 0.15.0 | `{sessionId, thoughtLevel}` |
-| `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, modelId}` / `{sessionId, mode}` |
+| `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, model}` / `{sessionId, mode}`（model 是 ModelSelection 对象 `{providerId, modelId, options?: {reasoningLevel}}`；0.16 后端 schema 要对象，旧 `modelId` 字符串必 -32602。另 `session/new` 支持可选 `model`（字符串按 catalog 解析并补默认 reasoningLevel，或完整对象），创建会话即锁定模型） |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
 | `session/rewindCascade` ❌ | 级联回退（同 rewind schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
 | `session/updateRuntimeModelConfig` ❌ | 运行时覆盖模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}`（0.16 起 `runtimeModel.revision` 必填） |
