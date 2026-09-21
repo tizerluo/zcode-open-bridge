@@ -422,6 +422,42 @@ class TestAppServerMethods(unittest.TestCase):
                 self._call(bridge, "session/new", {"cwd": "/p", "model": bad}),
                 -32602, msg=f"model={bad!r}")
 
+    # ---------- C5: session/new 工具名单透传 (只读监督的会话级前置手段) ----------
+    def test_c5_new_toollists_passthrough_to_create(self):
+        """C5: 非空 toolAllowlist/toolDenylist → 原样并入 session/create 参数。
+        引擎侧映射 PermissionService 硬 deny/allow, 不受权限模式影响 — 0.16 stdio
+        下 mode=plan 是 advisory, toolDenylist 是唯一的会话级只读手段"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": {"sessionId": "sess_tl"}}},
+        })
+        resp = self._call(bridge, "session/new", {
+            "cwd": "/p",
+            "toolDenylist": ["Write", "Edit", "Bash", ""],
+            "toolAllowlist": ["Read", "Grep"],
+        })
+        self._assert_ok(resp)
+        create_params = [c for c in fake.calls
+                         if c["method"] == "session/create"][0]["params"]
+        self.assertEqual(create_params.get("toolDenylist"),
+                         ["Write", "Edit", "Bash"],
+                         "空串条目应被剔除, 其余原样透传")
+        self.assertEqual(create_params.get("toolAllowlist"), ["Read", "Grep"])
+
+    def test_c5a_new_toollists_absent_unchanged(self):
+        """C5a: 不带名单 / 空数组 / 非数组 → create 参数与旧版逐字一致 (向后兼容)"""
+        for params in ({"cwd": "/p"},
+                       {"cwd": "/p", "toolDenylist": [], "toolAllowlist": []},
+                       {"cwd": "/p", "toolDenylist": "Write"}):
+            bridge, fake = self._new_bridge({
+                "session/create": {"response": {"result": {"sessionId": "sess_x"}}},
+            })
+            resp = self._call(bridge, "session/new", params)
+            self._assert_ok(resp, msg=f"params={params!r}")
+            create_params = [c for c in fake.calls
+                             if c["method"] == "session/create"][0]["params"]
+            self.assertNotIn("toolDenylist", create_params, msg=f"params={params!r}")
+            self.assertNotIn("toolAllowlist", create_params, msg=f"params={params!r}")
+
     # ---------- EV: 事件/轮询模式选择 · 事件分支 ----------
     def test_ev1_event_branch_subscribe_deliverykind(self):
         """EV1: subscribe 带 deliveryKind 成功 → 事件模式 (不触发轮询); 轮询分支见 PF3"""

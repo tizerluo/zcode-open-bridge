@@ -1325,7 +1325,7 @@ class ACPBridge:
     def _on_session_new(self, msg_id, params):
         """ACP session/new → zcode session/create
 
-        params: {cwd?, mode?, model?}
+        params: {cwd?, mode?, model?, toolAllowlist?, toolDenylist?}
           model 可选, 两种形态:
             - 字符串: catalog 里的 modelId (如 "GLM-5.3")。用 create 快照的
               settings.model.available 解析成完整 ModelSelection, 并补
@@ -1336,6 +1336,11 @@ class ACPBridge:
           0.16.9 实测 create 的初始 model 形参接受对象但丢 options, turn 阶段
           报 "Reasoning level is required" (ModelProtocolError); setModel
           路径无此问题。
+          toolAllowlist/toolDenylist 可选, 非空字符串数组原样透传给 create。
+          引擎侧映射到 PermissionService 的硬 deny/allow (不经过权限模式判断,
+          hook 也不能覆盖) — 用于只读监督类调用方: 0.16 stdio 下 mode=plan
+          是 advisory, 工具照常自动执行 (实测), 快照 diff 只是事后发现;
+          toolDenylist 是唯一的会话级前置只读手段。
         """
         self.ensure_backend()
         cwd = params.get("cwd") or os.getcwd()
@@ -1346,11 +1351,20 @@ class ACPBridge:
         mode = params.get("mode") or DEFAULT_ACP_MODE
         log(f"session/new: cwd={cwd}, mode={mode}")
 
-        zc_id = self._next_id()
-        resp, _ = self.backend.request(zc_id, "session/create", {
+        create_params = {
             "workspace": {"workspacePath": cwd, "workspaceKey": cwd},
             "mode": mode,
-        }, timeout=15)
+        }
+        for list_key in ("toolAllowlist", "toolDenylist"):
+            list_value = params.get(list_key)
+            if isinstance(list_value, list) and list_value:
+                normalized = [str(item) for item in list_value if str(item).strip()]
+                if normalized:
+                    create_params[list_key] = normalized
+                    log(f"  session/new {list_key} → {len(normalized)} tools")
+
+        zc_id = self._next_id()
+        resp, _ = self.backend.request(zc_id, "session/create", create_params, timeout=15)
 
         if "error" in resp:
             return self._error(msg_id, -32603, f"zcode create failed: {resp['error'].get('message','')}")
