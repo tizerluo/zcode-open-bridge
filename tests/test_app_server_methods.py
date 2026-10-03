@@ -11,6 +11,8 @@ session/requestRuntimePreferences (§3)、subscribe 必传 deliveryKind + 新事
   V   信封: ACP 侧保留 jsonrpc (ACP 协议不变), zcode 侧新信封无 jsonrpc 键
       (V2 params 净身 / V3 真实 request() 帧构造断言)
   C   session/new → session/create (cwd → workspace{workspacePath,workspaceKey})
+      · 可选 model (#52) · toolAllowlist/toolDenylist (#53)
+      · 空模型目录 stderr 告警 (#55, 行为不变; C4k/C4l)
   EV  事件/轮询模式选择 · 事件分支: subscribe 必传 deliveryKind → 事件模式
       (不轮询); 轮询降级分支见 test_polling_failure.py PF3
   PM  协议模式 (legacy/v16): _detect_protocol 三分支探测 + 实锤标志
@@ -524,6 +526,52 @@ class TestAppServerMethods(unittest.TestCase):
         self.assertEqual(set_calls[0]["params"]["model"],
                          {"providerId": "bigmodel-api", "modelId": "GLM-5.3"},
                          "畸形条目跳过, 合法条目不补 reasoningLevel")
+
+    def test_c4k_new_empty_catalog_warns_and_succeeds(self):
+        """C4k (#55): 未传 model + create 快照 available=[] (最小环境) →
+        stderr 一行告警, session/new 仍成功并登记 (行为不变); 传了 model
+        的路径由「模型目录不可用」-32602 覆盖, 不重复告警"""
+        empty_catalog = {"sessionId": "sess_empty",
+                         "settings": {"model": {"available": []}}}
+        bridge, _ = self._new_bridge({
+            "session/create": {"response": {"result": empty_catalog}},
+        })
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            resp = self._call(bridge, "session/new", {"cwd": "/p"})
+        self._assert_ok(resp)
+        self.assertEqual(resp["result"]["sessionId"], "sess_empty")
+        self.assertIn("sess_empty", bridge.session_map, "行为不变: 会话照常登记")
+        self.assertIn("模型目录为空", captured.getvalue())
+        self.assertIn("模型引导", captured.getvalue(), "告警应指向 README 新节")
+
+        # 传 model 的调用方已有明确 -32602, 不再叠加空目录告警
+        bridge2, _ = self._new_bridge({
+            "session/create": {"response": {"result": dict(empty_catalog)}},
+        })
+        captured2 = io.StringIO()
+        with contextlib.redirect_stderr(captured2):
+            resp2 = self._call(bridge2, "session/new",
+                               {"cwd": "/p", "model": "GLM-5.3"})
+        self._assert_error_code(resp2, -32602)
+        self.assertIn("不在本会话的模型目录中", resp2["error"]["message"])
+        self.assertNotIn("模型目录为空", captured2.getvalue(),
+                         "model 参数路径不重复告警")
+
+    def test_c4l_new_nonempty_or_missing_catalog_no_warn(self):
+        """C4l: catalog 非空 / 缺 settings.model.available 键 → 无空目录告警
+        (只认空列表这一确定性信号, 缺失/形状漂移不误报)"""
+        for create_result in (dict(self._CATALOG),
+                              {"sessionId": "sess_nokey"}):
+            with self.subTest(create_result=create_result):
+                bridge, _ = self._new_bridge({
+                    "session/create": {"response": {"result": create_result}},
+                })
+                captured = io.StringIO()
+                with contextlib.redirect_stderr(captured):
+                    resp = self._call(bridge, "session/new", {"cwd": "/p"})
+                self._assert_ok(resp)
+                self.assertNotIn("模型目录为空", captured.getvalue())
 
     # ---------- C5: session/new 工具名单透传 (只读监督的会话级前置手段) ----------
     def test_c5_new_toollists_normalized_into_create(self):
