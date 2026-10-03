@@ -442,6 +442,15 @@ class TestAgentHelp(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        # 隔离宿主耦合: ZCODE_PROVIDER_CONFIG_PATH 在 import 时按真实 HOME
+        # 求值, 未显式传 provider_config_path 的用例 (C12d/e/j) 会读开发者
+        # 真实 ~/.zcode/v2/provider_config.json — 统一指向临时目录 (P3-7)
+        self._saved_pc_path = self.ah.ZCODE_PROVIDER_CONFIG_PATH
+        self.ah.ZCODE_PROVIDER_CONFIG_PATH = os.path.join(
+            self._tmp.name, "no-provider-config.json")
+        self.addCleanup(
+            lambda: setattr(self.ah, "ZCODE_PROVIDER_CONFIG_PATH",
+                            self._saved_pc_path))
 
     def _run_main(self, argv):
         """调 agent-help main(), 返回 (rc, stdout, stderr)。"""
@@ -570,6 +579,87 @@ class TestAgentHelp(unittest.TestCase):
             rc = self.ah.print_injected_env(config_path=cfg_path)
         self.assertEqual(rc, 0)
         self.assertIn("🚫 残留", out.getvalue())
+
+    # ---------- C12k+: 模型解析面 (#55, agent-help 可观测性最小诚实版) ----------
+
+    def _run_print_env(self, cfg_path, provider_cfg_path):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.ah.print_injected_env(
+                config_path=cfg_path, provider_config_path=provider_cfg_path)
+        return rc, out.getvalue()
+
+    def test_c12k_model_resolution_layers(self):
+        """C12k: 层 1 显示 config.json 注入模型; 层 2 显示
+        defaultModelSelection ({providerId}/{modelId}) + providerOrder 首位;
+        免责行明说 runtime 不回报实际模型 id"""
+        cfg_path = _write_isolated_config(self._tmp.name)
+        _isolated_env(self, self._tmp.name)
+        pc_path = os.path.join(self._tmp.name, "provider_config.json")
+        with open(pc_path, "w") as f:
+            json.dump({"config": {
+                "defaultModelSelection": {"providerId": "bigmodel-api",
+                                          "modelId": "GLM-5.3"},
+                "providerOrder": ["bigmodel-api", "other"],
+            }}, f)
+        rc, text = self._run_print_env(cfg_path, pc_path)
+        self.assertEqual(rc, 0)
+        self.assertIn("模型解析面", text)
+        self.assertIn("GLM-5.2", text, "层 1 应显示 config.json 的模型")
+        self.assertIn("bigmodel-api/GLM-5.3", text)
+        self.assertIn("providerOrder 首位", text)
+        self.assertIn("runtime 不回报实际使用的模型 id", text)
+        self.assertIn("env 注入不被读取", text)
+
+    def test_c12m_module_provider_config_path_used(self):
+        """P3-7: 不传 provider_config_path 时读模块常量 (setUp 已隔离到临时
+        目录) — 写哨兵值到该路径, 断言输出反映哨兵而非宿主真实文件"""
+        cfg_path = _write_isolated_config(self._tmp.name)
+        _isolated_env(self, self._tmp.name)
+        with open(self.ah.ZCODE_PROVIDER_CONFIG_PATH, "w") as f:
+            json.dump({"config": {"defaultModelSelection": {
+                "providerId": "sentinel-provider",
+                "modelId": "sentinel-model"}}}, f)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.ah.print_injected_env(config_path=cfg_path)
+        self.assertEqual(rc, 0)
+        self.assertIn("sentinel-provider/sentinel-model", out.getvalue())
+
+    def test_c12l_missing_corrupt_unset_and_malformed(self):
+        """C12l: 文件缺失/JSON 损坏/形状不符 → 「未配置/不可解析」; 键存在但
+        未设置 → 「未设置」; 四态都不抛错且不写文件"""
+        cfg_path = _write_isolated_config(self._tmp.name)
+        _isolated_env(self, self._tmp.name)
+        missing = os.path.join(self._tmp.name, "no-such-provider.json")
+        rc, text = self._run_print_env(cfg_path, missing)
+        self.assertEqual(rc, 0)
+        self.assertIn("(未配置/不可解析)", text)
+        self.assertFalse(os.path.exists(missing), "诊断不得写任何文件")
+
+        corrupt = os.path.join(self._tmp.name, "corrupt.json")
+        with open(corrupt, "w") as f:
+            f.write("{not valid json")
+        rc, text = self._run_print_env(cfg_path, corrupt)
+        self.assertEqual(rc, 0)
+        self.assertIn("(未配置/不可解析)", text)
+        with open(corrupt) as f:
+            self.assertEqual(f.read(), "{not valid json", "诊断不得改文件")
+
+        unset = os.path.join(self._tmp.name, "unset.json")
+        with open(unset, "w") as f:
+            json.dump({"config": {"providerOrder": ["p1", "p2"]}}, f)
+        rc, text = self._run_print_env(cfg_path, unset)
+        self.assertEqual(rc, 0)
+        self.assertIn("(未设置)", text)
+        self.assertIn("p1", text, "providerOrder 首位应显示")
+
+        malformed = os.path.join(self._tmp.name, "malformed.json")
+        with open(malformed, "w") as f:
+            json.dump({"config": {"defaultModelSelection": {"providerId": 123}}}, f)
+        rc, text = self._run_print_env(cfg_path, malformed)
+        self.assertEqual(rc, 0)
+        self.assertIn("(未配置/不可解析)", text)
 
 
 # ============================================================

@@ -229,7 +229,7 @@ PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮�
 
 **canonical model id = `~/.zcode/v2/config.json` 里 `models` 的 key 原样**（如 `GLM-5.3`），**不加 provider 前缀**。`shared/credentials.py`、MCP server、ACP bridge、agent-help 四处统一用原始 id。实测（0.16.1 时代）`zai/GLM-5.2` 前缀形式也兼容，但非 canonical，本项目不使用。
 
-模型面现状（App 3.12.3 的 0.16.5 构建实测，2026-09-17；0.16.9/App 3.14.0 于 2026-09-19 复测一致）：当前 enabled provider（`builtin:zai-coding-plan`）的 models 为 `GLM-5.3` / `GLM-5.3-Flash`（`GLM-5-Turbo` 已由服务端移除；3.10.2 时代为三者）。
+模型面现状（App 3.12.3 的 0.16.5 构建实测，2026-09-17；0.16.9/App 3.14.0 于 2026-09-19 在完整桌面配置机器上复测一致；最小 headless 环境的模型引导见下方新节）：当前 enabled provider（`builtin:zai-coding-plan`）的 models 为 `GLM-5.3` / `GLM-5.3-Flash`（`GLM-5-Turbo` 已由服务端移除；3.10.2 时代为三者）。
 
 ### 凭证注入：显式环境变量优先
 
@@ -247,7 +247,25 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 ```bash
 ./packages/agent-help/zcode-agent-help --print-injected-env
 # 输出每个 key 的来源（config vs env）+ 最终值（apiKey 脱敏）
+# 末尾另附「模型解析面」段: config.json 注入模型 + provider_config.json 的
+# defaultModelSelection/providerOrder 首位 (只读推断, runtime 不回报实际值)
 ```
+
+> ⚠️ **env 注入的边界**：以上 env 覆盖在**有完整 `~/.zcode` 配置的机器上无法验证效果**（配置文件兜底掩盖了 env 是否真的被读取）；而**最小环境实测中 env 完全不被读取**（0.16.9 官方 runtime 报 `Model creation failed`）。桥保留现有注入行为不变（对既有用户无害）；服务器/容器等最小环境还需要完成模型引导，见下一节。
+
+### 最小 headless 环境的模型引导（0.16.9 官方 runtime）
+
+在有完整桌面配置的机器上，模型选择由 `~/.zcode` 下的配置文件兜底，桥的 env 注入是否生效不可分辨；但在**最小环境**（空 HOME、仅入口旁有内置 provider 文件）实测中，官方 runtime **完全不读取** `ZCODE_MODEL` / `ZCODE_BASE_URL` / `ANTHROPIC_API_KEY`，`--prompt` 直接失败退出。服务器/容器部署需要按本节准备：
+
+**前置一步：内置 provider 配置文件**。官方 runtime 按**调用入口路径（不解析符号链接）**探测 `<入口目录>/provider/zcode-builtin.json`。部署时需把官方发行物中的该文件（连同 `provider/` 目录）放到调用入口旁，否则 `--prompt` 报 `无法定位 CLI ZCode Built-in Provider Config`。
+
+**模型选择两条可行路径**：
+1. **宿主机先完成一次模型选择**（推荐）：桌面 App 登录并选择模型会生成 `~/.zcode/v2/provider_config.json` 注册表（含加密凭证），把整个 `~/.zcode` 配置带到服务器即可；也可以在该文件的 `config.defaultModelSelection` 写 `{"providerId": ..., "modelId": ...}` 指定默认模型。
+2. **社区包装器**：`zcode-app-cli`（社区项目，非本项目维护/背书，仅供参考）+ legacy `~/.zcode/cli/config.json` 路径。
+
+**桥的行为**：mcp-server 检测到 `Model creation failed` / `无法定位 CLI ZCode Built-in Provider Config` 两类特征（且既有错误分类为 unknown——限流/配额优先级不变）时，返回 `isError` + 顶层结构化键 `bootstrap.kind`（`model_selection` / `builtin_provider_config`），错误文本前置修复指引；review-gate 把它当**终态**处理（`gave_up` + 告警评论，同 head 不重试、新 head 自动复活），不再 5 次退避后静默放弃。
+
+**ACP 路径**：最小环境 `session/create` 会成功但模型目录为空（`settings.model.available: []`），turn 静默停滞、不产出任何事件。bridge 对空目录打一行 stderr 告警（行为不变，session 照常返回）；建议 ACP 调用方在 `session/new` 传 `model` 参数显式选模型——传字符串 model 且目录为空时会得到明确 `-32602`（对象形态不做 catalog 校验，拿到的是后端 `setModel` 错误），而不是静默停滞。
 
 ### ZCODE_BASE_URL 残留自动检测（切换过 plan 的用户）
 
@@ -315,7 +333,7 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 
 | ZCode CLI 版本 | 支持情况 | ACP bridge 流式 | 扩展方法 |
 |:--------------:|:--------:|:---------------:|:--------:|
-| **0.16.9**（App 3.14.0） | ✅ 完整（核心面与 3.12.3 的 0.16.5 构建一致） | **真流式**（事件驱动） | ✅ session/*（workspace/* 仍删 7/8 仅 generateText 存活；CLI 旗标面增删：`--permission-mode`/`--allow-main-worktree-yolo` 已移除，新增 `--cwd`/`--target-replace` 等，见 agent-help） |
+| **0.16.9**（App 3.14.0） | ✅ 完整（核心面与 3.12.3 的 0.16.5 构建一致；最小 headless 环境的模型引导需配置文件，见[^bootstrap]） | **真流式**（事件驱动） | ✅ session/*（workspace/* 仍删 7/8 仅 generateText 存活；CLI 旗标面增删：`--permission-mode`/`--allow-main-worktree-yolo` 已移除，新增 `--cwd`/`--target-replace` 等，见 agent-help） |
 | **0.16.5**（App 3.12.3，同版本号构建漂移） | ✅ 完整（核心面） | **真流式**（事件驱动） | ✅ session/*（workspace/* 删 7/8 仅 generateText 存活；updateRuntimeModelConfig/updateInteractionPreferences 已删，透传优雅降级） |
 | **0.16.5**（App 3.10.2） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（与 0.16.1 同面；`automation/*` 未实现不受其删除影响） |
 | **0.16.1**（App 3.6.5） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（`steer`/`rewind*`/`prompt/enhance*` 已于 0.16 移除；`updateRuntimeModelConfig` 存活但 `runtimeModel.revision` 必填） |
@@ -330,6 +348,8 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 > 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改——真正断点是反向调用必须应答、事件模型调整、删除 steer/rewind/enhance（信封去 `jsonrpc`/方法 rename/`deliveryKind` 必填同为协议事实，但桥对内本就用这套调用面），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)（含勘误）。0.16.5 已于 2026-09-01 全链路复测（协议面兼容、桥无需代码改动），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。App 3.12.3 的内嵌 CLI `--version` 仍为 0.16.5 但**构建内容漂移**（同号删了 workspace/* 7/8 等，`--version` 不再是唯一兼容性判据），已于 2026-09-17 复测，详见 [docs/recheck-3.12.3.md](docs/recheck-3.12.3.md)。0.16.9（App 3.14.0）已于 2026-09-19 复测：协议面与 3.12.3 的 0.16.5 构建完全一致、桥零改动；变化仅在 CLI 旗标面（`--allowed-tools`/`--max-turns` 连帮助文案一并消失，`--permission-mode`/`--allow-main-worktree-yolo` 移除，新增 `--cwd`/`--target-replace`/`--browser-use` 等），详见 [docs/recheck-3.14.0.md](docs/recheck-3.14.0.md)。
 >
 > ⚠️ **`session/setModel` 对象形态的适用范围**：仅在 0.16.x 验证（0.16.9 实测可用）；≤0.15 后端未验证该形态（历史 `{modelId}` 字符串形态在 0.16 schema 下必拒，故桥已切换为对象形态——这是破坏性变更，旧版调用方需注意）。
+
+[^bootstrap]: 最小 headless 环境不能依赖 env 注入完成模型引导（0.16.9 官方 runtime 实测 env 不被读取），需按「最小 headless 环境的模型引导」准备 `provider/zcode-builtin.json` 与 `~/.zcode/v2/provider_config.json`；否则 mcp-server 返回结构化 `bootstrap` 键、review-gate 按终态告警。
 
 **降级行为**：
 - 轮询降级**仅限 legacy（< 0.16）协议模式**：旧版下 `session/subscribe` 不可用时自动切换到轮询 `session/read`（伪流式）。**0.16+ 不再自动降级**——新协议模式下 subscribe 失败直接报错 `-32603`（"0.16+ 必须走事件订阅；轮询降级仅限旧协议模式"）。

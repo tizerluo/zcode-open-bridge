@@ -20,6 +20,8 @@ test_security_review.py — review 只读护栏 + zcode_security_review 管线�
   - 超时结构化标因 (issue #54): _review_timeout 默认 1200 可配; 子进程超时
     附 timeout 键/锁等待超时附 lock_timeout 键 (均仅 structured_output);
     超时不进限流重试循环 (调用次数=1); 普通路径 result 形状不变
+  - 引导失败结构化键 (#55): Model creation failed / 无法定位 CLI ZCode
+    Built-in Provider Config → bootstrap 键 (三 tool 无条件附加, 不重试)
 
 运行: python3 tests/test_security_review.py
 依赖: 仅 Python 标准库 + zcode-mcp-server 模块
@@ -2070,6 +2072,68 @@ class TestStructuredQuotaOutput(_EnvGuard):
         self.assertEqual(data["result"]["quota_limit"],
                          {"code": 1308, "reset_at": self._TS_1789728196})
         self.assertEqual(data["result"]["usage"], {"total_tokens": 42})
+
+
+class TestBootstrapKeyAllTools(_EnvGuard):
+    """(#55) 引导失败结构化键: 与 structured_output 无关 (不设门控), 三个
+    review tool 形状一致 (对齐 refusal 先例) — gate 只认此键判终态告警。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    # 合成夹具: traceId 全零样式 (不涉真实环境)
+    _STDERR = ("Error: Model creation failed "
+               "(traceId: 00000000-0000-4000-8000-000000000001)")
+
+    def test_bs0_pr_review_attaches_bootstrap(self):
+        """BS0: zcode_pr_review 引导失败 → bootstrap 键 + 指引文本, 不重试"""
+        mod, saved, proj, captured = TestPrReview._patch(
+            self, changed=["app.py"], zcode_rc=1, zcode_stderr=self._STDERR)
+        try:
+            result = mod.tool_zcode_pr_review({"path": proj, "base": "main"})
+        finally:
+            TestPrReview._restore(self, mod, saved)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("bootstrap"), {"kind": "model_selection"})
+        self.assertIn("模型未引导", result["content"][0]["text"])
+        self.assertEqual(captured["zcode_calls"], 1, "引导失败不应重试")
+
+    def test_bs1_security_review_attaches_bootstrap(self):
+        """BS1: zcode_security_review 同一路径附加 (三 tool 形状一致)"""
+        mod, saved, proj = TestSecurityReviewTool._patch_common(self)
+        saved_run = mod.subprocess.run
+        try:
+            mod.subprocess.run = lambda *a, **kw: _FakeCompletedProcess(
+                1, "", self._STDERR)
+            result = mod.tool_zcode_security_review({"path": proj})
+        finally:
+            mod.subprocess.run = saved_run
+            TestSecurityReviewTool._restore_common(self, mod, saved)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("bootstrap"), {"kind": "model_selection"})
+
+    def test_bs2_call_once_serializes_bootstrap(self):
+        """BS2: --call 一次性模式 (gate 消费路径) 的信封不丢 bootstrap 键"""
+        import contextlib
+        import io
+        mod = self.mod
+        stub = {"content": [{"type": "text", "text": "引导失败"}],
+                "isError": True,
+                "bootstrap": {"kind": "builtin_provider_config"}}
+        saved_handler = mod.TOOL_HANDLERS["zcode_pr_review"]
+        mod.TOOL_HANDLERS["zcode_pr_review"] = lambda args: dict(stub)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = mod.call_once(["zcode_pr_review", "{}"])
+        finally:
+            mod.TOOL_HANDLERS["zcode_pr_review"] = saved_handler
+        self.assertEqual(rc, 2)             # isError → exit 2
+        data = json.loads(buf.getvalue())
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["result"]["bootstrap"],
+                         {"kind": "builtin_provider_config"})
 
 
 class TestFindingFingerprint(_EnvGuard):

@@ -454,6 +454,171 @@ class TestRetryLogic(unittest.TestCase):
                 os.environ["ZCODE_BRIDGE_MAX_OUTPUT"] = old_mo
 
 
+class TestBootstrapGuidance(unittest.TestCase):
+    """(#55) 引导失败: 特征错误 → isError + 顶层 bootstrap 键 + 指引文本;
+    只调用 1 次 (unknown 不重试); 限流分类优先级/合法 JSON 防误杀不回归。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    # 合成夹具: traceId 全零样式 (不涉真实环境)
+    _STDERR_MODEL = ("Error: Model creation failed "
+                     "(traceId: 00000000-0000-4000-8000-000000000001)")
+    # 混合文本: 同时含限流与引导特征 — 钉分类互斥 (限流优先)
+    _MIXED_RATE_BOOTSTRAP = (
+        "429 Too Many Requests: Model creation failed "
+        "(traceId: 00000000-0000-4000-8000-000000000000)")
+
+    def _run_review(self, procs, max_retries=None):
+        """patch subprocess.run 返回序列 + sleep no-op + 关锁, 调 zcode_review。
+
+        返回 (result, calls); 仿 TestRetryLogic 的 patch 手法, 独立实现以
+        避免继承触发父类全部用例重复执行。
+        """
+        mod = self.mod
+        calls = {"n": 0}
+        saved_run = mod.subprocess.run
+        saved_sleep = mod.time.sleep
+        saved = {k: os.environ.get(k) for k in
+                 ("ZCODE_BRIDGE_REVIEW_LOCK", "ZCODE_BRIDGE_MAX_RETRIES")}
+
+        def fake_run(*a, **kw):
+            i = calls["n"]
+            calls["n"] += 1
+            return procs[min(i, len(procs) - 1)]
+
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        if max_retries is not None:
+            os.environ["ZCODE_BRIDGE_MAX_RETRIES"] = str(max_retries)
+        mod.subprocess.run = fake_run
+        mod.time.sleep = lambda _s: None
+        try:
+            result = mod.tool_zcode_review({"code": "print('x')"})
+        finally:
+            mod.subprocess.run = saved_run
+            mod.time.sleep = saved_sleep
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return result, calls
+
+    def test_bg0_model_creation_failed_terminal(self):
+        """BG0: exit=1 + stderr 单行 Model creation failed → isError +
+        bootstrap.kind=model_selection + 文本含指引; 恰调用 1 次 (不重试)"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=1, stdout="",
+                                  stderr=self._STDERR_MODEL)])
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("bootstrap"), {"kind": "model_selection"})
+        text = result["content"][0]["text"]
+        self.assertIn("模型未引导", text)
+        self.assertIn("README", text)
+        self.assertIn("原始错误", text, "原始 stderr 摘要应保留")
+        self.assertEqual(calls["n"], 1, "引导失败不重试")
+
+    def test_bg1_deb_variant(self):
+        """BG1: Linux .deb 构建变体 'Select a model before continuing' → 同分类"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(
+                returncode=1, stdout="",
+                stderr="Model creation failed: Select a model before continuing")])
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("bootstrap"), {"kind": "model_selection"})
+        self.assertEqual(calls["n"], 1)
+
+    def test_bg2_builtin_provider_config(self):
+        """BG2: 无法定位 CLI ZCode Built-in Provider Config → 另一分类 + 指引"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(
+                returncode=1, stdout="",
+                stderr="无法定位 CLI ZCode Built-in Provider Config："
+                       "/x/provider/zcode-builtin.json, "
+                       "/y/config/provider/zcode-builtin.json")])
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("bootstrap"),
+                         {"kind": "builtin_provider_config"})
+        self.assertIn("zcode-builtin.json", result["content"][0]["text"])
+        self.assertEqual(calls["n"], 1)
+
+    def test_bg3_valid_json_stdout_not_killed(self):
+        """BG3: 防误杀 — exit=0 + stdout 合法 --json 结果 + stderr 含特征串
+        → 成功, 无 bootstrap 键"""
+        payload = json.dumps({"response": "审查结论: OK"}, ensure_ascii=False)
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=0, stdout=payload,
+                                  stderr=self._STDERR_MODEL)])
+        self.assertNotIn("isError", result)
+        self.assertNotIn("bootstrap", result)
+        self.assertIn("审查结论", result["content"][0]["text"])
+        self.assertEqual(calls["n"], 1)
+
+    def test_bg3b_nonjson_stdout_with_feature_is_error(self):
+        """BG3b (P2-2 行为钉子): exit=0 + stdout 非合法 JSON + stderr 命中
+        引导特征 → 判失败并附 bootstrap 键。这是 stderr_matches 扩展
+        (`or bootstrap is not None`) 的静默行为点 — 删掉该扩展此例会退回
+        "成功空输出" (isError 缺失), 全套测试不再全绿。"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=0, stdout="非 JSON 原始输出",
+                                  stderr=self._STDERR_MODEL)])
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("bootstrap"), {"kind": "model_selection"})
+        self.assertEqual(calls["n"], 1)
+
+    def test_bg4_rate_limit_priority_unchanged(self):
+        """BG4: 分类互斥 — 429 限流仍走重试路径 (不被误判成引导终态),
+        重试后成功且无 bootstrap 键; error_kind 实际值 "rate_limit" (下划线)"""
+        # 分类器级断言: 限流分类优先, 引导特征不命中 (防两类互吃)
+        self.assertEqual(self.mod._parse_provider_error("429 Too Many Requests")
+                         ["error_kind"], "rate_limit")
+        self.assertIsNone(
+            self.mod._parse_bootstrap_error("429 Too Many Requests"))
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=0, stdout="",
+                                  stderr="429 Too Many Requests"),
+            _FakeCompletedProcess(returncode=0, stdout="审查结论: OK", stderr="")])
+        self.assertNotIn("isError", result)
+        self.assertNotIn("bootstrap", result)
+        self.assertEqual(calls["n"], 2, "限流应照旧重试 (共 2 次调用)")
+
+    def test_bg4b_mixed_rate_limit_wins_no_bootstrap(self):
+        """BG4b (P2-1 守卫钉子 a): stderr 同时含限流与引导特征 → 既有分类
+        rate_limit 优先; MAX_RETRIES=0 时不重试、无 bootstrap 键、错误文本
+        不得出现「引导失败」前缀 (删掉 unknown 守卫此例会红)。"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=0, stdout="",
+                                  stderr=self._MIXED_RATE_BOOTSTRAP)],
+            max_retries=0)
+        self.assertTrue(result.get("isError"))
+        self.assertNotIn("bootstrap", result)
+        self.assertNotIn("引导失败", result["content"][0]["text"],
+                         "限流分类优先, 不得按引导失败渲染错误文本")
+        self.assertEqual(calls["n"], 1, "max_retries=0 → 仅 1 次调用")
+
+    def test_bg4c_mixed_rate_limit_retries_without_bootstrap(self):
+        """BG4c (P2-1 守卫钉子 b): 同混合文本在可重试配置下照旧走限流重试
+        (共 2 次调用), 仍无 bootstrap 键 (分类互斥不回归)。"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=0, stdout="",
+                                  stderr=self._MIXED_RATE_BOOTSTRAP),
+            _FakeCompletedProcess(returncode=0, stdout="审查结论: OK", stderr="")],
+            max_retries=1)
+        self.assertNotIn("isError", result)
+        self.assertNotIn("bootstrap", result)
+        self.assertEqual(calls["n"], 2, "限流路径应重试 (共 2 次调用)")
+
+    def test_bg5_unknown_error_no_key(self):
+        """BG5: 其他 unknown 错误 → isError 但不加 bootstrap 键 (形状不变)"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=1, stdout="",
+                                  stderr="some totally unknown failure")])
+        self.assertTrue(result.get("isError"))
+        self.assertNotIn("bootstrap", result)
+        self.assertEqual(calls["n"], 1)
+
+
 class TestEmbeddedProviderError(unittest.TestCase):
     """内嵌 _parse_provider_error 与 shared/provider_error.py 权威版对齐
     (整体 review P1-4: insufficient 拆成 credit/balance 两条, 漏 quota 形态)"""

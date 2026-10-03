@@ -14,7 +14,7 @@ zcode-agent-help — ZCode 开放生态能力说明书
   zcode-agent-help              # 完整能力清单 (JSON)
   zcode-agent-help --pretty     # 人类可读的格式化输出
   zcode-agent-help --section <name>   # 只看某一节
-  zcode-agent-help --print-injected-env   # 诊断: 会注入哪些凭证 (脱敏, issue #3)
+  zcode-agent-help --print-injected-env   # 诊断: 会注入哪些凭证 + 模型解析面 (脱敏, issue #3/#55)
   zcode-agent-help --help       # 本帮助
 
 可用 section:
@@ -33,6 +33,12 @@ ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 # 模型 ID 的 canonical 格式: config 里 models 的 key 原样 (如 GLM-5.3), 不加 provider 前缀。
 # 实测 "zai/GLM-5.2" 也兼容, 但与 shared/credentials.py 权威实现不一致, 故统一用原始 id。
 ZCODE_CREDS_PATH = Path.home() / ".zcode" / "v2" / "config.json"
+
+# issue #55: 模型解析面只读诊断用的官方 runtime 模型注册表 (桌面 App 完成
+# 模型选择后生成)。只读, 不写任何文件; 缺失/损坏按「未配置/不可解析」展示。
+ZCODE_PROVIDER_CONFIG_PATH = (
+    Path.home() / ".zcode" / "v2" / "provider_config.json"
+)
 
 
 def _load_creds_internal(config_path=None):
@@ -84,17 +90,76 @@ def _safe_host(url):
         return None
 
 
-def print_injected_env(config_path=None):
+def _read_model_selection(provider_config_path):
+    """只读 v2/provider_config.json (#55), 返回 (defaultModelSelection 串, providerOrder 首位)。
+
+    容错契约: 文件缺失/权限错误/JSON 损坏/config 形状不符/选择对象缺字段
+    → "(未配置/不可解析)"; defaultModelSelection 键存在但值为 null → "(未设置)"。
+    不抛错、不写任何文件 (可观测性最小诚实版: 只反映配置面, 不探测 runtime)。
+    """
+    unparsable = "(未配置/不可解析)"
+    try:
+        with open(provider_config_path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        # FileNotFoundError/PermissionError → OSError; JSONDecodeError → ValueError
+        return unparsable, None
+    config = data.get("config") if isinstance(data, dict) else None
+    if not isinstance(config, dict):
+        return unparsable, None
+    selection = config.get("defaultModelSelection")
+    if selection is None:
+        selection_text = "(未设置)"
+    elif isinstance(selection, dict):
+        pid = selection.get("providerId")
+        mid = selection.get("modelId")
+        if isinstance(pid, str) and pid and isinstance(mid, str) and mid:
+            selection_text = f"{pid}/{mid}"
+        else:
+            selection_text = unparsable
+    else:
+        selection_text = unparsable
+    order = config.get("providerOrder")
+    order_first = (order[0] if isinstance(order, list) and order
+                   and isinstance(order[0], str) and order[0] else None)
+    return selection_text, order_first
+
+
+def _print_model_resolution(creds, provider_config_path):
+    """打印「模型解析面」段 (只读配置面推断; #55)。
+
+    层 1: v2/config.json enabled provider 的 model (桥的现注入口径);
+    层 2: v2/provider_config.json 的 defaultModelSelection + providerOrder 首位
+          (runtime 兜底解析顺序的第一个)。
+    固定免责: runtime 不回报实际使用的模型 id; 0.16.9 最小环境 env 注入不被
+    读取 — 不承诺做不到的事 (真实模型 id 事后不可得)。
+    """
+    print("\n模型解析面 (只读推断, 不写任何文件):")
+    layer1 = creds.get("ZCODE_MODEL") or "(未配置)"
+    print(f"  1. config.json enabled provider model: {layer1}  (桥的现注入口径)")
+    selection, order_first = _read_model_selection(provider_config_path)
+    print(f"  2. provider_config.json defaultModelSelection: {selection}")
+    print(f"     providerOrder 首位 (runtime 兜底解析顺序): "
+          f"{order_first or '(未设置)'}")
+    print("  免责: runtime 不回报实际使用的模型 id; 以上为配置面推断。"
+          "0.16.9 最小环境 env 注入不被读取 (见 README「最小 headless 环境的模型引导」)")
+
+
+def print_injected_env(config_path=None, provider_config_path=None):
     """打印"如果现在注入凭证, 会用哪些值"(脱敏), 用于不改 config 诊断 model/baseURL 来源。
 
     显示每个 key 的来源 (config vs 显式 env) + 最终值 (apiKey 脱敏),
-    体现"显式 env 优先"的合并语义 (issue #3 子项2)。
+    体现"显式 env 优先"的合并语义 (issue #3 子项2); 末尾附「模型解析面」段
+    (层 1 config.json 模型 + 层 2 provider_config.json 的默认选择/顺序, #55)。
 
     Args:
         config_path: 可选, 自定义配置文件路径 (测试用, 整体 review P2-3)。
                      默认 ZCODE_CREDS_PATH。
+        provider_config_path: 可选, 模型注册表路径 (测试用, #55)。
+                     默认 ZCODE_PROVIDER_CONFIG_PATH。
     """
     path = config_path or ZCODE_CREDS_PATH
+    provider_config_path = provider_config_path or ZCODE_PROVIDER_CONFIG_PATH
     creds = _load_creds_internal(path)
     keys = ["ZCODE_MODEL", "ZCODE_BASE_URL", "ANTHROPIC_API_KEY"]
     if not creds:
@@ -103,6 +168,7 @@ def print_injected_env(config_path=None):
         env_hits = {k: v for k in keys if (v := os.environ.get(k))}
         if not env_hits:
             print(f"❌ 未从 {path} 读取到凭证 (config 无 enabled provider 或文件缺失)")
+            _print_model_resolution(creds, provider_config_path)
             return 0
         print("=== 凭证注入诊断 (显式非空 env 优先于 config; 空串视为未设置) ===")
         print(f"config 源: {path}")
@@ -110,6 +176,7 @@ def print_injected_env(config_path=None):
         for k, v in env_hits.items():
             shown = _mask_key(v) if k == "ANTHROPIC_API_KEY" else v
             print(f"  {k}: {shown}  (来自 env)")
+        _print_model_resolution(creds, provider_config_path)
         return 0
     # 读 config 里所有 provider 的 baseURL (残留检测用, host 集合)
     # 整体 review P1-1: 用与权威版逐字对齐的 _safe_host 构造, 消除诊断与真实注入的漂移
@@ -154,6 +221,7 @@ def print_injected_env(config_path=None):
         else:
             shown = _mask_key(config_val) if k == "ANTHROPIC_API_KEY" else config_val
             print(f"  {k}: {shown}  (来自 config)")
+    _print_model_resolution(creds, provider_config_path)
     return 0
 
 
@@ -209,8 +277,12 @@ NATIVE_CLI = {
         "ANTHROPIC_API_KEY": {"description": "API 密钥 (provider kind 为 anthropic)", "example": "<your-key>"},
     },
     "config_note": (
-        "~/.zcode/cli/config.json 的 model 字段在 --prompt 模式下不被读取, "
-        "必须用上述环境变量配置。凭证可从 ~/.zcode/v2/config.json 动态读取注入。"
+        "~/.zcode/cli/config.json 的 model 字段在 --prompt 模式下不被读取。"
+        "环境变量注入是条件性生效的: 0.16.9 官方 runtime 的最小环境实测中 "
+        "ZCODE_MODEL 等 env 完全不被读取 (报 Model creation failed), 模型选择"
+        "需宿主机 v2/provider_config.json 配置; 完整桌面配置机器上 env 是否"
+        "生效亦未被隔离验证 (见 README「最小 headless 环境的模型引导」)。"
+        "凭证可从 ~/.zcode/v2/config.json 动态读取注入。"
     ),
     "headless_modes": [
         {
@@ -808,7 +880,7 @@ def print_pretty(cap):
     # native_cli
     nc = cap["native_cli"]
     print("▼ 第一层: 原生 Headless CLI")
-    print("  必需环境变量: ZCODE_MODEL / ZCODE_BASE_URL / ANTHROPIC_API_KEY")
+    print("  凭证环境变量 (条件性生效, 详见下): ZCODE_MODEL / ZCODE_BASE_URL / ANTHROPIC_API_KEY")
     print(f"  ⚠ {nc['config_note'][:60]}...\n")
     for m in nc["headless_modes"]:
         print(f"  [{m['name']}] {m['description']}")

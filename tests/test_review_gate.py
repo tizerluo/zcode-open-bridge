@@ -269,13 +269,15 @@ class _OnceEndToEndBase(_GateCase):
             return _CP(returncode=0, stdout=json.dumps(payload), stderr="")
         raise AssertionError(f"未预期命令: {cmd}")
 
-    def _err_stdout(self, text, quota_limit=None, refusal=None):
+    def _err_stdout(self, text, quota_limit=None, refusal=None, bootstrap=None):
         """伪造 mcp-server --call 失败输出 (isError result, 可选结构化键)"""
         result = {"content": [{"type": "text", "text": text}], "isError": True}
         if quota_limit is not None:
             result["quota_limit"] = quota_limit
         if refusal is not None:
             result["refusal"] = refusal
+        if bootstrap is not None:
+            result["bootstrap"] = bootstrap
         return json.dumps({"ok": False, "result": result})
 
     def _write_config(self, repos=("octo/hello",), quota=None):
@@ -752,6 +754,79 @@ class TestRefusalKeyInRunReview(_GateCase):
                 self._cfg(), "/clone", "main", "sha")
         self.assertFalse(ok)
         self.assertIsNone(info["refusal"])
+
+
+class TestBootstrapKeyInRunReview(_GateCase):
+    """引导失败结构化键提取 (#55): 只认 result 顶层 "bootstrap" 键,
+    正文文本不参与判定 (与 refusal 同一伪造面论证)。"""
+
+    def _cfg(self):
+        return self.mod.GateConfig({})
+
+    def _run_with_stdout(self, payload):
+        cp = _CP(returncode=2, stdout=json.dumps(payload), stderr="")
+        with mock.patch.object(self.mod.subprocess, "run",
+                               lambda *a, **kw: cp):
+            return self.mod.run_review(self._cfg(), "/clone", "main", "sha")
+
+    def test_bootstrap_key_extracted(self):
+        """isError result 顶层 bootstrap 键原样透传到 info"""
+        ok, _detail, info = self._run_with_stdout({
+            "ok": False, "result": {
+                "content": [{"type": "text", "text": "引导失败: 模型未引导…"}],
+                "isError": True,
+                "bootstrap": {"kind": "model_selection"}}})
+        self.assertFalse(ok)
+        self.assertEqual(info["bootstrap"], {"kind": "model_selection"})
+
+    def test_bootstrap_key_absent(self):
+        """无 bootstrap 键 → None (普通失败, 照走退避)"""
+        ok, _detail, info = self._run_with_stdout({
+            "ok": False, "result": {
+                "content": [{"type": "text", "text": "炸了"}],
+                "isError": True}})
+        self.assertFalse(ok)
+        self.assertIsNone(info["bootstrap"])
+
+    def test_forged_text_marker_not_bootstrap(self):
+        """正文出现引导特征串但无结构化键 → 不判引导终态 (伪造面):
+        否则任意临时失败可被伪造成终态 (跳过退避 + 假告警)。"""
+        ok, _detail, info = self._run_with_stdout({
+            "ok": False, "result": {
+                "content": [{"type": "text",
+                             "text": "mimosa 回显: Model creation failed"}],
+                "isError": True}})
+        self.assertFalse(ok)
+        self.assertIsNone(info["bootstrap"],
+                          "文本特征不得被解析为引导失败 (只认结构化键)")
+
+    def test_bootstrap_comment_sanitizes_candidate_paths(self):
+        """告警评论脱敏: builtin_provider_config 的 detail 带宿主候选路径时,
+        评论体必须抹成占位符 (评论发到公开 PR, 脱敏红线); 特征前缀保留。"""
+        detail = (
+            "zcode 调用失败: 引导失败 (builtin_provider_config): 内置 provider "
+            "配置缺失…\n"
+            "原始错误: 无法定位 CLI ZCode Built-in Provider Config："
+            "/x/provider/zcode-builtin.json, "
+            "/y/config/provider/zcode-builtin.json")
+        body = self.mod.build_bootstrap_comment("a" * 40, detail)
+        self.assertIn("<候选路径已省略>", body)
+        self.assertNotIn("/x/", body, "候选路径不得进入公开评论")
+        self.assertNotIn("/y/", body, "候选路径不得进入公开评论")
+        self.assertNotIn("/x/provider/zcode-builtin.json", body)
+        self.assertIn("无法定位 CLI ZCode Built-in Provider Config", body,
+                      "特征前缀保留 (人可 grep)")
+        self.assertIn("审查未执行", body)
+
+    def test_subprocess_failure_empty_info(self):
+        """子进程起不来/非 JSON → 空 info (bootstrap=None, 不误判)"""
+        def boom(*a, **kw):
+            raise OSError("gone")
+        with mock.patch.object(self.mod.subprocess, "run", boom):
+            ok, _detail, info = self.mod.run_review(
+                self._cfg(), "/clone", "main", "sha")
+        self.assertFalse(ok)
+        self.assertIsNone(info["bootstrap"])
 
 
 class TestCommentBody(_GateCase):
@@ -1542,6 +1617,96 @@ class TestOnceEndToEnd(_OnceEndToEndBase):
         # 第一轮限流尝试也被 fake 记录: 1 (限流失败) + 1 (补发成功)
         self.assertEqual(len(posts), 2, "限流失败一次 + 补发成功一次")
         self.assertIn("审查被拒绝", posts[-1][2]["body"])
+        self.assertEqual(len(self.mcp_calls), 1)
+
+    def test_bootstrap_terminal_with_alert_comment(self):
+        """引导失败 (#55, 结构化 bootstrap 键): 终态 gave_up + 告警评论,
+        文案区分「环境」问题; 同 head 不重试不重复评论。"""
+        cfg_path = self._write_config()
+        self.mcp_rc = 2
+        self.mcp_stdout = self._err_stdout(
+            "zcode 调用失败: 引导失败 (model_selection): 模型未引导…\n"
+            "原始错误: Error: Model creation failed",
+            bootstrap={"kind": "model_selection"})
+
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "gave_up",
+                         "引导失败应终态, 不进失败退避")
+        self.assertIsNone(entry["verdict"])
+        self.assertEqual(entry.get("bootstrap"), {"kind": "model_selection"})
+        posts = [c for c in self.api_calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 1, "引导失败必须发告警评论")
+        body = posts[0][2]["body"]
+        self.assertIn("环境", body, "文案应点明环境问题")
+        self.assertIn("未引导", body)
+        self.assertNotIn("concerns", body, "不得发成通用 verdict 评论")
+
+        # 同 head 第二轮: 终态不处理 (无第二次审查调用, 也不重复评论)
+        self.assertEqual(self._run_once(cfg_path), 0)
+        self.assertEqual(len(self.mcp_calls), 1, "同 head 引导失败不应重试")
+        self.assertEqual(len([c for c in self.api_calls if c[0] == "POST"]), 1)
+
+    def test_bootstrap_comment_failure_cached_and_reposted(self):
+        """引导告警发不出去 (Retryable): 转 comment_failed 缓存原文;
+        下一轮补发的仍是引导告警 (不是通用 verdict 评论), 补发成功回
+        gave_up 终态 — 补发路径必须识别 bootstrap entry (#55 评审意见 2,
+        与 refusal 的 R1 P1-2 同型)。"""
+        cfg_path = self._write_config()
+        self.mcp_rc = 2
+        self.mcp_stdout = self._err_stdout(
+            "zcode 调用失败: 引导失败 (builtin_provider_config): 内置 provider "
+            "配置缺失…\n原始错误: 无法定位 CLI ZCode Built-in Provider Config",
+            bootstrap={"kind": "builtin_provider_config"})
+        self.comment_behavior = "retryable"
+
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "comment_failed")
+        self.assertEqual(entry.get("bootstrap"), {"kind": "builtin_provider_config"})
+        self.assertTrue(entry.get("report"), "引导告警原文须缓存, 供补发使用")
+
+        # 下一轮 (退避到点): 只补发引导告警, 不重跑审查, 回 gave_up 终态
+        self._force_retry_due()
+        self.comment_behavior = "ok"
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "gave_up", "补发成功应回引导终态")
+        self.assertIsNone(entry["verdict"], "不得翻成 verdict 状态")
+        self.assertEqual(len(self.mcp_calls), 1, "补评论不得重跑 mcp 审查")
+        posts = [c for c in self.api_calls if c[0] == "POST"]
+        # 第一轮失败尝试也被 fake 记录: 1 (失败) + 1 (补发成功)
+        self.assertEqual(len(posts), 2)
+        self.assertIn("审查未执行", posts[-1][2]["body"],
+                      "补发的必须是引导告警评论")
+        self.assertNotIn("concerns", posts[-1][2]["body"],
+                         "不得发成通用 verdict 评论")
+
+    def test_bootstrap_alert_ratelimited_then_reposted(self):
+        """引导告警撞限流: 与 refusal 同口径 — 缓存 + comment_failed
+        (不烧 attempts) + 上抛停轮; 下一轮补发引导告警, 回 gave_up 终态"""
+        cfg_path = self._write_config()
+        self.mcp_rc = 2
+        self.mcp_stdout = self._err_stdout(
+            "zcode 调用失败: 引导失败 (model_selection): 模型未引导…",
+            bootstrap={"kind": "model_selection"})
+        self.comment_behavior = "ratelimited"
+
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "comment_failed",
+                         "限流不得让引导告警丢失 (须转可补发状态)")
+        self.assertEqual(entry.get("bootstrap"), {"kind": "model_selection"})
+        self.assertEqual(entry.get("attempts") or 0, 0, "限流不烧 attempts")
+        self.assertEqual(entry.get("next_retry_at"), 0)
+
+        self.comment_behavior = "ok"
+        self.assertEqual(self._run_once(cfg_path), 0)
+        entry = self._state_entry()
+        self.assertEqual(entry["status"], "gave_up")
+        posts = [c for c in self.api_calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 2, "限流失败一次 + 补发成功一次")
+        self.assertIn("审查未执行", posts[-1][2]["body"])
         self.assertEqual(len(self.mcp_calls), 1)
 
     def test_comment_retryable_failure_caches_and_comment_only_retry(self):

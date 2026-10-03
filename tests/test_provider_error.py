@@ -15,6 +15,8 @@ test_provider_error.py — parse_provider_error 错误解析单测
   PE8 retry-after 边界 (超大值截断到 300, 含堆栈的长文本只看头部)
   PQ0-PQ2 (#35) parse_quota_1308: 1308 结构化解析 (北京 naive → unix 对拍
     review-gate 正则路径钉死值; 1309/10h/坏日期/空文本不命中)
+  PB0-PB3 (#55) parse_bootstrap_error: 模型/provider 未引导特征分类 +
+    指引文案 + 与 mcp-server 内嵌副本逐 fixture 对拍 (C11/C12/C13 模式)
 
 运行: python3 tests/test_provider_error.py
 依赖: 仅 Python 标准库 + shared/provider_error.py
@@ -22,10 +24,12 @@ test_provider_error.py — parse_provider_error 错误解析单测
 
 import os
 import sys
+import types
 import unittest
 
 # shared/provider_error.py 是普通 .py, 直接 import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
+from provider_error import parse_bootstrap_error as pb  # noqa: E402
 from provider_error import parse_provider_error as pe  # noqa: E402
 from provider_error import parse_quota_1308 as pq  # noqa: E402
 
@@ -225,6 +229,75 @@ class TestParseQuota1308(unittest.TestCase):
         """PQ2: 空文本 / None → None (不崩, 调用方不加结构化键)"""
         self.assertIsNone(pq(""))
         self.assertIsNone(pq(None))
+
+
+# ============================================================
+# PB: parse_bootstrap_error (#55) + mcp-server 内嵌副本同步
+# ============================================================
+MCP_SERVER_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "packages", "mcp-server", "zcode-mcp-server"
+)
+
+
+def _load_mcp_module():
+    """exec 加载 mcp-server 单文件 (去掉 __main__ 块), 取内嵌副本。"""
+    mod = types.ModuleType("zcode_mcp_server_pe")
+    mod.__file__ = MCP_SERVER_PATH
+    with open(MCP_SERVER_PATH) as f:
+        code = f.read()
+    exec(code.split('if __name__ == "__main__":')[0], mod.__dict__)
+    return mod
+
+
+class TestParseBootstrapError(unittest.TestCase):
+    """(#55) 引导失败解析: 仅认两类稳定特征; 与 mcp-server 内嵌副本对拍
+    (沿用 C11/C12/C13 的权威版 + 副本同步测试模式)。"""
+
+    # 合成夹具: traceId 全零样式, 路径用泛称 /x /y, 不含真实环境信息
+    FIXTURES = [
+        ("model_selection", "Error: Model creation failed "
+                            "(traceId: 00000000-0000-4000-8000-000000000001)"),
+        ("model_selection",
+         "Model creation failed: Select a model before continuing"),
+        ("builtin_provider_config",
+         "无法定位 CLI ZCode Built-in Provider Config："
+         "/x/provider/zcode-builtin.json, /y/config/provider/zcode-builtin.json"),
+    ]
+    NON_MATCHES = [
+        "",
+        None,
+        "APICallError: Unauthorized",
+        "429 Too Many Requests",
+        "quota exceeded",
+        "这是一段正常的代码审查结论, 没有错误",
+    ]
+
+    def test_pb0_patterns_and_guidance(self):
+        """PB0: 两类特征各自分类, 且带非空指引 (指向 README 新节)"""
+        for kind, text in self.FIXTURES:
+            r = pb(text)
+            self.assertIsNotNone(r, f"应命中引导特征: {text!r}")
+            self.assertEqual(r["kind"], kind, f"分类错误: {text!r}")
+            self.assertTrue(r["guidance"], "指引文案不得为空")
+            self.assertIn("模型引导", r["guidance"], "指引应指向 README 新节")
+
+    def test_pb1_non_matches(self):
+        """PB1: 空/None/限流/配额/普通文本 → None (不误判)"""
+        for text in self.NON_MATCHES:
+            self.assertIsNone(pb(text), f"不应命中引导特征: {text!r}")
+
+    def test_pb2_case_insensitive(self):
+        """PB2: 特征串大小写不敏感 (与限流解析同口径)"""
+        r = pb("model creation FAILED")
+        self.assertIsNotNone(r)
+        self.assertEqual(r["kind"], "model_selection")
+
+    def test_pb3_embedded_copy_parity(self):
+        """PB3: 权威版与 mcp-server 内嵌副本逐 fixture 同结果 (防副本漂移)"""
+        mod = _load_mcp_module()
+        for text in [t for _, t in self.FIXTURES] + self.NON_MATCHES:
+            self.assertEqual(pb(text), mod._parse_bootstrap_error(text),
+                             f"内嵌副本与权威版漂移: {text!r}")
 
 
 if __name__ == "__main__":

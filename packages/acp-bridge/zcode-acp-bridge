@@ -1364,6 +1364,9 @@ class ACPBridge:
           js_add_node_module_dir 与 mcp__node_repl__js*): 仅禁 Write/Edit/
           Bash 会被其 execSync 打穿 (0.16.1 实测先例, 见 README「只读原理」
           与「重要限制」#7)。
+          (#55) 未传 model 且 create 快照的 settings.model.available 为空列表
+          (最小/未引导环境) 时, 打一行 stderr 告警 — ACP 路径 turn 会静默
+          停滞, 空目录是唯一确定性本地信号; 行为不变 (session 照常登记返回)。
         """
         self.ensure_backend()
         cwd = params.get("cwd") or os.getcwd()
@@ -1424,6 +1427,26 @@ class ACPBridge:
 
         # ACP sessionId: 用 zcode 的或生成一个
         acp_sid = zcode_sid  # 格式兼容, 直接用
+
+        # issue #55: 最小/未引导环境的确定性本地信号 — create 快照的模型目录
+        # 为空。ACP 路径 turn 会静默停滞 (无 turn.failed、无错误文本可匹配),
+        # 故在创建时打一行 stderr 告警; 行为不变 (session 照常登记返回)。
+        # 传了 model 参数的调用方由 _resolve_session_model 给出明确 -32602
+        # (目录为空报「不在本会话的模型目录中」), 不重复告警。
+        if model_param is None:
+            # settings 可能是真值非 dict (list/str): 先 isinstance 判空再取键,
+            # 防 AttributeError 把成功路径打成 -32603 (同 _resolve_session_model
+            # 的形态防御思路)
+            _settings = result.get("settings")
+            _settings_model = (_settings.get("model")
+                               if isinstance(_settings, dict) else None)
+            _available = (_settings_model.get("available")
+                          if isinstance(_settings_model, dict) else None)
+            if isinstance(_available, list) and not _available:
+                log("⚠ session/new: 模型目录为空 (settings.model.available=[]), "
+                    "turn 可能停滞无法产出 — 请在宿主机完成模型引导 (见 README"
+                    "「最小 headless 环境的模型引导」), 或 session/new 传 model "
+                    "参数显式选模型")
 
         # 可选 model: 归一后经 setModel 应用 (见 docstring 为何不走 create 形参)
         if model_param is not None:
@@ -1511,8 +1534,14 @@ class ACPBridge:
         if isinstance(model_param, dict):
             return model_param
         wanted = model_param.strip()
-        settings_model = ((create_result.get("settings") or {}).get("model") or {})
-        available = settings_model.get("available")
+        # settings/settings.model 可能是真值非 dict (list/str): 先 isinstance
+        # 判空再取键, 与 session/new 空目录守卫同款防御 — 否则调用方传字符串
+        # model 时会 AttributeError 打成 -32603, 且丢失已创建 sessionId。
+        settings = create_result.get("settings")
+        settings_model = (settings.get("model")
+                          if isinstance(settings, dict) else None)
+        available = (settings_model.get("available")
+                     if isinstance(settings_model, dict) else None)
         # 容错: catalog 缺失/形态漂移按「不可用」报, 非 dict 条目跳过 (防
         # AttributeError 把 -32602 变成 -32603 内部错)
         if not isinstance(available, list):

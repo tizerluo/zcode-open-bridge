@@ -17,6 +17,10 @@ zcode --prompt 失败时, provider 端错误 (限流/配额) 会出现在:
 另有 parse_quota_1308: 解析 z.ai 1308 (5 小时额度耗尽) 业务码的 reset
 时间, 供 mcp-server 结构化输出 (review-gate 的 1308 额度墙消费)。
 
+另有 parse_bootstrap_error: 解析「模型/provider 未引导」特征错误 (issue #55),
+供 mcp-server 返回结构化 bootstrap 键 + 修复指引。调用时机有硬约束 —
+只在 parse_provider_error 判 unknown 后调用 (限流/配额分类优先)。
+
 用法:
   from shared.provider_error import parse_provider_error
   info = parse_provider_error(stderr_text)
@@ -93,6 +97,55 @@ def parse_provider_error(text):
 
     return {"is_rate_limit": False, "is_quota": False, "retry_after_sec": None,
             "error_kind": "unknown", "raw_hint": raw_hint}
+
+
+# ============================================================
+# 引导失败解析 (issue #55): 最小 headless 环境里官方 runtime 未拿到模型/
+# provider 配置时, --prompt 调用以特征错误退出 (实测: exit≠0, stderr 单行)。
+# 两类稳定特征:
+#   - "Model creation failed"            → 模型选择缺失 (含 .deb 变体后缀)
+#   - "无法定位 CLI ZCode Built-in Provider Config" → 入口旁缺内置 provider 文件
+# 调用时机硬约束: 只在 parse_provider_error 判 unknown 后调用 — 限流/配额
+# 分类优先级不变, 杜绝把限流误判成引导问题 (以及反向)。
+# 指引文案为泛称措辞, 指向 README「最小 headless 环境的模型引导」。
+# ============================================================
+BOOTSTRAP_GUIDANCE = {
+    "model_selection": (
+        "模型未引导: 官方 runtime 未读到可用模型 (Model creation failed)。"
+        "请在宿主机先完成一次模型选择 (桌面 App 登录并选择模型), 或配置 "
+        "~/.zcode/v2/provider_config.json 的 config.defaultModelSelection; "
+        "详见 README「最小 headless 环境的模型引导」。"
+    ),
+    "builtin_provider_config": (
+        "内置 provider 配置缺失: 官方 runtime 未在调用入口旁找到 "
+        "provider/zcode-builtin.json。请把官方发行物中的该文件 (连同 "
+        "provider/ 目录) 放到调用入口旁; "
+        "详见 README「最小 headless 环境的模型引导」。"
+    ),
+}
+
+_BOOTSTRAP_PATTERNS = (
+    (re.compile(r"Model creation failed", re.IGNORECASE), "model_selection"),
+    (re.compile(r"无法定位 CLI ZCode Built-in Provider Config"),
+     "builtin_provider_config"),
+)
+
+
+def parse_bootstrap_error(text):
+    """解析「模型/provider 未引导」特征错误, 返回 {"kind", "guidance"} 或 None。
+
+    只认上述两类稳定特征串 (特征串匹配, 任意位置; 覆盖 Linux .deb 构建的
+    "Model creation failed: Select a model before continuing" 变体);
+    不命中返回 None。注意调用时机: 仅在 parse_provider_error 判 unknown 后
+    查 (限流/配额等已分类错误不做引导判定)。
+    """
+    if not text:
+        return None
+    sample = text if len(text) <= 2000 else text[:2000]  # 只看头部, 与限流解析同口径
+    for pattern, kind in _BOOTSTRAP_PATTERNS:
+        if pattern.search(sample):
+            return {"kind": kind, "guidance": BOOTSTRAP_GUIDANCE[kind]}
+    return None
 
 
 def _extract_hint(sample):
