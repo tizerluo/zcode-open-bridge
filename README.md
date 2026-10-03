@@ -171,6 +171,8 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 
 > **session/new 可选 `model` 参数**：`{cwd, mode?, model?}` —— model 可传 catalog 里的 modelId 字符串（如 `"GLM-5.3"`，按 create 快照解析成完整 ModelSelection；catalog 条目带 `reasoning.defaultLevel` 时补默认 reasoningLevel）或完整对象（`{providerId, modelId, options?}`，两者须为非空字符串；`model: null` 或省略等同未提供）。create 成功后桥内部经 `session/setModel` 应用，失败则 session/new 整体报错（文案带已创建的 sessionId，且该会话不登记、不可经 session/prompt 使用）。会话创建即锁定模型，不依赖 App 侧「上次使用」默认（headless 场景刚需）。不透传给 create 本身：0.16.9 实测 create 的初始 model 形参丢 options。
 
+> **session/new 可选 `toolAllowlist` / `toolDenylist` 参数**：字符串数组，在会话创建时按名过滤工具（**工具集注册级物理过滤**：先于权限层、与 mode 无关，hook/权限确认都覆盖不了）。键缺省 → 不写入 create 参数（引擎默认全量工具，与旧行为一致）；键存在 → 每个元素须为 strip 后非空的字符串，非法（非数组、元素非字符串、空串，**含显式 `null`**）本地 `-32602` 且不触碰后端——fail-closed，安全参数不静默忽略。条目 strip 后透传，字面 `[]` 原样透传（空 allowlist = 全部禁用，空 denylist = 无限制）。allow+deny 同传时引擎取**交集且 deny 优先**。用于只读监督：0.16 stdio 下 `mode=plan` 只是 advisory（0.16.1 实测工具照常自动执行，快照 diff 只是事后发现），名单是唯一的会话级前置只读手段；建议同时 deny Node REPL 族（`js` / `js_reset` / `js_add_node_module_dir` / `mcp__node_repl__js*`），否则可经 `execSync` 打穿 `Bash` 黑名单（先例见上文 `zcode_review` 只读原理）。
+
 > ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除。steer 语义并入 `session/send`（turn 进行中发送即 steer）；rewind 无协议替代，仅剩 slash 命令 `/rewind` 与 `rewind.triggered` 事件。0.16.1 上调用这些方法会收到 `-32601`。
 >
 > ℹ️ **0.16 schema 变更**：`session/updateRuntimeModelConfig` 在 0.16.1 仍存活（实测），但 schema 新要求 `runtimeModel.revision`（string）必填。App 3.12.3 的同号 0.16.5 构建已删除该方法（2026-09-17 实测后端返 -32601；0.16.9/App 3.14.0 于 2026-09-19 复测仍删），桥透传时降级为「已移除」文案。
@@ -372,7 +374,7 @@ cp -r skills/zcode-bridge-guide ~/.zcode/skills/
 4. **diff 无内容**：ZCode 协议层不暴露 oldText/newText，只能列文件名。
 5. **GLM-5.2 无推理输出**：思考过程（agent_thought_chunk）在 GLM-5.2 下不触发，需 GLM-5-Turbo（GLM-5.2 为旧默认模型；GLM-5.3 行为未复测。GLM-5-Turbo 已于 App 3.12.3 时代由服务端从 coding-plan provider 下线，此条为历史观察）。
 6. **TUI 不可用**：0.16.1 起 CLI 帮助虽列出 `tui` 命令（无参数即进入 TUI），但独立终端实测仍报错（`Cannot find package '@zcode/tui'`），仅 headless 模式可用。
-7. **⚠️ ACP bridge 默认 `mode=yolo`（权限风险）**：为避免工具调用 turn 卡在权限确认，ACP bridge 的 `session/new` 强制以 `mode=yolo` 创建会话（见 `zcode-acp-bridge` 的 `_on_session_new`）。这意味着任意 prompt 都可能触发**无确认的文件修改和命令执行**。作为编辑器集成时请知悉此风险；现可用 `ZCODE_ACP_DEFAULT_MODE=build` 收紧默认值，且 bridge 启动日志（stderr）会对当前默认 mode 打显眼告警。更完整的方案是实现 ACP↔ZCode 的 permission 转发（本项目 P4b 未实现）。
+7. **⚠️ ACP bridge 默认 `mode=yolo`（权限风险）**：为避免工具调用 turn 卡在权限确认，ACP bridge 的 `session/new` 强制以 `mode=yolo` 创建会话（见 `zcode-acp-bridge` 的 `_on_session_new`）。这意味着任意 prompt 都可能触发**无确认的文件修改和命令执行**。作为编辑器集成时请知悉此风险；现可用 `ZCODE_ACP_DEFAULT_MODE=build` 收紧默认值，且 bridge 启动日志（stderr）会对当前默认 mode 打显眼告警；调用方还可用 `session/new` 的 `toolDenylist` 做会话级前置缓解（工具集注册级物理过滤，与 mode 无关，见「扩展方法」的 session/new 名单说明）。更完整的方案是实现 ACP↔ZCode 的 permission 转发（本项目 P4b 未实现）。
 8. **⚠️ Provider 管理方法涉及 apiKey**：`workspace/upsertModelProvider`、`workspace/updateProviderRegistry` 的 `provider`/`registry` 参数会携带 `apiKey`（可能为 `{source:"inline", value:"sk-..."}` 明文）。ACP bridge 仅整体透传给 ZCode 后端、不读取也不在日志打印其明文；但调用方应自行确保传输通道（stdio）可信，并避免在日志中回显原始参数。（这两个方法已于 App 3.12.3 的 0.16.5 构建删除，本条适用于 3.10.2 及更早构建。）
 9. **⚠️ 事件模式 turn 超时契约（2026-08-08 起）**：`session/prompt` 在事件模式下若 turn 已启动但 120s 未收到完成信号，返回 **JSON-RPC 错误 `-32603`（"事件流超时"）**，而**不是**正常 `stopReason=max_turn_requests`——后者只保留给"turn 从未启动"的场景。ACP client 侧应按此区分「卡死」与「真的太长」（整体 review P1 + 复审 P1-B 的契约变更）。
 

@@ -1330,7 +1330,7 @@ class ACPBridge:
     def _on_session_new(self, msg_id, params):
         """ACP session/new → zcode session/create
 
-        params: {cwd?, mode?, model?}
+        params: {cwd?, mode?, model?, toolAllowlist?, toolDenylist?}
           model 可选, 两种形态:
             - 字符串: catalog 里的 modelId (如 "GLM-5.3")。用 create 快照的
               settings.model.available 解析成完整 ModelSelection, catalog 条目
@@ -1347,6 +1347,23 @@ class ACPBridge:
           model 透传给 create 本身: 0.16.9 实测 create 的初始 model 形参接受
           对象但丢 options, turn 阶段报 "Reasoning level is required"
           (ModelProtocolError); setModel 路径无此问题。
+          toolAllowlist/toolDenylist 可选, 是工具集注册级物理过滤 (0.16.9
+          bundle 证据): 会话创建时按名剔除/限定工具, 先于权限层且与 mode
+          无关 — hook/权限确认都不能覆盖。用于只读监督类调用方: 0.16 stdio
+          下 mode=plan 只是 advisory (0.16.1 实测工具照常自动执行, 快照 diff
+          只是事后发现), 名单是唯一的会话级前置只读手段。校验与归一:
+            - 键缺省 → 不写入 create 参数 (引擎默认全量工具, 与旧行为一致);
+            - 键存在 → 必须是字符串数组且每个元素 strip 后非空, 否则本地
+              -32602 且不触碰后端 (fail-closed: 显式 null/字符串等非法形态
+              不静默忽略, 否则调用方会误以为隔离已生效);
+            - 存 strip 后的值; 字面空数组 [] 原样透传 — 空 allowlist 表示
+              全部禁用, 空 denylist 表示无限制 (引擎语义, 不静默丢弃);
+            - allow 与 deny 同传时引擎取交集且 deny 优先 (deny 中的工具即使
+              在 allow 中也禁用)。
+          只读监督建议同时 deny Node REPL 族 (js/js_reset/
+          js_add_node_module_dir 与 mcp__node_repl__js*): 仅禁 Write/Edit/
+          Bash 会被其 execSync 打穿 (0.16.1 实测先例, 见 README「只读原理」
+          与「重要限制」#7)。
         """
         self.ensure_backend()
         cwd = params.get("cwd") or os.getcwd()
@@ -1356,20 +1373,39 @@ class ACPBridge:
         # 0.16 stdio 下工具自动执行, 参数被忽略)
         mode = params.get("mode") or DEFAULT_ACP_MODE
         log(f"session/new: cwd={cwd}, mode={mode}")
+        # 形状校验必须在 create 之前: 非法参数不触碰后端 (否则先建会话再
+        # 报错, 客户端拿不到 sessionId 也无从收编)。model=null/缺省等同未
+        # 提供; 工具名单只看键是否存在 (显式 null 也按非法拒绝 — 安全开关
+        # fail-closed, 不静默忽略)。
+        create_params = {
+            "workspace": {"workspacePath": cwd, "workspaceKey": cwd},
+            "mode": mode,
+        }
+        for list_key in ("toolAllowlist", "toolDenylist"):
+            if list_key not in params:
+                continue
+            err = self._tool_list_param_error(params[list_key])
+            if err:
+                return self._error(
+                    msg_id, -32602, f"session/new {list_key} 参数无效: {err}")
+            # 条目归一为 strip 后的值; 空数组原样保留 (引擎语义: 空 allowlist
+            # = 全部禁用, 空 denylist = 无限制), 不静默丢弃
+            create_params[list_key] = [item.strip() for item in params[list_key]]
+            log(f"  session/new {list_key} → {len(create_params[list_key])} tools")
 
-        # model 形状校验必须在 create 之前: 非法参数不触碰后端 (否则先建会话再
-        # 报错, 客户端拿不到 sessionId 也无从收编)。null/缺省等同未提供。
         model_param = params.get("model")
         if model_param is not None:
             err = self._model_param_error(model_param)
             if err:
                 return self._error(msg_id, -32602, f"session/new model 参数无效: {err}")
 
+
+        # 校验全部通过才拉起后端: 非法参数连子进程都不启动 (纯本地校验,
+        # "零后端调用"字面成立 — 复审 P3)
+        self.ensure_backend()
+
         zc_id = self._next_id()
-        resp, _ = self.backend.request(zc_id, "session/create", {
-            "workspace": {"workspacePath": cwd, "workspaceKey": cwd},
-            "mode": mode,
-        }, timeout=15)
+        resp, _ = self.backend.request(zc_id, "session/create", create_params, timeout=15)
 
         if "error" in resp:
             return self._error(msg_id, -32603, f"zcode create failed: {resp['error'].get('message','')}")
@@ -1439,6 +1475,25 @@ class ACPBridge:
             return None
         if not isinstance(model_param, str) or not model_param.strip():
             return "model 需为非空字符串 (catalog modelId) 或 ModelSelection 对象"
+        return None
+
+    @staticmethod
+    def _tool_list_param_error(list_value):
+        """session/new 的 toolAllowlist/toolDenylist 形状校验 (create 前调用)。
+
+        键存在时须为数组, 每个元素是 strip 后非空的字符串 — 安全参数
+        fail-closed: 非法形态本地 -32602, 不触碰后端也不静默忽略 (静默忽略
+        会让调用方误以为隔离已生效)。空数组合法 (引擎语义: 空 allowlist =
+        全部禁用, 空 denylist = 无限制), 由调用方原样透传, 本函数不判空。
+        返回错误文案 (含期望形态与实际类型), 合法返回 None。
+        """
+        if not isinstance(list_value, list):
+            return (f"需为字符串数组 (每个元素为 strip 后非空的字符串), "
+                    f"实际为 {type(list_value).__name__}")
+        for index, item in enumerate(list_value):
+            if not isinstance(item, str) or not item.strip():
+                return (f"第 {index} 个元素需为 strip 后非空的字符串, "
+                        f"实际为 {repr(item)[:80]!r} ({type(item).__name__})")
         return None
 
     @staticmethod

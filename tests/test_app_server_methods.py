@@ -525,6 +525,108 @@ class TestAppServerMethods(unittest.TestCase):
                          {"providerId": "bigmodel-api", "modelId": "GLM-5.3"},
                          "畸形条目跳过, 合法条目不补 reasoningLevel")
 
+    # ---------- C5: session/new 工具名单透传 (只读监督的会话级前置手段) ----------
+    def test_c5_new_toollists_normalized_into_create(self):
+        """C5: 合法 toolAllowlist/toolDenylist → 归一 (逐条 strip) 后并入
+        session/create 参数。名单是工具集注册级物理过滤, 先于权限层、与 mode
+        无关 — 0.16 stdio 下 mode=plan 是 advisory, 名单是唯一的会话级只读手段"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": {"sessionId": "sess_tl"}}},
+        })
+        resp = self._call(bridge, "session/new", {
+            "cwd": "/p",
+            "toolDenylist": ["  Write ", "Edit", "Bash"],
+            "toolAllowlist": ["Read ", " Grep"],
+        })
+        self._assert_ok(resp)
+        create_params = [c for c in fake.calls
+                         if c["method"] == "session/create"][0]["params"]
+        self.assertEqual(create_params.get("toolDenylist"),
+                         ["Write", "Edit", "Bash"],
+                         "条目应 strip 后透传")
+        self.assertEqual(create_params.get("toolAllowlist"), ["Read", "Grep"])
+
+    def test_c5a_new_toollists_absent_unchanged(self):
+        """C5a: 两键都不传 → create 参数与旧版逐字段一致 (向后兼容)"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": {"sessionId": "sess_plain"}}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p"})
+        self._assert_ok(resp)
+        create = [c for c in fake.calls if c["method"] == "session/create"]
+        self.assertEqual(create[0]["params"], {
+            "workspace": {"workspacePath": "/p", "workspaceKey": "/p"},
+            "mode": self.mod.DEFAULT_ACP_MODE,
+        }, "不带名单的 create 参数必须与旧调用逐字段一致 (向后兼容)")
+
+    def test_c5b_new_empty_list_passthrough(self):
+        """C5b: 字面空数组 → 原样透传入 create (引擎语义: 空 allowlist = 全部
+        禁用, 空 denylist = 无限制), 不得静默丢弃"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": {"sessionId": "sess_empty"}}},
+        })
+        resp = self._call(bridge, "session/new",
+                          {"cwd": "/p", "toolAllowlist": [], "toolDenylist": []})
+        self._assert_ok(resp)
+        create_params = [c for c in fake.calls
+                         if c["method"] == "session/create"][0]["params"]
+        self.assertEqual(create_params.get("toolAllowlist"), [],
+                         "空 allowlist 应原样透传 (全部禁用语义), 不得丢弃")
+        self.assertEqual(create_params.get("toolDenylist"), [],
+                         "空 denylist 应原样透传 (无限制语义), 不得丢弃")
+
+    def test_c5c_new_toollists_invalid_fail_closed(self):
+        """C5c: 键存在但形态非法 (非数组/元素非字符串/元素空串) → 本地 -32602
+        且零后端调用 (fail-closed, 安全参数不静默忽略)"""
+        for bad in ("Write", 42, None,
+                    ["Write", 123], [None], [["Write"]], ["  "], ["Write", ""]):
+            with self.subTest(bad=bad):
+                bridge, fake = self._new_bridge({
+                    "session/create": {"response": {"result": {"sessionId": "s"}}},
+                })
+                resp = self._call(bridge, "session/new",
+                                  {"cwd": "/p", "toolDenylist": bad})
+                self._assert_error_code(resp, -32602, msg=f"bad={bad!r}")
+                self.assertEqual(fake.calls, [],
+                                 f"非法名单不得发起任何后端调用: {fake.calls}")
+
+    def test_c5d_new_toollists_single_sided(self):
+        """C5d: 只传单边名单 → create 只含该键 (不得凭空生成另一键)"""
+        for key in ("toolAllowlist", "toolDenylist"):
+            with self.subTest(key=key):
+                bridge, fake = self._new_bridge({
+                    "session/create": {"response": {"result": {"sessionId": "s"}}},
+                })
+                resp = self._call(bridge, "session/new",
+                                  {"cwd": "/p", key: ["Read"]})
+                self._assert_ok(resp)
+                create_params = [c for c in fake.calls
+                                 if c["method"] == "session/create"][0]["params"]
+                other = ("toolDenylist" if key == "toolAllowlist"
+                         else "toolAllowlist")
+                self.assertEqual(create_params.get(key), ["Read"])
+                self.assertNotIn(other, create_params,
+                                 "单边名单不得生成另一键")
+
+    def test_c5e_new_toollists_with_model(self):
+        """C5e: 名单与 model 并存 → create 带名单, model 照常经 setModel 应用,
+        成功后会话登记"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG)}},
+        })
+        resp = self._call(bridge, "session/new", {
+            "cwd": "/p", "model": "GLM-5.3",
+            "toolDenylist": ["Write", "Bash", "js"],
+        })
+        self._assert_ok(resp)
+        create_params = [c for c in fake.calls
+                         if c["method"] == "session/create"][0]["params"]
+        self.assertEqual(create_params.get("toolDenylist"),
+                         ["Write", "Bash", "js"])
+        set_calls = [c for c in fake.calls if c["method"] == "session/setModel"]
+        self.assertEqual(len(set_calls), 1, "model 与名单并存时 setModel 照常走")
+        self.assertIn("sess_m", bridge.session_map)
+
     # ---------- EV: 事件/轮询模式选择 · 事件分支 ----------
     def test_ev1_event_branch_subscribe_deliverykind(self):
         """EV1: subscribe 带 deliveryKind 成功 → 事件模式 (不触发轮询); 轮询分支见 PF3"""

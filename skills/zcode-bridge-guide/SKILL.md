@@ -259,11 +259,13 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 | `session/compact` | 压缩对话上下文 | 0.14.8 | `{sessionId}` |
 | `session/steer` ❌ | turn 进行中追加指令（**0.16 已移除**，语义并入 `session/send`） | 0.14.8 | `{sessionId, content}` |
 | `session/setThoughtLevel` | ⭐ 设置思考强度 | 0.15.0 | `{sessionId, thoughtLevel}` |
-| `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, model}` / `{sessionId, mode}`（model 是 ModelSelection 对象 `{providerId, modelId, options?: {reasoningLevel}}`；0.16 后端 schema 要对象，旧 `modelId` 字符串必 -32602，且对象形态仅在 0.16.x 验证、≤0.15 未验证。另 `session/new` 支持可选 `model`（字符串按 catalog 解析，条目带 `reasoning.defaultLevel` 时补；或完整对象；`model: null`/省略等同未提供），创建会话即锁定模型） |
+| `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, model}` / `{sessionId, mode}`（model 是 ModelSelection 对象 `{providerId, modelId, options?: {reasoningLevel}}`；0.16 后端 schema 要对象，旧 `modelId` 字符串必 -32602，且对象形态仅在 0.16.x 验证、≤0.15 未验证。另 `session/new` 支持可选 `model`（字符串按 catalog 解析，条目带 `reasoning.defaultLevel` 时补；或完整对象；`model: null`/省略等同未提供），创建会话即锁定模型；另支持 `toolAllowlist`/`toolDenylist` 工具名单，见下方注） |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
 | `session/rewindCascade` ❌ | 级联回退（同 rewind schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
 | `session/updateRuntimeModelConfig` ❌ | 运行时覆盖模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}`（0.16 起 `runtimeModel.revision` 必填） |
 
+> 🔒 **`session/new` 可选工具名单**：`toolAllowlist` / `toolDenylist`（字符串数组，strip 后非空；非法形态——含显式 `null`——本地 `-32602` 且不碰后端，fail-closed）在创建会话时按名过滤工具：**工具集注册级物理过滤**，先于权限层、与 mode 无关。allow+deny 同传 = 交集且 deny 优先；字面 `[]` 原样透传（空 allowlist = 全部禁用，空 denylist = 无限制）。0.16 stdio 下 `mode=plan` 只是 advisory，只读监督建议用 `toolDenylist` 并同时 deny Node REPL 族（`js` / `js_reset` / `js_add_node_module_dir` / `mcp__node_repl__js*`，防 `execSync` 打穿 `Bash`）。
+>
 > ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除（steer 并入 `session/send`——turn 进行中发送即 steer；rewind 仅剩 slash 命令 `/rewind`），0.16.1 上调用会收到 `-32601`。
 >
 > ℹ️ **0.16 schema 变更**：`session/updateRuntimeModelConfig` 在 0.16.1 仍存活（实测），但 schema 新要求 `runtimeModel.revision`（string）必填。App 3.12.3 的同号 0.16.5 构建已删除该方法（2026-09-17 实测后端返 -32601），桥透传时降级为「已移除」文案。
