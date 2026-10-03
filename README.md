@@ -266,7 +266,7 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 | **项目配置拒审**（issue #49 洞三） | 被审目录链（cwd 到 git 根）存在 `zcode.json` / `.zcode/config.json` 时 **fail-closed 拒审**（`isError` + 顶层结构化 `refusal` 键；review-gate 据此按终态告警处理，不当临时失败重试）——该文件的 `mcp.servers` 会被 zcode 启动时直接 spawn。审查子进程 `--cwd` 恒为隔离沙箱（含空 `.git` 阻断配置上溯），被审仓库根目录经 prompt 以绝对路径提供 | `ZCODE_BRIDGE_TRUST_PROJECT_CONFIG=1` 显式放行可信仓库（`0/false/no/off/disabled` 均视为关） |
 | **provider 错误解析** | 识别 429 / 1302 / `Too Many Requests` / `请求过于频繁` / `retry-after`，区分限流/配额/其他 | — |
 | **有限重试 + 退避** | 仅对**限流**错误重试（配额/Unauthorized 不重试），退避用 retry-after 或指数退避（`2^n+1`） | `ZCODE_BRIDGE_MAX_RETRIES`（默认 3） |
-| **单次调用超时** | review 单次 zcode 调用超时 | `ZCODE_BRIDGE_REVIEW_TIMEOUT`（默认 300s，下限 30s） |
+| **单次调用超时** | review 单次 zcode 调用超时 | `ZCODE_BRIDGE_REVIEW_TIMEOUT`（默认 1200s，下限 30s；旧默认 300s 对 depth=deep 普遍不够——闸门实测两仓中位 305s/409s、57%/71% 超 300s，未显式设值的调用方对 deep 档必然超时，见 #54。review-gate 自身显式设 3600，不受默认值影响） |
 | **code 参数体积上限** | `zcode_review` 的 `code` 参数超过上限即截断，防超大内联代码撑爆调用 | `ZCODE_BRIDGE_CODE_MAX`（默认 500KB） |
 | **zcode 输出体积上限** | zcode stdout 输出超过上限即截断 | `ZCODE_BRIDGE_MAX_OUTPUT`（默认 10MB） |
 
@@ -299,7 +299,7 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 >
 > 实测备注（2026-08-08，GC-8G）：① 独立调用时 mimosa 也会在被扫项目写一个小会话状态文件（`.mimosa/hook-state/sess_*.continue.json`，约 200 字节，无害）——即 bridge 自身的代码路径对被扫目录只读，但 mimosa 引擎会落这个状态文件，说"完全只读"不准确；② 从非登录 shell（systemd unit、cron、`sudo -u` 直调）启动时 PATH 可能不含 `~/.local/bin`，需显式 `export PATH="$HOME/.local/bin:$PATH"` 否则找不到 `zcode`。
 >
-> 并发与阻塞边界（狗食 review P2-4/P2-5）：mimosa 预扫**不在** review 文件锁内（确定性引擎无 LLM 限流问题），只有 zcode 复核阶段持锁——并发扫同一项目时 mimosa 的 hook-state 文件各写各的会话，无冲突。最坏阻塞时长估算：锁等待 300s + 单次调用 `ZCODE_BRIDGE_REVIEW_TIMEOUT`（默认 300s）×（1 + `ZCODE_BRIDGE_MAX_RETRIES` 默认 3）+ 限流退避，极端情况单次 tool 调用可阻塞约 20 分钟；depth=deep 时前面还要再加 mimosa 异步扫描预算（`ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT` 默认 900s）。调用方应把 MCP 超时设到相应量级。
+> 并发与阻塞边界（狗食 review P2-4/P2-5）：mimosa 预扫**不在** review 文件锁内（确定性引擎无 LLM 限流问题），只有 zcode 复核阶段持锁——并发扫同一项目时 mimosa 的 hook-state 文件各写各的会话，无冲突。最坏阻塞时长估算：锁等待 300s + 单次调用 `ZCODE_BRIDGE_REVIEW_TIMEOUT`（默认 1200s）×（1 + `ZCODE_BRIDGE_MAX_RETRIES` 默认 3）+ 限流退避，极端情况单次 tool 调用可阻塞约 85 分钟；depth=deep 时前面还要再加 mimosa 异步扫描预算（`ZCODE_BRIDGE_MIMOSA_DEEP_TIMEOUT` 默认 900s）。调用方应把 MCP 超时设到相应量级——**该默认值是 #54 后按 deep 实测中位（305s/409s）上调的**，代价是挂死子进程占用文件锁的时长随之变长（锁等待仍 300s）。
 
 ### 聚焦审查 prompt 建议
 

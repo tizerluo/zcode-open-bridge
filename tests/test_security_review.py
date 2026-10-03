@@ -176,9 +176,9 @@ class TestReviewCmd(_EnvGuard):
         self.assertIn("只读工具", prompt)
 
     def test_rc4_timeout_env_configurable(self):
-        """RC4: 单次超时由 ZCODE_BRIDGE_REVIEW_TIMEOUT 控制 (默认 300)"""
+        """RC4: 单次超时由 ZCODE_BRIDGE_REVIEW_TIMEOUT 控制 (默认 1200, #54)"""
         mod = self.mod
-        self.assertEqual(mod._review_timeout(), 300)
+        self.assertEqual(mod._review_timeout(), 1200)
         os.environ["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = "60"
         self.assertEqual(mod._review_timeout(), 60)
         os.environ["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = "1"  # clamp 下限 30
@@ -240,6 +240,45 @@ class TestReviewCmd(_EnvGuard):
         self.assertNotIn("isError", result)
         self.assertIn("已截断", captured["content"])
         self.assertLess(len(captured["content"]), 11000, "截断后应在上限附近")
+
+
+class TestTimeoutAttribution(_EnvGuard):
+    """#54: 超时路径的结构化标因 — 与 quota_limit/refusal 同型的顶层附加键。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def _run_with_timeout_exc(self, structured_output):
+        """patch subprocess.run 抛 TimeoutExpired, 直调 _run_zcode_headless。"""
+        mod = self.mod
+
+        def fake_run(cmd, *a, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 0))
+
+        saved = mod.subprocess.run
+        mod.subprocess.run = fake_run
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        try:
+            return mod._run_zcode_headless(
+                ["zcode", "--prompt", "x"], env={}, timeout=5,
+                structured_output=structured_output)
+        finally:
+            mod.subprocess.run = saved
+
+    def test_ta1_timeout_structured_key(self):
+        """TA1: structured_output=True 时超时结果附 timeout 键"""
+        result = self._run_with_timeout_exc(structured_output=True)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("timeout"), {"seconds": 5})
+        self.assertIn("超时 (5s)", result["content"][0]["text"])
+
+    def test_ta2_timeout_plain_shape_unchanged(self):
+        """TA2: structured_output=False 时 result 形状不变 (无 timeout 键)"""
+        result = self._run_with_timeout_exc(structured_output=False)
+        self.assertTrue(result.get("isError"))
+        self.assertNotIn("timeout", result)
+        self.assertNotIn("quota_limit", result)
 
 
 class TestProjectConfigGuard(_EnvGuard):
