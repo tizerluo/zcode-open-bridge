@@ -1534,8 +1534,14 @@ class ACPBridge:
         if isinstance(model_param, dict):
             return model_param
         wanted = model_param.strip()
-        settings_model = ((create_result.get("settings") or {}).get("model") or {})
-        available = settings_model.get("available")
+        # settings/settings.model 可能是真值非 dict (list/str): 先 isinstance
+        # 判空再取键, 与 session/new 空目录守卫同款防御 — 否则调用方传字符串
+        # model 时会 AttributeError 打成 -32603, 且丢失已创建 sessionId。
+        settings = create_result.get("settings")
+        settings_model = (settings.get("model")
+                          if isinstance(settings, dict) else None)
+        available = (settings_model.get("available")
+                     if isinstance(settings_model, dict) else None)
         # 容错: catalog 缺失/形态漂移按「不可用」报, 非 dict 条目跳过 (防
         # AttributeError 把 -32602 变成 -32603 内部错)
         if not isinstance(available, list):

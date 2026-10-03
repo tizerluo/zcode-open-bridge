@@ -801,7 +801,7 @@ class TestBootstrapKeyInRunReview(_GateCase):
                           "文本特征不得被解析为引导失败 (只认结构化键)")
 
     def test_bootstrap_comment_sanitizes_candidate_paths(self):
-        """P3-7 (必修): builtin_provider_config 的 detail 带宿主候选路径时,
+        """告警评论脱敏: builtin_provider_config 的 detail 带宿主候选路径时,
         评论体必须抹成占位符 (评论发到公开 PR, 脱敏红线); 特征前缀保留。"""
         detail = (
             "zcode 调用失败: 引导失败 (builtin_provider_config): 内置 provider "

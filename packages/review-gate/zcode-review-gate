@@ -786,7 +786,7 @@ def build_bootstrap_comment(head_sha, detail):
 
     与拒审告警同型 (终态 + 立即可见), 文案区分: 这是运维/环境问题,
     非 PR 代码问题; 修复指引在 mcp-server 错误文本与 README 新节。
-    脱敏 (P3-7): builtin_provider_config 的 stderr 特征行带宿主候选绝对
+    脱敏: builtin_provider_config 的 stderr 特征行带宿主候选绝对
     路径 ("无法定位 CLI ZCode Built-in Provider Config：<路径1>, <路径2>"),
     评论发到公开 PR 前必须抹掉 — 只保留特征前缀 + 占位符 (原始 detail 仍
     完整保存在本地 state, 不受影响)。

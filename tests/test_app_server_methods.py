@@ -590,6 +590,25 @@ class TestAppServerMethods(unittest.TestCase):
                 self.assertIn("sess_badsettings", bridge.session_map)
                 self.assertNotIn("模型目录为空", captured.getvalue())
 
+    def test_c4n_new_string_model_malformed_settings_32602(self):
+        """C4n: 字符串 model + settings 为真值非 dict → 本地 -32602
+        「模型目录不可用」(带已创建 sessionId 供收编), 而非 AttributeError
+        打成 -32603 内部错; 该会话不登记"""
+        bridge, _ = self._new_bridge({
+            "session/create": {"response": {"result": {
+                "sessionId": "sess_badsettings",
+                "settings": ["bogus"]}}},
+        })
+        resp = self._call(bridge, "session/new",
+                          {"cwd": "/p", "model": "GLM-5.3"})
+        self._assert_error_code(resp, -32602)
+        msg = resp["error"]["message"]
+        self.assertIn("模型目录不可用", msg)
+        self.assertIn("sess_badsettings", msg,
+                      "文案应带已创建 sessionId 供客户端收编")
+        self.assertNotIn("sess_badsettings", bridge.session_map,
+                         "model 未生效的会话不得登记")
+
     # ---------- C5: session/new 工具名单透传 (只读监督的会话级前置手段) ----------
     def test_c5_new_toollists_normalized_into_create(self):
         """C5: 合法 toolAllowlist/toolDenylist → 归一 (逐条 strip) 后并入
