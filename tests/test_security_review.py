@@ -17,6 +17,9 @@ test_security_review.py — review 只读护栏 + zcode_security_review 管线�
     与 gate 正则路径对拍)/非 1308 不加键/isError 文本保留 1308 串 (旧 gate
     兼容)/usage.totalTokens 透传两态/其他 review tool 形状不变/--call 信封
     序列化存活
+  - 超时结构化标因 (issue #54): _review_timeout 默认 1200 可配; 子进程超时
+    附 timeout 键/锁等待超时附 lock_timeout 键 (均仅 structured_output);
+    超时不进限流重试循环 (调用次数=1); 普通路径 result 形状不变
 
 运行: python3 tests/test_security_review.py
 依赖: 仅 Python 标准库 + zcode-mcp-server 模块
@@ -176,9 +179,9 @@ class TestReviewCmd(_EnvGuard):
         self.assertIn("只读工具", prompt)
 
     def test_rc4_timeout_env_configurable(self):
-        """RC4: 单次超时由 ZCODE_BRIDGE_REVIEW_TIMEOUT 控制 (默认 300)"""
+        """RC4: 单次超时由 ZCODE_BRIDGE_REVIEW_TIMEOUT 控制 (默认 1200, #54)"""
         mod = self.mod
-        self.assertEqual(mod._review_timeout(), 300)
+        self.assertEqual(mod._review_timeout(), 1200)
         os.environ["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = "60"
         self.assertEqual(mod._review_timeout(), 60)
         os.environ["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = "1"  # clamp 下限 30
@@ -240,6 +243,86 @@ class TestReviewCmd(_EnvGuard):
         self.assertNotIn("isError", result)
         self.assertIn("已截断", captured["content"])
         self.assertLess(len(captured["content"]), 11000, "截断后应在上限附近")
+
+
+class TestTimeoutAttribution(_EnvGuard):
+    """#54: 超时路径的结构化标因 — 与 quota_limit/refusal 同型的顶层附加键。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_mcp_module()
+
+    def _run_with_timeout_exc(self, structured_output):
+        """patch subprocess.run 抛 TimeoutExpired, 直调 _run_zcode_headless。
+
+        返回 (result, 子进程调用次数) — 计数用于钉住「超时不进限流重试循环」
+        (对齐 SQ1 对 1308 不重试的钉法)。
+        """
+        mod = self.mod
+        calls = []
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 0))
+
+        saved = mod.subprocess.run
+        mod.subprocess.run = fake_run
+        os.environ["ZCODE_BRIDGE_REVIEW_LOCK"] = "0"
+        try:
+            result = mod._run_zcode_headless(
+                ["zcode", "--prompt", "x"], env={}, timeout=5,
+                structured_output=structured_output)
+        finally:
+            mod.subprocess.run = saved
+        return result, len(calls)
+
+    def test_ta1_timeout_structured_key(self):
+        """TA1: structured_output=True 时超时结果附 timeout 键, 且不重试"""
+        result, n = self._run_with_timeout_exc(structured_output=True)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("timeout"), {"seconds": 5})
+        self.assertIn("超时 (5s)", result["content"][0]["text"])
+        self.assertEqual(n, 1, "超时不得进入限流重试循环")
+
+    def test_ta2_timeout_plain_shape_unchanged(self):
+        """TA2: structured_output=False 时 result 形状不变 (无 timeout 键)"""
+        result, n = self._run_with_timeout_exc(structured_output=False)
+        self.assertTrue(result.get("isError"))
+        self.assertNotIn("timeout", result)
+        self.assertNotIn("quota_limit", result)
+        self.assertEqual(n, 1)
+
+    def test_ta3_lock_timeout_structured_key(self):
+        """TA3: 锁等待超时附 lock_timeout 键 (与 timeout 键语义区分), 不起子进程"""
+        mod = self.mod
+
+        class _LockTimeout:
+            def __init__(self, timeout=300):
+                pass
+
+            def __enter__(self):
+                raise TimeoutError("锁等待超时 (300s), 可能有并发 review 在跑")
+
+            def __exit__(self, *a):
+                return False
+
+        def fail_run(*a, **kw):  # 锁失败必须在 spawn 之前, 起了即测试失败
+            raise AssertionError("锁超时路径不应执行 zcode 子进程")
+
+        saved_lock, saved_run = mod.ReviewFileLock, mod.subprocess.run
+        mod.ReviewFileLock = _LockTimeout
+        mod.subprocess.run = fail_run
+        try:
+            result = mod._run_zcode_headless(
+                ["zcode", "--prompt", "x"], env={}, timeout=5,
+                structured_output=True)
+        finally:
+            mod.ReviewFileLock = saved_lock
+            mod.subprocess.run = saved_run
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("lock_timeout"), {"seconds": 300})
+        self.assertNotIn("timeout", result, "锁等待超时不得冒充子进程预算超时")
+        self.assertIn("锁", result["content"][0]["text"])
 
 
 class TestProjectConfigGuard(_EnvGuard):

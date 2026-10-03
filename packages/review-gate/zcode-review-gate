@@ -654,7 +654,8 @@ def run_review(cfg, clone, base_ref, head_sha):
     只做进程调用与结果解包。base 必须带 origin/ 前缀 — mcp-server 的 diff
     是 base...head 三点语法 (merge-base 语义), 引用要指向远端跟踪分支。
     ZCODE_BRIDGE_REVIEW_TIMEOUT 显式透传 ZCODE_REVIEW_TIMEOUT (3600):
-    mcp-server 侧 zcode 审查默认 300s 超时, deep 档远远不够; gate 自身
+    mcp-server 侧未显式设值时默认 1200s (#54, 上限 3600), 对 deep 长尾
+    仍偏紧, 故 gate 仍显式钉 3600; gate 自身
     等子进程的总超时 REVIEW_TIMEOUT 在此基础上再加 120s, 留给 mimosa
     扫描与进程收尾, 防 zcode 报告已出却被 gate 提前掐掉。
 
