@@ -800,6 +800,24 @@ class TestBootstrapKeyInRunReview(_GateCase):
         self.assertIsNone(info["bootstrap"],
                           "文本特征不得被解析为引导失败 (只认结构化键)")
 
+    def test_bootstrap_comment_sanitizes_candidate_paths(self):
+        """P3-7 (必修): builtin_provider_config 的 detail 带宿主候选路径时,
+        评论体必须抹成占位符 (评论发到公开 PR, 脱敏红线); 特征前缀保留。"""
+        detail = (
+            "zcode 调用失败: 引导失败 (builtin_provider_config): 内置 provider "
+            "配置缺失…\n"
+            "原始错误: 无法定位 CLI ZCode Built-in Provider Config："
+            "/x/provider/zcode-builtin.json, "
+            "/y/config/provider/zcode-builtin.json")
+        body = self.mod.build_bootstrap_comment("a" * 40, detail)
+        self.assertIn("<候选路径已省略>", body)
+        self.assertNotIn("/x/", body, "候选路径不得进入公开评论")
+        self.assertNotIn("/y/", body, "候选路径不得进入公开评论")
+        self.assertNotIn("/x/provider/zcode-builtin.json", body)
+        self.assertIn("无法定位 CLI ZCode Built-in Provider Config", body,
+                      "特征前缀保留 (人可 grep)")
+        self.assertIn("审查未执行", body)
+
     def test_subprocess_failure_empty_info(self):
         """子进程起不来/非 JSON → 空 info (bootstrap=None, 不误判)"""
         def boom(*a, **kw):

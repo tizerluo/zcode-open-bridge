@@ -134,7 +134,7 @@ _BOOTSTRAP_PATTERNS = (
 def parse_bootstrap_error(text):
     """解析「模型/provider 未引导」特征错误, 返回 {"kind", "guidance"} 或 None。
 
-    只认上述两类稳定特征串 (前缀匹配, 覆盖 Linux .deb 构建的
+    只认上述两类稳定特征串 (特征串匹配, 任意位置; 覆盖 Linux .deb 构建的
     "Model creation failed: Select a model before continuing" 变体);
     不命中返回 None。注意调用时机: 仅在 parse_provider_error 判 unknown 后
     查 (限流/配额等已分类错误不做引导判定)。

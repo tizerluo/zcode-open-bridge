@@ -243,8 +243,8 @@ def _parse_bootstrap_error(text):
 
     与 shared/provider_error.py.parse_bootstrap_error 逐字同源 (单文件可独立
     运行故内嵌, 副本同步测试在 tests/test_provider_error.py)。只认两类稳定
-    特征串 (前缀匹配, 覆盖 .deb 构建的 "Model creation failed: Select a
-    model before continuing" 变体); 不命中返回 None。
+    特征串 (特征串匹配, 任意位置; 覆盖 .deb 构建的 "Model creation failed:
+    Select a model before continuing" 变体); 不命中返回 None。
     """
     if not text:
         return None
@@ -1284,8 +1284,10 @@ def _run_zcode_headless(cmd, env, timeout, structured_output=False):
     provider 分类为 unknown 且 stderr 命中模型/provider 未引导特征时, result
     顶层无条件(不设 structured_output 门控)附
     "bootstrap": {"kind": "model_selection"|"builtin_provider_config"}
-    (三 tool 形状一致, 对齐 refusal 先例), 错误文本前置修复指引;
-    其余情况下 result 形状保持不变。
+    (三 tool 形状一致, 对齐 refusal 先例), 错误文本前置修复指引。
+    其余情况下 result 形状保持不变 — 例外: rc=0 + stderr 命中引导特征 +
+    stdout 非合法 JSON 结果时同样判失败并附 bootstrap 键 (见下方 has_error
+    判定; 合法 JSON 结果仍按成功处理)。
     """
     # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数。
     # clamp 到 >=0, 防止 ZCODE_BRIDGE_MAX_RETRIES=-1 导致不执行 zcode (Codex P2)
@@ -1310,7 +1312,8 @@ def _run_zcode_headless(cmd, env, timeout, structured_output=False):
                     # 引导失败分类 (#55): 仅在既有 provider 分类判 unknown 后
                     # 查 — 限流/配额优先级不变。命中的 stderr 同样计入
                     # stderr_matches, 沿用"stdout 非合法 --json 结果才算错误"
-                    # 的保守判定 (覆盖 rc=0 + 引导错误只回显到 stdout 的变体)。
+                    # 的保守判定 (覆盖 rc=0 + 错误在 stderr、stdout 非合法
+                    # JSON 的变体)。
                     bootstrap = (_parse_bootstrap_error(result.stderr or "")
                                  if err_info["error_kind"] == "unknown" else None)
                     # has_error 判定 (整体 review P1-1 + 复审 P1-A): stderr 匹配

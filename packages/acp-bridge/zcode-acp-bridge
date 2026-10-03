@@ -1434,7 +1434,12 @@ class ACPBridge:
         # 传了 model 参数的调用方由 _resolve_session_model 给出明确 -32602
         # (目录为空报「不在本会话的模型目录中」), 不重复告警。
         if model_param is None:
-            _settings_model = (result.get("settings") or {}).get("model") or {}
+            # settings 可能是真值非 dict (list/str): 先 isinstance 判空再取键,
+            # 防 AttributeError 把成功路径打成 -32603 (同 _resolve_session_model
+            # 的形态防御思路)
+            _settings = result.get("settings")
+            _settings_model = (_settings.get("model")
+                               if isinstance(_settings, dict) else None)
             _available = (_settings_model.get("available")
                           if isinstance(_settings_model, dict) else None)
             if isinstance(_available, list) and not _available:

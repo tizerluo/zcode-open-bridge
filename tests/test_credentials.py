@@ -442,6 +442,15 @@ class TestAgentHelp(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        # 隔离宿主耦合: ZCODE_PROVIDER_CONFIG_PATH 在 import 时按真实 HOME
+        # 求值, 未显式传 provider_config_path 的用例 (C12d/e/j) 会读开发者
+        # 真实 ~/.zcode/v2/provider_config.json — 统一指向临时目录 (P3-7)
+        self._saved_pc_path = self.ah.ZCODE_PROVIDER_CONFIG_PATH
+        self.ah.ZCODE_PROVIDER_CONFIG_PATH = os.path.join(
+            self._tmp.name, "no-provider-config.json")
+        self.addCleanup(
+            lambda: setattr(self.ah, "ZCODE_PROVIDER_CONFIG_PATH",
+                            self._saved_pc_path))
 
     def _run_main(self, argv):
         """调 agent-help main(), 返回 (rc, stdout, stderr)。"""
@@ -601,6 +610,21 @@ class TestAgentHelp(unittest.TestCase):
         self.assertIn("providerOrder 首位", text)
         self.assertIn("runtime 不回报实际使用的模型 id", text)
         self.assertIn("env 注入不被读取", text)
+
+    def test_c12m_module_provider_config_path_used(self):
+        """P3-7: 不传 provider_config_path 时读模块常量 (setUp 已隔离到临时
+        目录) — 写哨兵值到该路径, 断言输出反映哨兵而非宿主真实文件"""
+        cfg_path = _write_isolated_config(self._tmp.name)
+        _isolated_env(self, self._tmp.name)
+        with open(self.ah.ZCODE_PROVIDER_CONFIG_PATH, "w") as f:
+            json.dump({"config": {"defaultModelSelection": {
+                "providerId": "sentinel-provider",
+                "modelId": "sentinel-model"}}}, f)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.ah.print_injected_env(config_path=cfg_path)
+        self.assertEqual(rc, 0)
+        self.assertIn("sentinel-provider/sentinel-model", out.getvalue())
 
     def test_c12l_missing_corrupt_unset_and_malformed(self):
         """C12l: 文件缺失/JSON 损坏/形状不符 → 「未配置/不可解析」; 键存在但

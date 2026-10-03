@@ -786,7 +786,13 @@ def build_bootstrap_comment(head_sha, detail):
 
     与拒审告警同型 (终态 + 立即可见), 文案区分: 这是运维/环境问题,
     非 PR 代码问题; 修复指引在 mcp-server 错误文本与 README 新节。
+    脱敏 (P3-7): builtin_provider_config 的 stderr 特征行带宿主候选绝对
+    路径 ("无法定位 CLI ZCode Built-in Provider Config：<路径1>, <路径2>"),
+    评论发到公开 PR 前必须抹掉 — 只保留特征前缀 + 占位符 (原始 detail 仍
+    完整保存在本地 state, 不受影响)。
     """
+    detail = re.sub(r"(无法定位 CLI ZCode Built-in Provider Config)[^\n]*",
+                    r"\1：<候选路径已省略>", detail or "")
     return (
         "## ⚠️ 审查未执行（审查环境未引导）\n\n"
         "审查子进程无法启动模型：宿主机未完成模型/provider 配置，或缺少"
@@ -799,7 +805,7 @@ def build_bootstrap_comment(head_sha, detail):
         "- 修复环境后如需立即重审，可推送一个新 commit（或删除 state 中该 "
         "PR 的记录）。\n\n"
         "<details><summary>原始错误输出</summary>\n\n"
-        f"```\n{(detail or '')[:1500]}\n```\n\n</details>"
+        f"```\n{detail[:1500]}\n```\n\n</details>"
     )
 
 

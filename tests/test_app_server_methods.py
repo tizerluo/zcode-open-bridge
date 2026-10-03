@@ -573,6 +573,23 @@ class TestAppServerMethods(unittest.TestCase):
                 self._assert_ok(resp)
                 self.assertNotIn("模型目录为空", captured.getvalue())
 
+    def test_c4m_new_malformed_settings_no_crash(self):
+        """C4m (P3-6): settings 为真值非 dict (list/str/int) → 不 AttributeError,
+        session/new 照常成功、无空目录告警"""
+        for settings in (["bogus"], "bogus", 42):
+            with self.subTest(settings=settings):
+                bridge, _ = self._new_bridge({
+                    "session/create": {"response": {"result": {
+                        "sessionId": "sess_badsettings",
+                        "settings": settings}}},
+                })
+                captured = io.StringIO()
+                with contextlib.redirect_stderr(captured):
+                    resp = self._call(bridge, "session/new", {"cwd": "/p"})
+                self._assert_ok(resp)
+                self.assertIn("sess_badsettings", bridge.session_map)
+                self.assertNotIn("模型目录为空", captured.getvalue())
+
     # ---------- C5: session/new 工具名单透传 (只读监督的会话级前置手段) ----------
     def test_c5_new_toollists_normalized_into_create(self):
         """C5: 合法 toolAllowlist/toolDenylist → 归一 (逐条 strip) 后并入

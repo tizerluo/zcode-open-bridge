@@ -465,6 +465,10 @@ class TestBootstrapGuidance(unittest.TestCase):
     # 合成夹具: traceId 全零样式 (不涉真实环境)
     _STDERR_MODEL = ("Error: Model creation failed "
                      "(traceId: 00000000-0000-4000-8000-000000000001)")
+    # 混合文本: 同时含限流与引导特征 — 钉分类互斥 (限流优先)
+    _MIXED_RATE_BOOTSTRAP = (
+        "429 Too Many Requests: Model creation failed "
+        "(traceId: 00000000-0000-4000-8000-000000000000)")
 
     def _run_review(self, procs, max_retries=None):
         """patch subprocess.run 返回序列 + sleep no-op + 关锁, 调 zcode_review。
@@ -551,6 +555,18 @@ class TestBootstrapGuidance(unittest.TestCase):
         self.assertIn("审查结论", result["content"][0]["text"])
         self.assertEqual(calls["n"], 1)
 
+    def test_bg3b_nonjson_stdout_with_feature_is_error(self):
+        """BG3b (P2-2 行为钉子): exit=0 + stdout 非合法 JSON + stderr 命中
+        引导特征 → 判失败并附 bootstrap 键。这是 stderr_matches 扩展
+        (`or bootstrap is not None`) 的静默行为点 — 删掉该扩展此例会退回
+        "成功空输出" (isError 缺失), 全套测试不再全绿。"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=0, stdout="非 JSON 原始输出",
+                                  stderr=self._STDERR_MODEL)])
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result.get("bootstrap"), {"kind": "model_selection"})
+        self.assertEqual(calls["n"], 1)
+
     def test_bg4_rate_limit_priority_unchanged(self):
         """BG4: 分类互斥 — 429 限流仍走重试路径 (不被误判成引导终态),
         重试后成功且无 bootstrap 键; error_kind 实际值 "rate_limit" (下划线)"""
@@ -566,6 +582,32 @@ class TestBootstrapGuidance(unittest.TestCase):
         self.assertNotIn("isError", result)
         self.assertNotIn("bootstrap", result)
         self.assertEqual(calls["n"], 2, "限流应照旧重试 (共 2 次调用)")
+
+    def test_bg4b_mixed_rate_limit_wins_no_bootstrap(self):
+        """BG4b (P2-1 守卫钉子 a): stderr 同时含限流与引导特征 → 既有分类
+        rate_limit 优先; MAX_RETRIES=0 时不重试、无 bootstrap 键、错误文本
+        不得出现「引导失败」前缀 (删掉 unknown 守卫此例会红)。"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=0, stdout="",
+                                  stderr=self._MIXED_RATE_BOOTSTRAP)],
+            max_retries=0)
+        self.assertTrue(result.get("isError"))
+        self.assertNotIn("bootstrap", result)
+        self.assertNotIn("引导失败", result["content"][0]["text"],
+                         "限流分类优先, 不得按引导失败渲染错误文本")
+        self.assertEqual(calls["n"], 1, "max_retries=0 → 仅 1 次调用")
+
+    def test_bg4c_mixed_rate_limit_retries_without_bootstrap(self):
+        """BG4c (P2-1 守卫钉子 b): 同混合文本在可重试配置下照旧走限流重试
+        (共 2 次调用), 仍无 bootstrap 键 (分类互斥不回归)。"""
+        result, calls = self._run_review([
+            _FakeCompletedProcess(returncode=0, stdout="",
+                                  stderr=self._MIXED_RATE_BOOTSTRAP),
+            _FakeCompletedProcess(returncode=0, stdout="审查结论: OK", stderr="")],
+            max_retries=1)
+        self.assertNotIn("isError", result)
+        self.assertNotIn("bootstrap", result)
+        self.assertEqual(calls["n"], 2, "限流路径应重试 (共 2 次调用)")
 
     def test_bg5_unknown_error_no_key(self):
         """BG5: 其他 unknown 错误 → isError 但不加 bootstrap 键 (形状不变)"""

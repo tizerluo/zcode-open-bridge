@@ -265,7 +265,7 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 **桥的行为**：mcp-server 检测到 `Model creation failed` / `无法定位 CLI ZCode Built-in Provider Config` 两类特征（且既有错误分类为 unknown——限流/配额优先级不变）时，返回 `isError` + 顶层结构化键 `bootstrap.kind`（`model_selection` / `builtin_provider_config`），错误文本前置修复指引；review-gate 把它当**终态**处理（`gave_up` + 告警评论，同 head 不重试、新 head 自动复活），不再 5 次退避后静默放弃。
 
-**ACP 路径**：最小环境 `session/create` 会成功但模型目录为空（`settings.model.available: []`），turn 静默停滞、不产出任何事件。bridge 对空目录打一行 stderr 告警（行为不变，session 照常返回）；建议 ACP 调用方在 `session/new` 传 `model` 参数显式选模型——目录为空时会得到明确 `-32602`，而不是静默停滞。
+**ACP 路径**：最小环境 `session/create` 会成功但模型目录为空（`settings.model.available: []`），turn 静默停滞、不产出任何事件。bridge 对空目录打一行 stderr 告警（行为不变，session 照常返回）；建议 ACP 调用方在 `session/new` 传 `model` 参数显式选模型——传字符串 model 且目录为空时会得到明确 `-32602`（对象形态不做 catalog 校验，拿到的是后端 `setModel` 错误），而不是静默停滞。
 
 ### ZCODE_BASE_URL 残留自动检测（切换过 plan 的用户）
 
