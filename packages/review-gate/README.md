@@ -192,8 +192,9 @@ state 文件（默认 `~/.local/state/zcode-review-gate/state.json`）记录每�
 
 deep 档审查耗时长：gate 起审查子进程时已自动透传
 `ZCODE_BRIDGE_REVIEW_TIMEOUT=3600`，自身等子进程的总超时再加 120s 留给
-mimosa 扫描与进程收尾（=3720），mcp-server 侧不会以默认 300s 提前掐断
-zcode。
+mimosa 扫描与进程收尾（=3720）；mcp-server 未显式设值时的默认是 1200s
+（#54 后按 deep 实测中位上调，上限 3600），对长尾 deep 仍偏紧，故 gate
+仍显式钉 3600。
 
 ## 限制
 

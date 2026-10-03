@@ -1235,9 +1235,9 @@ def _run_zcode_headless(cmd, env, timeout, structured_output=False):
     锁与重试语义见 ReviewFileLock / _parse_provider_error 注释 (issue #3)。
     structured_output=True (仅 zcode_pr_review 用, #35): 失败时若 stderr 命中
     1308 额度错误, result 顶层附 "quota_limit": {"code": 1308, "reset_at":
-    <unix 秒>}; 子进程超时附 "timeout": {"seconds": <int>} (#54); 成功时有
-    usage 时附 "usage": {"total_tokens": <int>}。其余 review tool 的 result
-    形状保持不变。
+    <unix 秒>}; 子进程超时附 "timeout": {"seconds": <int>}; 锁等待超时附
+    "lock_timeout": {"seconds": <int>} (均 #54); 成功时有 usage 时附
+    "usage": {"total_tokens": <int>}。其余 review tool 的 result 形状保持不变。
     """
     # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数。
     # clamp 到 >=0, 防止 ZCODE_BRIDGE_MAX_RETRIES=-1 导致不执行 zcode (Codex P2)
@@ -1331,8 +1331,15 @@ def _run_zcode_headless(cmd, env, timeout, structured_output=False):
             return {"content": [{"type": "text", "text": f"zcode 调用失败: 重试耗尽 {last_err}"}],
                     "isError": True}
     except TimeoutError as e:
-        return {"content": [{"type": "text", "text": f"zcode review 获取锁超时: {e}"}],
-                "isError": True}
+        err_result = {"content": [{"type": "text",
+                                   "text": f"zcode review 获取锁超时: {e}"}],
+                      "isError": True}
+        if structured_output:
+            # #54: 与 timeout 键同型的锁等待标因 — 深审常态 >300s 后, 并发
+            # 直调的第二个 review 会在锁等待耗尽时快速失败 (fail-fast 排队
+            # 而非等待), 调用方据此可区分「稍后重试」与其他失败。
+            err_result["lock_timeout"] = {"seconds": 300}
+        return err_result
 
 
 def _review_timeout():
@@ -1340,10 +1347,12 @@ def _review_timeout():
 
     默认 1200 (#54): 300 对 depth=deep 普遍不够 — deep 复核是多轮「读文件+
     推理」循环, 实测两仓各 21/28 次闸门深审的中位时长为 305s/409s, 57%/71%
-    超 300s; 慢模型 (TTFT 1-3min/请求) 下更甚。300 默认曾让所有未显式设
+    超 300s; 慢模型 (TTFT 1-3min/请求) 下更甚。300 默认曾让未显式设
     ZCODE_BRIDGE_REVIEW_TIMEOUT 的调用方 (人工/agent 的 --call 与 MCP 直调)
-    对 deep 档必然超时 (gate 自身不受影响, 见 review-gate 的显式 3600)。
-    注意代价: 挂死子进程占用 ReviewFileLock 的时长随之变长 (锁等待仍 300s)。
+    对 deep 档多数超时 (gate 自身不受影响, 见 review-gate 的显式 3600)。
+    注意代价: 挂死/长跑子进程占用 ReviewFileLock 的时长随之变长 (锁等待仍
+    300s) — 深审常态已超 300s, 并发直调的第二个 review 会在锁等待耗尽后
+    快速失败 (结构化键 lock_timeout), 由调用方稍后重试, 而非排队等完。
     """
     return max(30, _env_int("ZCODE_BRIDGE_REVIEW_TIMEOUT", 1200, maximum=3600))
 
