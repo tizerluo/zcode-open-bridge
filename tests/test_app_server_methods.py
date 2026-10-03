@@ -323,6 +323,208 @@ class TestAppServerMethods(unittest.TestCase):
         self.assertEqual(len(create), 1)
         self.assertEqual(create[0]["params"].get("mode"), "plan")
 
+    # ---------- C4+: session/new 可选 model (0.16.9 实测) ----------
+    # create 快照的 catalog 形态 (0.16.9 实测 settings.model.available):
+    _CATALOG = {
+        "sessionId": "sess_m",
+        "settings": {"model": {"available": [
+            {"ref": {"providerId": "bigmodel-api", "modelId": "GLM-5.3"},
+             "label": "GLM-5.3", "providerLabel": "bigmodel-api",
+             "reasoning": {"levels": [{"value": "low", "label": "low"},
+                                      {"value": "max", "label": "max"}],
+                           "defaultLevel": "max"}},
+            {"ref": {"providerId": "bigmodel-api", "modelId": "GLM-5.3-Flash"},
+             "label": "GLM-5.3-Flash", "providerLabel": "bigmodel-api"},
+        ]}},
+    }
+
+    def test_c4_new_model_string_resolves_catalog(self):
+        """C4: model 字符串 → 按 create 快照 catalog 解析成 ModelSelection 并补
+        reasoningLevel=defaultLevel, 经 session/setModel 应用 (0.16.9 实测:
+        缺 reasoningLevel 的模型 turn 阶段报 ModelProtocolError; create 的
+        初始 model 形参丢 options, 故必须走 setModel)"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG)}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "GLM-5.3"})
+        self._assert_ok(resp)
+        set_calls = [c for c in fake.calls if c["method"] == "session/setModel"]
+        self.assertEqual(len(set_calls), 1, "model 应恰好触发一次 setModel")
+        self.assertEqual(set_calls[0]["params"]["sessionId"], "sess_m",
+                         "setModel 必须发给 create 返回的会话")
+        self.assertEqual(set_calls[0]["params"]["model"],
+                         {"providerId": "bigmodel-api", "modelId": "GLM-5.3",
+                          "options": {"reasoningLevel": "max"}},
+                         "应补 catalog 默认 reasoningLevel")
+        self.assertEqual(resp["result"]["sessionId"], "sess_m")
+        self.assertIn("sess_m", bridge.session_map,
+                      "model 生效后会话须登记 (注册后移不得破坏成功路径)")
+        self.assertNotIn("model", [c for c in fake.calls
+                                   if c["method"] == "session/create"][0]["params"],
+                         "model 不得透传给 create (create 形参丢 options, 0.16.9 实测)")
+
+    def test_c4a_new_model_string_no_reasoning_entry(self):
+        """C4a: catalog 条目无 reasoning (如 Flash) → 只透 providerId/modelId"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG)}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "GLM-5.3-Flash"})
+        self._assert_ok(resp)
+        set_calls = [c for c in fake.calls if c["method"] == "session/setModel"]
+        self.assertEqual(set_calls[0]["params"]["sessionId"], "sess_m",
+                         "setModel 必须发给 create 返回的会话")
+        self.assertEqual(set_calls[0]["params"]["model"],
+                         {"providerId": "bigmodel-api", "modelId": "GLM-5.3-Flash"})
+
+    def test_c4b_new_model_object_passthrough(self):
+        """C4b: model 对象 → 原样透传给 setModel (调用方自己指定 provider/level)"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG)}},
+        })
+        ref = {"providerId": "other", "modelId": "m1",
+               "options": {"reasoningLevel": "low"}}
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": ref})
+        self._assert_ok(resp)
+        set_calls = [c for c in fake.calls if c["method"] == "session/setModel"]
+        self.assertEqual(set_calls[0]["params"]["sessionId"], "sess_m",
+                         "setModel 必须发给 create 返回的会话")
+        self.assertEqual(set_calls[0]["params"]["model"], ref)
+
+    def test_c4c_new_model_unknown_string(self):
+        """C4c: model 字符串不在 catalog → -32602, 不发 setModel; 文案带已创建
+        sessionId 供客户端收编, 且该会话不登记 session_map (孤儿不可用)"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG)}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "nope"})
+        self._assert_error_code(resp, -32602)
+        self.assertIn("sess_m", resp["error"]["message"],
+                      "catalog 未命中属 create 后失败, 文案须带 sessionId")
+        self.assertEqual([c for c in fake.calls
+                          if c["method"] == "session/setModel"], [],
+                         "解析失败不得调 setModel")
+        self.assertNotIn("sess_m", bridge.session_map,
+                         "model 未生效的会话不得登记 (不能经 session/prompt 使用)")
+
+    def test_c4d_new_set_model_failure_fails_new(self):
+        """C4d: setModel 失败/超时 → session/new 整体报错 (客户端明确知道模型
+        没生效); 文案含 setModel 可定位失败步骤、含 sessionId 供收编, 会话不登记"""
+        for err_resp in ({"error": {"code": -32603,
+                                    "message": "ModelProtocolError: boom"}},
+                         {"error": {"message": "timeout"}}):
+            with self.subTest(err=err_resp):
+                bridge, _ = self._new_bridge({
+                    "session/create": {"response": {"result": dict(self._CATALOG)}},
+                    "session/setModel": {"response": err_resp},
+                })
+                resp = self._call(bridge, "session/new",
+                                  {"cwd": "/p", "model": "GLM-5.3"})
+                self._assert_error_code(resp, -32603)
+                msg = resp["error"]["message"]
+                self.assertIn("setModel", msg, f"应指明 setModel 步骤: {msg}")
+                self.assertIn("sess_m", msg, f"应带已创建的 sessionId: {msg}")
+                self.assertNotIn("sess_m", bridge.session_map,
+                                 "model 未生效的会话不得登记")
+
+    def test_c4e_new_without_model_no_set_model(self):
+        """C4e: 不带 model → 行为与旧版一致 (create 参数逐字段不变), 不触发 setModel"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": {"sessionId": "sess_plain"}}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p"})
+        self._assert_ok(resp)
+        self.assertEqual([c for c in fake.calls
+                          if c["method"] == "session/setModel"], [])
+        create = [c for c in fake.calls if c["method"] == "session/create"]
+        self.assertEqual(create[0]["params"], {
+            "workspace": {"workspacePath": "/p", "workspaceKey": "/p"},
+            "mode": self.mod.DEFAULT_ACP_MODE,
+        }, "不带 model 的 create 参数必须与旧调用逐字段一致 (向后兼容)")
+        self.assertIn("sess_plain", bridge.session_map,
+                      "未指定 model 的会话照常登记 (注册后移不得漏)")
+
+    def test_c4f_new_model_invalid_types(self):
+        """C4f: model 空对象/空串/数字 → -32602; 形状校验在 create 前, 不触碰
+        后端 (A1: 不得先建会话再报错留孤儿)"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG)}},
+        })
+        for bad in ({}, "", 42):
+            self._assert_error_code(
+                self._call(bridge, "session/new", {"cwd": "/p", "model": bad}),
+                -32602, msg=f"model={bad!r}")
+        self.assertEqual(fake.calls, [],
+                         f"非法形态不得发起任何后端调用: {fake.calls}")
+
+    def test_c4g_new_set_model_32601_removed_wording(self):
+        """C4g (D17): session/new 的 model 路径中 setModel 后端 -32601 → 走
+        _passthrough_error 得「已移除 (session/setModel)」文案 (核心 handler 内
+        嵌套调用沿用扩展方法降级约定), 错误码保持 -32601 且带 sessionId"""
+        bridge, _ = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG)}},
+            "session/setModel": {"response": {"error": {
+                "code": -32601, "message": "Method not found"}}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "GLM-5.3"})
+        self._assert_error_code(resp, -32601, "setModel 已删应保持 -32601")
+        msg = resp["error"]["message"]
+        self.assertIn("已移除", msg)
+        self.assertIn("(session/setModel)", msg)
+        self.assertIn("sess_m", msg, "文案须带已创建的 sessionId 供收编")
+        self.assertNotIn("sess_m", bridge.session_map)
+
+    def test_c4h_new_model_object_bad_fields(self):
+        """C4h (B5): 对象形态缺 providerId/modelId (含空串/非字符串) → 本地
+        -32602, create 前拦截不触碰后端 (否则透传后端 -32602 会被改写成 -32603,
+        且先建会话留孤儿)"""
+        for bad in ({"modelId": "m1"},
+                    {"providerId": "bigmodel-api"},
+                    {"providerId": "", "modelId": "m1"},
+                    {"providerId": "bigmodel-api", "modelId": " "},
+                    {"providerId": 42, "modelId": "m1"}):
+            with self.subTest(model=bad):
+                bridge, fake = self._new_bridge({
+                    "session/create": {"response": {"result": dict(self._CATALOG)}},
+                })
+                resp = self._call(bridge, "session/new",
+                                  {"cwd": "/p", "model": bad})
+                self._assert_error_code(resp, -32602, msg=f"model={bad!r}")
+                self.assertEqual(fake.calls, [],
+                                 f"形状非法不得发起 create/setModel: {fake.calls}")
+
+    def test_c4i_new_model_catalog_unavailable(self):
+        """C4i (B7): create 快照无 settings.model.available → 「catalog 不可用」
+        文案 (与「未命中」区分), 且带已创建 sessionId"""
+        bridge, _ = self._new_bridge({
+            "session/create": {"response": {"result": {"sessionId": "sess_m"}}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "GLM-5.3"})
+        self._assert_error_code(resp, -32602)
+        msg = resp["error"]["message"]
+        self.assertIn("模型目录不可用", msg, f"应报 catalog 不可用: {msg}")
+        self.assertIn("sess_m", msg)
+        self.assertNotIn("不在本会话的模型目录中", msg,
+                         "不可用与未命中是两类错误, 文案应区分")
+
+    def test_c4j_new_model_catalog_malformed_entries(self):
+        """C4j (B6): catalog 含非 dict 条目/非 dict ref/非 dict reasoning →
+        跳过不抛 AttributeError, 后续合法条目仍可命中"""
+        catalog = {"sessionId": "sess_m", "settings": {"model": {"available": [
+            "bogus",
+            {"ref": "not-a-dict"},
+            {"ref": {"providerId": "bigmodel-api", "modelId": "GLM-5.3"},
+             "reasoning": "not-a-dict"},
+        ]}}}
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": catalog}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "GLM-5.3"})
+        self._assert_ok(resp)
+        set_calls = [c for c in fake.calls if c["method"] == "session/setModel"]
+        self.assertEqual(set_calls[0]["params"]["model"],
+                         {"providerId": "bigmodel-api", "modelId": "GLM-5.3"},
+                         "畸形条目跳过, 合法条目不补 reasoningLevel")
+
     # ---------- EV: 事件/轮询模式选择 · 事件分支 ----------
     def test_ev1_event_branch_subscribe_deliverykind(self):
         """EV1: subscribe 带 deliveryKind 成功 → 事件模式 (不触发轮询); 轮询分支见 PF3"""
@@ -884,19 +1086,29 @@ class TestAppServerMethods(unittest.TestCase):
         self._assert_error_code(resp, -32602)
 
     def test_m5_set_model_passthrough(self):
-        """M5: setModel 透传 modelId"""
+        """M5: setModel 透传 model 对象 (0.16 后端 schema 要 ModelSelection)"""
         bridge, fake = self._new_bridge()
+        ref = {"providerId": "bigmodel-api", "modelId": "GLM-5.3",
+               "options": {"reasoningLevel": "max"}}
         resp = self._call(bridge, "session/setModel",
-                          {"sessionId": "sess_x", "modelId": "glm-5.2"})
+                          {"sessionId": "sess_x", "model": ref})
         self._assert_ok(resp)
         self.assertEqual(fake.calls[0]["method"], "session/setModel")
-        self.assertEqual(fake.calls[0]["params"]["modelId"], "glm-5.2")
+        self.assertEqual(fake.calls[0]["params"]["model"], ref,
+                         "model 对象应原样透传 (0.16.9 实测形态)")
 
     def test_m5_set_model_missing(self):
-        """M5a: 缺 modelId → -32602"""
+        """M5a: 缺 model (或非对象) → -32602 (旧 modelId 字符串形态已移除:
+        0.16 后端 schema 必拒, 留着只会让调用方误以为已生效)"""
         bridge, _ = self._new_bridge()
-        resp = self._call(bridge, "session/setModel", {"sessionId": "sess_x"})
-        self._assert_error_code(resp, -32602)
+        self._assert_error_code(self._call(bridge, "session/setModel",
+                                           {"sessionId": "sess_x"}), -32602)
+        self._assert_error_code(self._call(bridge, "session/setModel",
+                                           {"sessionId": "sess_x", "modelId": "GLM-5.3"}),
+                                -32602)
+        self._assert_error_code(self._call(bridge, "session/setModel",
+                                           {"sessionId": "sess_x", "model": {}}),
+                                -32602)
 
     def test_m5_set_mode_passthrough(self):
         """M5b: setMode 透传 mode"""

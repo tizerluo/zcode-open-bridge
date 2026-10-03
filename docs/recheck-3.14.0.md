@@ -79,3 +79,10 @@ initialize → session/new → session/prompt 流式完成（`stopReason=end_tur
 - **方法存在性**：空 params 发一次——`-32602`（参数校验）即存活，`-32601` 即已删。
 - **headless**：`zcode --prompt "…" --mode yolo --no-color --json`。
 - **桥端到端**：`ZCODE_BIN` 指向官方构建后按 README 的 ACP bridge 用法跑 initialize → session/new → session/prompt。
+
+## 补遗（2026-10-03，PR #52 合并随附）
+
+- **旧 `{sessionId, modelId}` 形态实测原文**：0.16.9 下 `session/setModel` 发旧形态 → `-32602 "expected object, received undefined; Unrecognized key: modelId"`（后端 schema 要 `model` 对象）——0.16 起该方法从未真正可用。
+- **新对象形态实测可用**：`{sessionId, model: {providerId, modelId, options?:{reasoningLevel}}}` → ok；补 create 快照 catalog 默认 reasoningLevel 后 turn 通过（缺 options 的部分模型 turn 报 `ModelProtocolError: Reasoning level is required`）。
+- **create 快照 catalog 形态**：`result.settings.model.available[]`，条目形如 `{ref: {providerId, modelId}, label, providerLabel, reasoning?: {levels: [{value, label}], defaultLevel}}`。
+- **方法论教训**：§5 的「空 params 返 -32602 即存活」只验存活性、不验参数形态——setModel 的 schema 不匹配正是被它掩盖（存活却 0.16 起从未通过）。参数级兼容性须按真实 payload 实测。由外部贡献者 jasonQin6 在 PR #52 发现并修复。

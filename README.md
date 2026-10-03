@@ -166,8 +166,10 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | `session/updateRuntimeModelConfig` ❌ | 运行时覆盖会话模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}`（0.16 起 `runtimeModel.revision` 必填） |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
 | `session/rewindCascade` ❌ | 级联回退（与 rewind 同 schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
-| `session/setModel` | 切换会话模型 | 0.14.8 | `{sessionId, modelId}` |
+| `session/setModel` | 切换会话模型 | 0.14.8 | `{sessionId, model}` — model 是 ModelSelection 对象 `{providerId, modelId, options?: {reasoningLevel}}`（0.16 后端 schema 要对象；旧 `modelId` 字符串形态从未通过 0.16 schema，已移除）。缺 `reasoningLevel` 时部分模型 turn 阶段报 `ModelProtocolError: Reasoning level is required` |
 | `session/setMode` | 切换会话权限模式 | 0.14.8 | `{sessionId, mode}` |
+
+> **session/new 可选 `model` 参数**：`{cwd, mode?, model?}` —— model 可传 catalog 里的 modelId 字符串（如 `"GLM-5.3"`，按 create 快照解析成完整 ModelSelection；catalog 条目带 `reasoning.defaultLevel` 时补默认 reasoningLevel）或完整对象（`{providerId, modelId, options?}`，两者须为非空字符串；`model: null` 或省略等同未提供）。create 成功后桥内部经 `session/setModel` 应用，失败则 session/new 整体报错（文案带已创建的 sessionId，且该会话不登记、不可经 session/prompt 使用）。会话创建即锁定模型，不依赖 App 侧「上次使用」默认（headless 场景刚需）。不透传给 create 本身：0.16.9 实测 create 的初始 model 形参丢 options。
 
 > ❌ **0.16 已移除**：`session/steer`、`session/rewind`、`session/rewindCascade` 已从 app-server 删除。steer 语义并入 `session/send`（turn 进行中发送即 steer）；rewind 无协议替代，仅剩 slash 命令 `/rewind` 与 `rewind.triggered` 事件。0.16.1 上调用这些方法会收到 `-32601`。
 >
@@ -324,6 +326,8 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 | **< 0.14.5** | ⚠️ 未测 | — | — |
 
 > 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改——真正断点是反向调用必须应答、事件模型调整、删除 steer/rewind/enhance（信封去 `jsonrpc`/方法 rename/`deliveryKind` 必填同为协议事实，但桥对内本就用这套调用面），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)（含勘误）。0.16.5 已于 2026-09-01 全链路复测（协议面兼容、桥无需代码改动），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。App 3.12.3 的内嵌 CLI `--version` 仍为 0.16.5 但**构建内容漂移**（同号删了 workspace/* 7/8 等，`--version` 不再是唯一兼容性判据），已于 2026-09-17 复测，详见 [docs/recheck-3.12.3.md](docs/recheck-3.12.3.md)。0.16.9（App 3.14.0）已于 2026-09-19 复测：协议面与 3.12.3 的 0.16.5 构建完全一致、桥零改动；变化仅在 CLI 旗标面（`--allowed-tools`/`--max-turns` 连帮助文案一并消失，`--permission-mode`/`--allow-main-worktree-yolo` 移除，新增 `--cwd`/`--target-replace`/`--browser-use` 等），详见 [docs/recheck-3.14.0.md](docs/recheck-3.14.0.md)。
+>
+> ⚠️ **`session/setModel` 对象形态的适用范围**：仅在 0.16.x 验证（0.16.9 实测可用）；≤0.15 后端未验证该形态（历史 `{modelId}` 字符串形态在 0.16 schema 下必拒，故桥已切换为对象形态——这是破坏性变更，旧版调用方需注意）。
 
 **降级行为**：
 - 轮询降级**仅限 legacy（< 0.16）协议模式**：旧版下 `session/subscribe` 不可用时自动切换到轮询 `session/read`（伪流式）。**0.16+ 不再自动降级**——新协议模式下 subscribe 失败直接报错 `-32603`（"0.16+ 必须走事件订阅；轮询降级仅限旧协议模式"）。

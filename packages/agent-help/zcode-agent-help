@@ -534,7 +534,10 @@ APP_SERVER = {
          "note": "❌ 0.16 已移除 (调用返 -32601); 无协议替代, 仅剩 slash 命令 /rewind 与 rewind.triggered 事件"},
         {"method": "session/goal", "params": "sessionId, goal?", "note": "0.14.8+: 读/设 session 目标 (新)"},
         {"method": "session/compact", "params": "sessionId", "note": "0.14.8+: 压缩对话上下文 (新)"},
-        {"method": "session/setModel", "params": "sessionId, modelId", "note": "0.14.8+: 切换模型 (新)"},
+        {"method": "session/setModel",
+         "params": "sessionId, model{providerId, modelId, options?:{reasoningLevel}}",
+         "note": "0.14.8+: 切换模型 (新); 0.16 起 schema 要 model 对象 — 旧 modelId 字符串形态必报 "
+                 "-32602 (0.16.9 实测), 缺 reasoningLevel 时部分模型 turn 阶段报 ModelProtocolError"},
         {"method": "session/cancelBackgroundTask", "params": "sessionId, taskId",
          "note": "0.14.8+: 取消后台 Bash 任务 (新)"},
         # ----- 0.15.0 (App 3.2.0) 新增 session 级方法 -----
