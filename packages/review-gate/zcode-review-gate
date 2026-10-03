@@ -664,6 +664,10 @@ def run_review(cfg, clone, base_ref, head_sha):
         命中 1308 才有 (mcp-server 侧已完成北京 naive → unix 转换);
       refusal: str | None — 安全策略拒审 (issue #49 洞三) 时 mcp-server
         护栏写入的原因串 (如 "project_config"), 机器契约只此一处;
+      bootstrap: dict | None — 审查环境未引导 (issue #55, 模型/provider
+        配置缺失) 时 mcp-server 写入的 {"kind": "model_selection"|
+        "builtin_provider_config"}; process_pr 据此走终态告警 (与 refusal
+        同型), 形状校验 (dict + 非空 str kind) 在消费端;
       total_tokens: int — 成功时 usage.total_tokens 透传, 无则 0。
     子进程异常/非 JSON 输出时为空 info。quota_limit 原样透传 (键缺失为
     None), 合法性校验全在消费端 (quota_limit_reset_ts), 这里不猜不修。
@@ -679,7 +683,8 @@ def run_review(cfg, clone, base_ref, head_sha):
            json.dumps(args, ensure_ascii=False)]
     env = dict(os.environ)
     env["ZCODE_BRIDGE_REVIEW_TIMEOUT"] = str(ZCODE_REVIEW_TIMEOUT)
-    info = {"quota_limit": None, "total_tokens": 0, "refusal": None}
+    info = {"quota_limit": None, "total_tokens": 0, "refusal": None,
+            "bootstrap": None}
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=REVIEW_TIMEOUT, env=env)
@@ -699,6 +704,9 @@ def run_review(cfg, clone, base_ref, head_sha):
     # 拒审原因串原样透传 (#49): 只有 mcp-server 的项目配置护栏会写这个键,
     # 正文文本不参与判定 (伪造面, R1 P2-2)
     info["refusal"] = result.get("refusal")
+    # 引导失败键原样透传 (#55): 与 refusal 同理只认结构化键 (文本不参与
+    # 判定); 形状校验见 process_pr 的消费点
+    info["bootstrap"] = result.get("bootstrap")
     usage = result.get("usage")
     if isinstance(usage, dict):
         tokens = usage.get("total_tokens")
@@ -747,6 +755,11 @@ def parse_verdict_marker(report):
 # 终态拒审 (跳过 5 次重试 + 假告警); 结构化键只有 mcp-server 护栏会写。
 # 拒审按终态处理 (gave_up + 🚫 告警评论), 不当临时失败退避重试:
 # 重试不会变, 且 5 次后静默 gave_up 会吞掉"有人在投毒"的信号。
+#
+# 引导失败 (#55) 走同一套终态机制: mcp-server 检测到模型/provider 未配置
+# (模型未引导/内置 provider 文件缺失) 时在 isError result 顶层附
+# "bootstrap": {"kind": ...}。同理由: 环境问题重试不可能自愈, 而 5 次退避后
+# 静默 gave_up 会让"闸门从未真正审查过"无人知晓 — 正是 #55 的动机场景。
 
 
 def build_refusal_comment(head_sha, detail):
@@ -768,11 +781,36 @@ def build_refusal_comment(head_sha, detail):
     )
 
 
-def _post_refusal_alert(cfg, token, entry, key, head_sha, owner, repo,
-                        pr_number, text, now):
-    """发拒审告警评论; 发不出去则缓存原文转 comment_failed 等下轮补发。
+def build_bootstrap_comment(head_sha, detail):
+    """审查环境未引导告警评论体 (#55; 供人工立即看见, 不参与 verdict 解析)。
 
-    两个调用点共用 (首发于拒审分支 / 补发于 comment_failed 重试轮),
+    与拒审告警同型 (终态 + 立即可见), 文案区分: 这是运维/环境问题,
+    非 PR 代码问题; 修复指引在 mcp-server 错误文本与 README 新节。
+    """
+    return (
+        "## ⚠️ 审查未执行（审查环境未引导）\n\n"
+        "审查子进程无法启动模型：宿主机未完成模型/provider 配置，或缺少"
+        "内置 provider 配置文件（`provider/zcode-builtin.json`）——属**运维/"
+        "环境问题，非本 PR 代码问题**。修复指引见 zcode-open-bridge README"
+        "「最小 headless 环境的模型引导」（mcp-server 返回的错误文本中附有"
+        "同样的指引）。\n\n"
+        f"- head: `{(head_sha or '')[:12]}`\n"
+        "- 同 head 不再重试；推送新 commit 会自动重新触发审查。\n"
+        "- 修复环境后如需立即重审，可推送一个新 commit（或删除 state 中该 "
+        "PR 的记录）。\n\n"
+        "<details><summary>原始错误输出</summary>\n\n"
+        f"```\n{(detail or '')[:1500]}\n```\n\n</details>"
+    )
+
+
+def _post_terminal_alert(cfg, token, entry, key, head_sha, owner, repo,
+                         pr_number, text, now, builder):
+    """发终态告警评论 (拒审/审查环境未引导); 失败则缓存原文转 comment_failed。
+
+    调用点共用 (首发于终态判定分支 / 补发于 comment_failed 重试轮),
+    builder 决定评论文案 (build_refusal_comment / build_bootstrap_comment);
+    补发轮凭 entry 的 refusal/bootstrap 字段选回同一 builder — 走通用补评论
+    路径会把终态告警销毁成 verdict "concerns" 评论并错误翻转状态。
     失败口径与正常评论路径一致:
       - RateLimited (R1 P1-1): 仓级事件不烧 attempts, 缓存 + comment_failed
         后上抛停本轮 — 早期版本只捕 Retryable/RepoHard, RateLimited 穿透时
@@ -783,12 +821,12 @@ def _post_refusal_alert(cfg, token, entry, key, head_sha, owner, repo,
     comment_failed, 状态见 entry)。
     """
     if not (cfg.comment_enabled and token):
-        log(f"{key}: 拒审告警未发 (评论禁用或无 token), 详见 state/日志")
+        log(f"{key}: 终态告警未发 (评论禁用或无 token), 详见 state/日志")
         return False
     try:
         resp = post_comment(token, cfg.github_api, owner, repo, pr_number,
-                            build_refusal_comment(head_sha, text))
-        log(f"{key}: 拒审告警已发布 {(resp or {}).get('html_url') or ''}")
+                            builder(head_sha, text))
+        log(f"{key}: 终态告警已发布 {(resp or {}).get('html_url') or ''}")
         return True
     except RateLimited:
         entry["report"] = text[:cfg.comment_max_body]
@@ -797,7 +835,7 @@ def _post_refusal_alert(cfg, token, entry, key, head_sha, owner, repo,
         raise
     except (RetryableError, RepoHardError) as e:
         entry["report"] = text[:cfg.comment_max_body]
-        mark_failure(entry, f"拒审告警发布失败: {e}", now, cfg,
+        mark_failure(entry, f"终态告警发布失败: {e}", now, cfg,
                      status="comment_failed")
         return False
 
@@ -1407,19 +1445,29 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
         # 审查已成功过、只是评论没发出去: 沿用缓存结果, 只补评论,
         # 不为一次评论失败重跑昂贵的 zcode 审查
         report = entry["report"]
+        alert_builder = None
         if entry.get("refusal"):
             # 拒审告警补发 (R1 P1-2): 缓存的是拒审文案, 补发的必须是拒审
             # 评论 — 走下方通用路径会把安全拒审销毁成 "concerns 质量告警"
             # 并翻成 reviewed, 下游读 state 拿到错误结论。
-            if _post_refusal_alert(cfg, token, entry, key, head_sha, owner,
-                                   repo, info["number"], report, now):
+            alert_builder = build_refusal_comment
+        elif entry.get("bootstrap"):
+            # 引导失败告警补发 (#55): 与拒审同型 — 缓存的是引导告警文案,
+            # 补发必须走 build_bootstrap_comment; 走通用路径会对一次从未
+            # 运行的审查发 "concerns" 评论并翻成 reviewed, 同 R1 P1-2 的
+            # 销毁形态。
+            alert_builder = build_bootstrap_comment
+        if alert_builder is not None:
+            if _post_terminal_alert(cfg, token, entry, key, head_sha, owner,
+                                    repo, info["number"], report, now,
+                                    alert_builder):
                 entry["status"] = "gave_up"   # 补发成功, 回终态
                 entry["next_retry_at"] = 0.0
                 entry["report"] = None
             elif entry["status"] != "comment_failed":
                 # 未尝试 (评论被禁用/无 token): 烧退避老化, 不无限空转;
                 # 缓存保留, gave_up 后仍可供人工排查
-                mark_failure(entry, "拒审告警未发 (评论禁用或无 token)",
+                mark_failure(entry, "终态告警未发 (评论禁用或无 token)",
                              now, cfg, status="comment_failed")
             return
         verdict = entry.get("verdict") or "concerns"
@@ -1465,8 +1513,28 @@ def process_pr(cfg, state, token, owner, repo, clone, info):
                 entry["next_retry_at"] = 0.0
                 log(f"{key}: ⛔ 拒审 (refusal: {refused}), 终态 "
                     f"(head={head_sha[:12]}) — 发告警评论")
-                _post_refusal_alert(cfg, token, entry, key, head_sha, owner,
-                                    repo, info["number"], payload, now)
+                _post_terminal_alert(cfg, token, entry, key, head_sha, owner,
+                                     repo, info["number"], payload, now,
+                                     build_refusal_comment)
+                return
+            # 引导失败 (#55): 与拒审同型终态 — 环境问题重试不可能自愈,
+            # 且 5 次退避后静默 gave_up 会让"审查从未运行"无人知晓。只认
+            # mcp-server 写的结构化 bootstrap 键 (文本不参与判定, 与 refusal
+            # 同一伪造面论证); 形状不符按普通失败退避 (fail-safe)。
+            bootstrap = rinfo.get("bootstrap")
+            bootstrap_kind = (bootstrap.get("kind")
+                              if isinstance(bootstrap, dict) else None)
+            if isinstance(bootstrap_kind, str) and bootstrap_kind:
+                entry["error"] = payload[:500]
+                entry["verdict"] = None
+                entry["bootstrap"] = {"kind": bootstrap_kind}
+                entry["status"] = "gave_up"
+                entry["next_retry_at"] = 0.0
+                log(f"{key}: ⚠ 审查环境未引导 (bootstrap: {bootstrap_kind}), "
+                    f"终态 (head={head_sha[:12]}) — 发告警评论")
+                _post_terminal_alert(cfg, token, entry, key, head_sha, owner,
+                                     repo, info["number"], payload, now,
+                                     build_bootstrap_comment)
                 return
             # 判据优先级 (#35①): 结构化 quota_limit 键优先 (mcp-server 侧已转
             # unix 秒), 键缺失/形状不符退正则兜底 (旧 mcp-server 兼容)。两条

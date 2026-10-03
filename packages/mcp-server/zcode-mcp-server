@@ -213,6 +213,48 @@ def _extract_retry_after(sample):
     return None
 
 
+# 引导失败解析 (issue #55): 源自 shared/provider_error.py, 修改时请同步。
+# 调用时机硬约束: 只在 _parse_provider_error 判 unknown 后调用 — 限流/配额
+# 分类优先; 指引文案泛称措辞, 指向 README「最小 headless 环境的模型引导」。
+_BOOTSTRAP_GUIDANCE = {
+    "model_selection": (
+        "模型未引导: 官方 runtime 未读到可用模型 (Model creation failed)。"
+        "请在宿主机先完成一次模型选择 (桌面 App 登录并选择模型), 或配置 "
+        "~/.zcode/v2/provider_config.json 的 config.defaultModelSelection; "
+        "详见 README「最小 headless 环境的模型引导」。"
+    ),
+    "builtin_provider_config": (
+        "内置 provider 配置缺失: 官方 runtime 未在调用入口旁找到 "
+        "provider/zcode-builtin.json。请把官方发行物中的该文件 (连同 "
+        "provider/ 目录) 放到调用入口旁; "
+        "详见 README「最小 headless 环境的模型引导」。"
+    ),
+}
+
+_BOOTSTRAP_PATTERNS = (
+    (re.compile(r"Model creation failed", re.IGNORECASE), "model_selection"),
+    (re.compile(r"无法定位 CLI ZCode Built-in Provider Config"),
+     "builtin_provider_config"),
+)
+
+
+def _parse_bootstrap_error(text):
+    """解析「模型/provider 未引导」特征错误 → {"kind","guidance"} 或 None。
+
+    与 shared/provider_error.py.parse_bootstrap_error 逐字同源 (单文件可独立
+    运行故内嵌, 副本同步测试在 tests/test_provider_error.py)。只认两类稳定
+    特征串 (前缀匹配, 覆盖 .deb 构建的 "Model creation failed: Select a
+    model before continuing" 变体); 不命中返回 None。
+    """
+    if not text:
+        return None
+    sample = text if len(text) <= 2000 else text[:2000]  # 只看头部, 与限流解析同口径
+    for pattern, kind in _BOOTSTRAP_PATTERNS:
+        if pattern.search(sample):
+            return {"kind": kind, "guidance": _BOOTSTRAP_GUIDANCE[kind]}
+    return None
+
+
 # 1308 = z.ai 5 小时额度耗尽业务码 (issue #35): 解析 reset 时间作结构化
 # 载荷附在 zcode_pr_review 的 result 上, 下游 (review-gate 额度墙) 直读
 # 不猜。副本源自 shared/provider_error.py (正则/时区规则与其逐字同源,
@@ -1237,7 +1279,13 @@ def _run_zcode_headless(cmd, env, timeout, structured_output=False):
     1308 额度错误, result 顶层附 "quota_limit": {"code": 1308, "reset_at":
     <unix 秒>}; 子进程超时附 "timeout": {"seconds": <int>}; 锁等待超时附
     "lock_timeout": {"seconds": <int>} (均 #54); 成功时有 usage 时附
-    "usage": {"total_tokens": <int>}。其余 review tool 的 result 形状保持不变。
+    "usage": {"total_tokens": <int>}。
+    bootstrap (#55) 与 structured_output 无关: 任一 review tool 的失败在既有
+    provider 分类为 unknown 且 stderr 命中模型/provider 未引导特征时, result
+    顶层无条件(不设 structured_output 门控)附
+    "bootstrap": {"kind": "model_selection"|"builtin_provider_config"}
+    (三 tool 形状一致, 对齐 refusal 先例), 错误文本前置修复指引;
+    其余情况下 result 形状保持不变。
     """
     # 有限重试配置 (issue #3 子项3c): 仅对 provider 限流错误重试, 退避指数。
     # clamp 到 >=0, 防止 ZCODE_BRIDGE_MAX_RETRIES=-1 导致不执行 zcode (Codex P2)
@@ -1259,17 +1307,26 @@ def _run_zcode_headless(cmd, env, timeout, structured_output=False):
                     # 成限流而白重试, 甚至把成功结果截断成报错)。zcode headless 错误
                     # 常在 stderr (APICallError 堆栈), stdout 是审查结论正文。
                     err_info = _parse_provider_error(result.stderr or "")
+                    # 引导失败分类 (#55): 仅在既有 provider 分类判 unknown 后
+                    # 查 — 限流/配额优先级不变。命中的 stderr 同样计入
+                    # stderr_matches, 沿用"stdout 非合法 --json 结果才算错误"
+                    # 的保守判定 (覆盖 rc=0 + 引导错误只回显到 stdout 的变体)。
+                    bootstrap = (_parse_bootstrap_error(result.stderr or "")
+                                 if err_info["error_kind"] == "unknown" else None)
                     # has_error 判定 (整体 review P1-1 + 复审 P1-A): stderr 匹配
                     # 错误关键词时, 仅当 stdout 不是合法 --json 结果才判错误。
                     # zcode 常往 stderr 打 Node deprecation 警告, 恰好含 "Unauthorized"
                     # 等词时会误杀成功调用; 但"stdout 非空"也可能是错误回显文本,
                     # 所以判据是"能否解析出 response 结果"而非"非空"。
-                    stderr_matches = bool(result.stderr) \
-                        and err_info["error_kind"] != "unknown"
+                    stderr_matches = bool(result.stderr) and (
+                        err_info["error_kind"] != "unknown"
+                        or bootstrap is not None)
                     has_error = result.returncode != 0 or (
                         stderr_matches and _parse_result_json(output) is None)
                     if stderr_matches and not has_error and result.returncode == 0:
-                        log(f"⚠ stderr 含 {err_info['error_kind']} 关键词但 stdout "
+                        matched = (f"bootstrap:{bootstrap['kind']}" if bootstrap
+                                   else err_info["error_kind"])
+                        log(f"⚠ stderr 含 {matched} 关键词但 stdout "
                             "是合法结果, 按成功处理 (便于事后排查边界)")
 
                     if has_error and err_info["is_rate_limit"] and attempt < max_retries:
@@ -1284,10 +1341,21 @@ def _run_zcode_headless(cmd, env, timeout, structured_output=False):
                         # 非限流错误, 或重试耗尽 → 返回错误 (重试过的话附说明)
                         suffix = f" (已重试 {attempt} 次)" if attempt > 0 else ""
                         err_text = result.stderr.strip() or output or "未知错误"
+                        if bootstrap:
+                            # 引导失败 (#55): 错误文本前置分类提示 + 指引块
+                            # (原始 stderr 摘要保留在尾部, 仍受下方 500 字符截断)
+                            err_text = (f"引导失败 ({bootstrap['kind']}): "
+                                        f"{bootstrap['guidance']}\n"
+                                        f"原始错误: {err_text}")
                         # 提取简短错误 (脱敏: provider 错误一般不含 apiKey, 但截断防泄漏)
                         err_result = {"content": [{"type": "text",
                                                    "text": f"zcode 调用失败{suffix}: {err_text[:500]}"}],
                                       "isError": True}
+                        if bootstrap:
+                            # 结构化引导键 (#55): 无条件附加 (与 refusal 先例
+                            # 一致, 不设 structured_output 门控) — 三个 review
+                            # tool 形状一致, review-gate 只认此键判终态告警。
+                            err_result["bootstrap"] = {"kind": bootstrap["kind"]}
                         # 1308 结构化载荷 (#35): 从完整 stderr 解析 (上面 content
                         # 里的 err_text 已截 500 字符, 尾部时间串可能被切掉);
                         # isError 文本本身一字不动保留 1308 原文 — 旧 gate 的
