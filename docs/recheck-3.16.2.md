@@ -10,8 +10,8 @@
   1. `session/list` 的 strict Zod 拒收 `includeArchived` 键（桥原无条件发 `false` 使 list 整体失败）→ 桥去键（era 无关）；
   2. 模型身份改名 `builtin:zai-coding-plan/GLM-5.3` → **`zai/glm-5.3`**（小写、精确大小写敏感）→ 桥的 session/new 字符串 model 增加 casefold 折叠回退（catalog 中介，用规范 ID）；
   3. `workspace/generateText` 参数键 `modelRef` → **`selection`**（且该改名**早于 0.17.0**）→ 桥先发 selection、键级拒收特征时一次性回退 modelRef。
-- 社区包装器 `zcode-app-cli` 3.16.2-38 已 vendor `zcode-runtime` 0.17.0（2026-10-20 当天升级），与官方 App 3.16.2 在桥相关面上实测行为一致（`includeArchived` 同样被拒、`{}`/`{limit}`/`{workspace}` 同样接受）。「同号构建漂移」再添实锤：`zcode-app-cli` 3.15.3-37 vendor 的 0.16.9 与官方 App 3.14.0 的 0.16.9 构建内容不同（前者 generateText 已收 selection、help 已列 `--mode guarded` 与 `/expert`）。
-- CLI 旗标面：与 App 3.15.3 的 vendor 0.16.9 逐项 diff 后**唯一确证新增 `--toolsearch-mode <auto|native|local|off>`**（默认 off）；`--disallowed-tools` 的 help 标签现带 camelCase 别名形态（`--disallowed-tools, --disallowedTools <tools...>`）。slash 命令 15 个不变。
+- 社区包装器 `zcode-app-cli` 3.16.2-38 已 vendor `zcode-runtime` 0.17.0（2026-10-20 当天升级），与官方 App 3.16.2 在桥相关面上实测行为一致（`includeArchived` 同样被拒、`{}`/`{limit}`/`{workspace}` 同样接受）。**generateText 参数面漂移**：`zcode-app-cli` 3.15.3-37 包装器 vendor 的 0.16.9 与官方 0.16.9（App 3.14.0，本仓记录）的 generateText 参数面不同（前者已只收 `selection`）——注意官方 0.16.9 当轮只做过空 params 存活性复测、未做参数级复测，差异归因（官方 0.16.9 构建 vs vendor 提取过程）无法进一步分辨（R1 P2-4）。
+- CLI 旗标面：与 `zcode-app-cli` 3.15.3-37 包装器 vendor 的 0.16.9 逐项 diff 后**唯一确证新增 `--toolsearch-mode <auto|native|local|off>`**（默认 off）；`--disallowed-tools` 的 help 标签现带 camelCase 别名形态（`--disallowed-tools, --disallowedTools <tools...>`）。slash 命令 15 个不变。
 - 最小 headless 环境：**模型引导配方在 0.17.0 上仍可用，但机制注记需修正**——0.17.0 runtime 把入口解析到真实路径（符号链接不再保持入口目录），符号链接入口 + 邻置 `provider/` 的组合失效；两条实测可行路径见 §7。
 
 ## 实证环境
@@ -26,7 +26,7 @@
 
 ### 1. 测试套件
 
-适配后 `python3.14 -m pytest tests/ -q` → **606 passed + 58 subtests**（适配前基线 591 + 56；+15 用例见 §4）、`ruff check packages/ tests/` 全绿。
+适配后 `python3.14 -m pytest tests/ -q` → **608 passed + 67 subtests**（适配前基线 591 + 56；净增 17 用例 + 11 子测试，其中 R1 审查轮 +2 用例 +9 子测试，见「适配后的测试清单」）、`ruff check packages/ tests/` 全绿。
 
 ### 2. app-server 协议（活体探测，stdio 发无 jsonrpc 信封的 NDJSON）
 
@@ -42,6 +42,10 @@
 - **存活**：`session/setModel`、`setMode`、`setThoughtLevel`、`fork`、`compact`、`goal`、`cancelBackgroundTask`、`workspace/generateText`、`session/list`、`session/update`——与 0.16.9 基线一致。
 - **已删（-32601，删除面 12 项不变）**：`workspace/readState`、`setDefaultModel`、`setDefaultMode`、`setDefaultThoughtLevel`、`upsertModelProvider`、`removeModelProvider`、`updateProviderRegistry`（workspace/* 8 删 7）；`session/updateRuntimeModelConfig`；`updateInteractionPreferences`；`session/steer`、`session/rewind`、`prompt/enhance`。桥的泛化降级文案无需调整。
 
+### 4. toolAllowlist/toolDenylist（#53 工具名单，零代码改动确认）
+
+主代理真机实测（2026-10-20，官方 0.17.0）：session/create 的 `toolAllowlist`/`toolDenylist` **字符串数组形态全通**（含 `"*"` 通配条目）；**对象条目被拒**（`expected string, received object`）。桥 #53 的本地校验本就只接受字符串数组且 fail-closed（元素非 strip 后非空字符串即本地 -32602、不触碰后端），发往后端的一律是字符串数组——两代构建自动兼容，本 PR 零代码改动（R1 P2-7）。
+
 ## ⚠️ 三处破坏与修法（本 PR 适配）
 
 ### ① `session/list` 拒收 `includeArchived`
@@ -54,23 +58,23 @@
 
 - 0.17.0 create 快照 catalog（`settings.model.available`，30 项）条目形态：`{ref:{providerId, modelId}, label, providerLabel, contextWindow, maxOutputTokens, reasoning:{defaultLevel, levels}}`。zai 条目：`glm-5.3` / `glm-5.3-flash`（contextWindow 1,000,000，maxOutputTokens 128,000，defaultLevel 均 max）+ **`glm-5-turbo` 回归**（contextWindow 200,000，maxOutputTokens 64,000，defaultLevel enabled；该模型曾于 App 3.12.3 时代从服务端下架）。
 - 新 ID **精确大小写敏感**：`glm-5.3` 可用，`GLM-5.3` 报「不存在 Model」。显式选模型**强制要求 `options.reasoningLevel`**（实测 setModel `{providerId:"zai", modelId:"glm-5.3", options:{reasoningLevel:"max"}}` → ok；不带 options → 报 `Reasoning level is required for zai/glm-5.3`）。
-- **桥的行为**：session/new 字符串形态传新 ID `"glm-5.3"` **全通**（catalog 解析 + defaultLevel 补全设计天然适应改名）；传旧习惯 `"GLM-5.3"` 原本报「不在本会话的模型目录中」。**修法**：精确匹配失败后按 casefold 对 catalog 的 `ref.modelId` 做第二轮匹配，命中则用 **catalog 规范 ID** 构建 selection（绝不用调用方原始串）——旧习惯 "GLM-5.3" 在 0.17.0 自动解析到 "glm-5.3"，0.16 大写 catalog 精确先命中、折叠轮不触发，行为不变（真机 E2E 复核：0.17.0 上 `model: "GLM-5.3"` 创建会话成功）。
+- **桥的行为**：session/new 字符串形态传新 ID `"glm-5.3"` **全通**（catalog 解析 + defaultLevel 补全设计天然适应改名）；传旧习惯 `"GLM-5.3"` 原本报「不在本会话的模型目录中」。**修法**：精确匹配失败后按 casefold 对 catalog 的 `ref.modelId` 做第二轮匹配，命中则用 **catalog 规范 ID** 构建 selection（绝不用调用方原始串）——旧习惯 "GLM-5.3" 在 0.17.0 自动解析到 "glm-5.3"（0.16 既有大写调用方行为不变——精确轮先命中；新增的是小写/混合大小写写法的解析能力；折叠命中多个条目时显式报歧义错，建议对象形态指定 providerId，不静默绑定；真机 E2E 复核：0.17.0 上 `model: "GLM-5.3"` 创建会话成功）。
 - **不做** providerId 前缀映射魔法（`builtin:zai-coding-plan`→`zai` 无法从 catalog 泛化推导）：对象形态传旧 providerId 继续由后端报错透传（文案清晰）。
 - 两条命名空间并存：headless env 的 `ZCODE_MODEL` 仍用 config models key 原样（`GLM-5.3` 大写，0.17.0 实测可用）；app-server 的 catalog/setModel/generateText 用小写 `glm-5.3`。
 
 ### ③ `workspace/generateText` 参数键 `modelRef` → `selection`
 
-- **改名早于 0.17.0**：实测 App 3.12.3 的 0.16.5 构建仍收 `modelRef`（本仓 2026-09-17 记录），而 `zcode-app-cli` 3.15.3-37 vendor 的 0.16.9 **已只收 selection**（`modelRef` → `-32602 Unrecognized key`）——改名发生在两个同号 0.16.9 构建之间的某次漂移。桥按「先发 selection、键级拒收特征时一次性回退 modelRef」覆盖两端。
+- **改名早于 0.17.0**：`zcode-app-cli` 3.15.3-37 包装器 vendor 的 0.16.9 **已只收 selection**（实测 `modelRef` → `-32602 Unrecognized key`），而更老构建「仍收 `modelRef`」系**推断**（本仓 0.15 时代参数表与 App 3.12.3 的 0.16.5 复测都只有空 params 存活性记录，无参数级实测；R1 P2-5）——桥的 modelRef 回退路径建立在该推断上，故回退判定只认键级拒收错误特征、重试失败透传第二次错误，推断不成立时行为退化为「错误透传」，无害。桥按「先发 selection、键级拒收特征时一次性回退 modelRef」覆盖两端。
 - **maxOutputTokens 之谜解开**：省略 `maxOutputTokens` → `-32603 maxOutputTokens is outside the model option range`（0.16.9 selection 构建与 0.17.0 **同样如此**，非 0.17.0 新增——服务端不再提供可用默认值，不是客户端参数越界）。实测能通组合：**1024 ≤ maxOutputTokens ≤ catalog maxOutputTokens（glm-5.3 / glm-5.3-flash 均 128,000）+ `options.reasoningLevel` 必填**（取 catalog `reasoning.defaultLevel`）；显式 128,000 与 1024 均通过并返回真实模型输出；超上限（对 128,000 的模型发 131,072）同样报 range 错。
 - **temperature 已删**：selection 构建发 `temperature` → `-32602 Unrecognized key: "temperature"`（0.16.9 selection 构建同样拒收）。桥照旧透传让错误指名道姓，不静默丢弃。
 - **era 取舍**：不做双发（strict Zod 拒未知键，selection+modelRef 并列必 -32602）；也**不替调用方发明 maxOutputTokens/reasoningLevel 默认值**（桥在无会话上下文时拿不到 catalog，发明默认值会悄悄改变输出截断/推理语义）——省略时让后端错误透传并附加一句修法指引（错误文案可读）。回退判定只认 `-32602` 且错误文本提及 `modelRef`、或 `selection`+`unrecognized`（键级拒收形态）；selection 内容非法（"expected object" 型）不触发重试，避免把内容错误改写成第二次更离谱的 `Unrecognized key: "modelRef"`。
 - result 键随构建不同：selection 构建返回 `{text, selection, finishReason, usage}`（老构建为 `{text, modelRef}`），桥原样透传。
 
-### 适配后的测试清单（+15 用例，tests/test_app_server_methods.py）
+### 适配后的测试清单（+17 用例，tests/test_app_server_methods.py）
 
-- **L1–L4（session/list）**：空参数发 `{}` 无 includeArchived 键 + result 映射不变；cwd/limit 照常透传；客户端传 includeArchived 不透传；后端错误保持 `-32603 "zcode list failed"` 透传。
-- **C4o–C4s（casefold 折叠）**：0.17 小写 catalog + 旧习惯 "GLM-5.3" 命中规范 ID 并补 defaultLevel；精确命中不触发折叠；折叠无命中报原错误（带原始串）；catalog 同存仅大小写不同的两个 ID 时精确优先不串 ID；0.16 大写 catalog 反向折叠可用。
-- **M7a 改写 + M7f–M7j（generateText）**：首发 selection 键（值取自客户端 modelRef）；键级拒收 → modelRef 一次性重试（全量参数）且重试失败透传第二次错误；内容型 -32602 不重试；maxOutputTokens range 错透传 + 追加「必填」指引（后端原文不改写）；`Reasoning level is required` 透传 + 指引；temperature 拒收不重试、错误指名道姓。
+- **L1–L4（session/list）**：空参数发 `{}` 无 includeArchived 键 + result 映射不变；cwd/limit 照常透传；客户端传 includeArchived 不透传**且打丢弃日志**（R1 P2-2）；后端错误保持 `-32603 "zcode list failed"` 透传。
+- **C4o–C4t（casefold 折叠）**：0.17 小写 catalog + 旧习惯 "GLM-5.3" 命中规范 ID 并补 defaultLevel；精确命中不触发折叠；折叠无命中报原错误（带原始串）；catalog 同存仅大小写不同的两个 ID 时精确优先不串 ID；0.16 大写 catalog 反向折叠可用；**折叠命中多个条目（跨 provider 同名）显式报歧义错、不静默绑定**（R1 P2-3）。
+- **M7a 改写 + M7f–M7k（generateText）**：首发 selection 键（值取自客户端 modelRef）；键级拒收 → modelRef 一次性重试（全量参数）且重试失败透传第二次错误；内容型 -32602 不重试；maxOutputTokens range 错透传 + 追加「必填」指引（后端原文不改写）；`Reasoning level is required` 透传 + 指引；temperature 拒收不重试、错误指名道姓；**重试判定 helper 直接单测**：键级拒收（`Unrecognized key: "selection"`/复数键列首 selection/modelRef required/missing）才触发，嵌套键（`selection: Unrecognized key: "variant"`）、其他键（temperature）、内容型、非 -32602 一律不触发（R1 P2-1）。
 
 ## CLI 旗标面（0.17.0 vs 0.16.9）
 
@@ -79,7 +83,7 @@
 - **新增**：`--toolsearch-mode <auto|native|local|off>`（默认 off，仅本次启动生效）——唯一确证增量。
 - **标签形态变化**：`--disallowed-tools` 的 help 标签现为 `--disallowed-tools, --disallowedTools <tools...>`（camelCase 别名上标签；别名此前已兼容可用）。
 - **其余全部一致**：`-h/-v/-p/--prompt`、`--memory-bench`、`--browser-use`+`--browser-executable`、`--surface`、`--attach`、`--cwd`、`--force-mcs`、`--locale`、`--mode`、`--resume`、`--target`+`--target-replace`、`--workflow-mode`、`-c/--continue`、`--json`、`--no-browser`、`--no-color`、`--verbose`。`--mode` 帮助文案两代均列 `build, edit, plan, yolo, or guarded`（`guarded` 未实测，勿盲用；0.16.1 实测的 `auto` 保留值未实现结论继续有效）。`--allowed-tools`/`--max-turns`/`--permission-mode`/`--allow-main-worktree-yolo` 继续不存在。
-- **与主代理按本仓 0.16.9（App 3.14.0）记录对比出的 6 项「新增」（--attach/--force-mcs/--surface/--toolsearch-mode/--verbose/--workflow-mode）说明**：后 5 项在 App 3.15.3 的 vendor 0.16.9 help 里已存在——同号构建漂移使「新增」的归因依赖基准构建，唯一两代构建都确认新增的只有 `--toolsearch-mode`。子命令 9 个不变（`login` 自 0.16.9 起带 `[zai|bigmodel]` 标签）；slash 命令 15 个不变（`/expert` 在 vendor 0.16.9 已在列，不能归因 0.17.0）。
+- **与主代理按本仓 0.16.9（App 3.14.0）记录对比出的 6 项「新增」（--attach/--force-mcs/--surface/--toolsearch-mode/--verbose/--workflow-mode）说明**：后 5 项在 `zcode-app-cli` 3.15.3-37 包装器 vendor 的 0.16.9 help 里已存在——「新增」的归因依赖基准构建，唯一两代构建都确认新增的只有 `--toolsearch-mode`。子命令 9 个不变（`login` 自 0.16.9 起带 `[zai|bigmodel]` 标签）；slash 命令 15 个不变（`/expert`、`--mode guarded` 两代 help 均列，**不是**漂移证据——R1 P2-4）。
 
 ## 最小 headless 环境的模型引导（0.17.0 复测，#57 配方）
 

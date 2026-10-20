@@ -382,7 +382,8 @@ NATIVE_CLI = {
              "yolo": "全自动, 跳过确认 (--prompt 默认)",
          },
          "note": "0.16.1 headless 仅接受 build/edit/plan/yolo; auto 是 app-server schema "
-                 "保留值未实现 (setMode 切 auto 会全拒工具调用, mode.auto.unimplemented)",
+                 "保留值未实现 (setMode 切 auto 会全拒工具调用, mode.auto.unimplemented); "
+                 "0.16.9/0.17.0 两代 help 文案另列 guarded (未实测, 勿盲用)",
          "example": "zcode --prompt \"review\" --mode plan"},
         # 浏览器
         {"category": "browser", "name": "browser-use", "supported": True,
@@ -480,7 +481,8 @@ NATIVE_CLI = {
                        "(需 Memory 功能已启用)",
          "arg": "--memory-bench", "since": "0.16.9"},
         # 0.17.0 (App 3.16.2) help 新增的旗标, 2026-10-20 实测在列 (与
-        # App 3.15.3 的同号 0.16.9 构建逐项 diff 后的唯一旗标增量)
+        # zcode-app-cli 3.15.3-37 包装器 vendor 的 0.16.9 逐项 diff 后的
+        # 唯一旗标增量)
         {"category": "agency", "name": "toolsearch-mode", "supported": True,
          "description": "ToolSearch 模式: auto|native|local|off (默认 off, 仅本次启动生效)",
          "arg": "--toolsearch-mode <mode>", "since": "0.17.0"},
@@ -514,7 +516,7 @@ NATIVE_CLI = {
     ],
     # slash 命令 (TUI 会话内使用; /side /btw 未见于 0.16.1/0.16.5/0.16.9 --help, 出自 App 3.6.5 changelog;
     # 0.16.5 help 实测 slash 列表 14 个; 0.16.9 help 实测 15 个 (新增 /dwf); 0.17.0 help 实测 15 个不变
-    # (与 App 3.15.3 的同号 0.16.9 构建逐项一致), 与本清单除 /side /btw 外一致)
+    # (与 zcode-app-cli 3.15.3-37 包装器 vendor 的 0.16.9 逐项一致), 与本清单除 /side /btw 外一致)
     "slash_commands": [
         {"command": "/help [command]", "description": "slash 命令帮助"},
         {"command": "/login", "description": "Z.AI OAuth 登录", "since": "0.16.1"},
@@ -644,8 +646,8 @@ APP_SERVER = {
         {"method": "session/setMode", "params": "sessionId, mode",
          "note": "0.15.0+ 暴露: 切换会话权限模式 (mode: plan|build|edit|yolo|auto); "
                  "⚠ auto 为保留值未实现 — 切 auto 后该会话所有工具调用被 "
-                 "mode.auto.unimplemented 拒绝, 勿当'智能自动批准'用; "
-                 "0.17.0 help 的 --mode 文案另列 guarded (与 auto 同样未实测, 勿盲用)"},
+                 "mode.auto.unimplemented 拒绝, 勿当'智能自动批准'用 "
+                 "(guarded 注记见 --mode 条目)"},
         # ----- 0.15.0 (App 3.2.0) 新增 workspace/* 方法 (按工作区定位, 非 session) -----
         {"method": "workspace/readState", "params": "workspace:{workspacePath,workspaceKey}, runtimeModel?",
          "note": "0.15.0+: 读工作区状态 (settings/modelCatalog/slashCommands); "
@@ -653,10 +655,13 @@ APP_SERVER = {
         {"method": "workspace/generateText", "params": "workspace, selection{providerId, modelId, options:{reasoningLevel}}, prompt, querySource, maxOutputTokens",
          "note": "0.15.0+: 一次性文本生成 (不建会话, 无 messages/tools); "
                  "App 3.12.3 的 0.16.5 构建实测仍存活 (workspace/* 8 删 7 中唯一幸存); "
-                 "selection 构建起 (早于 0.17.0, App 3.15.3 的同号 0.16.9 已如此): 参数键 "
+                 "selection 构建起 (早于 0.17.0: zcode-app-cli 3.15.3-37 包装器 vendor 的 "
+                 "0.16.9 已如此; 更老构建仍收 modelRef 系推断, 无参数级实测): 参数键 "
                  "modelRef → selection、maxOutputTokens 必填 (省略报 \"outside the model "
                  "option range\", 实测 1024 ≤ 值 ≤ catalog maxOutputTokens 可用)、temperature "
-                 "已删 (Unrecognized key); 桥先发 selection、键级拒收时一次性回退 modelRef"},
+                 "已删 (Unrecognized key); 桥先发 selection、键级拒收时一次性回退 modelRef; "
+                 "result 键随构建不同: 新构建 {text, selection, finishReason, usage}, "
+                 "老构建 {text, modelRef}"},
         {"method": "workspace/setDefaultModel", "params": "workspace, model, runtimeModel?, expectedWorkspaceRevision?",
          "note": "0.15.0+: 设工作区默认模型 (持久化, 乐观锁); "
                  "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (实测返 -32601)"},

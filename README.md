@@ -169,7 +169,7 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | `session/setModel` | 切换会话模型 | 0.14.8 | `{sessionId, model}` — model 是 ModelSelection 对象 `{providerId, modelId, options?: {reasoningLevel}}`（0.16 后端 schema 要对象；旧 `modelId` 字符串形态从未通过 0.16 schema，已移除）。缺 `reasoningLevel` 时部分模型 turn 阶段报 `ModelProtocolError: Reasoning level is required` |
 | `session/setMode` | 切换会话权限模式 | 0.14.8 | `{sessionId, mode}` |
 
-> **session/new 可选 `model` 参数**：`{cwd, mode?, model?}` —— model 可传 catalog 里的 modelId 字符串（如 `"GLM-5.3"`，按 create 快照解析成完整 ModelSelection；catalog 条目带 `reasoning.defaultLevel` 时补默认 reasoningLevel；0.17.0 起精确未命中再按 casefold 折叠匹配并取 catalog 规范 ID——旧大写习惯 `"GLM-5.3"` 在 0.17.0 小写 catalog 上自动解析到 `glm-5.3`，0.16 大写 catalog 精确先命中、行为不变）或完整对象（`{providerId, modelId, options?}`，两者须为非空字符串，原样透传不做 ID 改写；`model: null` 或省略等同未提供）。create 成功后桥内部经 `session/setModel` 应用，失败则 session/new 整体报错（文案带已创建的 sessionId，且该会话不登记、不可经 session/prompt 使用）。会话创建即锁定模型，不依赖 App 侧「上次使用」默认（headless 场景刚需）。不透传给 create 本身：0.16.9 实测 create 的初始 model 形参丢 options。
+> **session/new 可选 `model` 参数**：`{cwd, mode?, model?}` —— model 可传 catalog 里的 modelId 字符串（如 `"GLM-5.3"`，按 create 快照解析成完整 ModelSelection；catalog 条目带 `reasoning.defaultLevel` 时补默认 reasoningLevel；0.17.0 起精确未命中再按 casefold 折叠匹配并取 catalog 规范 ID——旧大写习惯 `"GLM-5.3"` 在 0.17.0 小写 catalog 上自动解析到 `glm-5.3`；0.16 既有大写调用方行为不变，新增的是小写/混合大小写写法的解析能力；折叠命中多个条目时显式报错建议改对象形态，不静默绑定）或完整对象（`{providerId, modelId, options?}`，两者须为非空字符串，原样透传不做 ID 改写；`model: null` 或省略等同未提供）。create 成功后桥内部经 `session/setModel` 应用，失败则 session/new 整体报错（文案带已创建的 sessionId，且该会话不登记、不可经 session/prompt 使用）。会话创建即锁定模型，不依赖 App 侧「上次使用」默认（headless 场景刚需）。不透传给 create 本身：0.16.9 实测 create 的初始 model 形参丢 options。
 
 > **session/new 可选 `toolAllowlist` / `toolDenylist` 参数**：字符串数组，在会话创建时按名过滤工具（**工具集注册级物理过滤**：先于权限层、与 mode 无关，hook/权限确认都覆盖不了）。键缺省 → 不写入 create 参数（引擎默认全量工具，与旧行为一致）；键存在 → 每个元素须为 strip 后非空的字符串，非法（非数组、元素非字符串、空串，**含显式 `null`**）本地 `-32602` 且不触碰后端——fail-closed，安全参数不静默忽略。条目 strip 后透传，字面 `[]` 原样透传（空 allowlist = 全部禁用，空 denylist = 无限制）。allow+deny 同传时引擎取**交集且 deny 优先**。用于只读监督：0.16 stdio 下 `mode=plan` 只是 advisory（0.16.1 实测工具照常自动执行，快照 diff 只是事后发现），名单是唯一的会话级前置只读手段；建议同时 deny Node REPL 族（`js` / `js_reset` / `js_add_node_module_dir` / `mcp__node_repl__js*`），否则可经 `execSync` 打穿 `Bash` 黑名单（先例见上文 `zcode_review` 只读原理）。
 
@@ -182,7 +182,7 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | 扩展方法 | 作用 | params |
 |----------|------|--------|
 | `workspace/readState` | 读工作区状态（settings/modelCatalog/slashCommands） | `{workspace, runtimeModel?}` |
-| `workspace/generateText` | 一次性文本生成（不建会话） | `{workspace, modelRef, prompt, querySource, maxOutputTokens?, temperature?}`（桥把 modelRef 映射为后端的 `selection` 键发送——selection 构建起 `maxOutputTokens` 必填、`options.reasoningLevel` 必填（zai 系）、`temperature` 已删；见下行注） |
+| `workspace/generateText` | 一次性文本生成（不建会话） | `{workspace, modelRef, prompt, querySource, maxOutputTokens, temperature?}`（`maxOutputTokens` 在 selection 构建起**必填**（去问号）；`temperature` 已被拒收——见下行注。桥把 modelRef 映射为后端的 `selection` 键发送） |
 | `workspace/setDefaultModel` | 设工作区默认模型（持久化） | `{workspace, model, runtimeModel?, expectedWorkspaceRevision?}` |
 | `workspace/setDefaultMode` | 设工作区默认权限模式（持久化） | `{workspace, mode, expectedWorkspaceRevision?}` |
 | `workspace/setDefaultThoughtLevel` | 设工作区默认思考强度（持久化） | `{workspace, thoughtLevel, expectedWorkspaceRevision?}` |
@@ -192,7 +192,9 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 
 > ❌ **App 3.12.3 的 0.16.5 构建已删**：除 `workspace/generateText`（存活）外，上表 7 个 workspace/* 方法均已从 app-server 删除（2026-09-17 实测后端 -32601，且未搬家到 session/ 命名空间）；`updateInteractionPreferences` 同批删除。0.16.9（App 3.14.0）复测同面（2026-09-19）；0.17.0（App 3.16.2）复测同面（2026-10-20）。上表语义适用于 0.15.0 – App 3.10.2 的 0.16.5 构建。桥透传调用会收到「当前 ZCode 版本已移除该能力」降级文案（见下方降级行为）。
 >
-> ⚠️ **`workspace/generateText` 的 selection 语义（早于 0.17.0 引入，0.17.0 延续）**：后端参数键已由 `modelRef` 改名 `selection`，且（实测 App 3.15.3 的同号 0.16.9 构建与 0.17.0 一致）`maxOutputTokens` **必填**（省略报 `maxOutputTokens is outside the model option range`；实测 1024 ≤ 值 ≤ catalog maxOutputTokens 可用）、zai 系模型 `selection.options.reasoningLevel` **必填**（取 catalog `reasoning.defaultLevel`）、`temperature` **已删**。调用方接口保持 `modelRef` 不变（桥负责映射），老构建（≤0.16.5 只收 modelRef）由桥按后端错误特征一次性回退。省略必填项时错误透传并附修法指引；桥不替调用方发明默认值。
+> ⚠️ **`workspace/generateText` 的 selection 语义（早于 0.17.0 引入，0.17.0 延续）**：后端参数键已由 `modelRef` 改名 `selection`，且（实测 `zcode-app-cli` 3.15.3-37 包装器 vendor 的 0.16.9 与 0.17.0 一致；更老构建「仍收 modelRef」系推断，本仓 0.15/3.12.3 记录只有空 params 存活性、无参数级实测，见 [docs/recheck-3.16.2.md](docs/recheck-3.16.2.md) §③）`maxOutputTokens` **必填**（省略报 `maxOutputTokens is outside the model option range`；实测 1024 ≤ 值 ≤ catalog maxOutputTokens 可用）、zai 系模型 `selection.options.reasoningLevel` **必填**（取 catalog `reasoning.defaultLevel`）、`temperature` **已删**。调用方接口保持 `modelRef` 不变（桥负责映射），老构建（推断 ≤0.16.5 只收 modelRef）由桥按后端键级拒收错误特征一次性回退。省略必填项时错误透传并附修法指引；桥不替调用方发明默认值（fail-loud，不静默截断）。
+>
+> ⚠️ **返回键随构建不同（R1 仲裁：只提醒，不做 alias）**：selection 构建返回 `{text, selection, finishReason, usage}`（0.16.9/0.17.0 实测），老 modelRef 构建返回 `{text, modelRef}`——**读 `result.modelRef` 的老调用方在 0.17.0 上会拿到 `undefined`**，请改读 `result.selection`（或只依赖 `text`）。
 
 **prompt 级**（提示词增强，App 3.3.0 引入；❌ **0.16 已全部移除**，无替代）：
 
@@ -256,7 +258,7 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 > ⚠️ **env 注入的边界**：以上 env 覆盖在**有完整 `~/.zcode` 配置的机器上无法验证效果**（配置文件兜底掩盖了 env 是否真的被读取）；而**最小环境实测中 env 完全不被读取**（0.16.9 官方 runtime 报 `Model creation failed`）。桥保留现有注入行为不变（对既有用户无害）；服务器/容器等最小环境还需要完成模型引导，见下一节。
 
-### 最小 headless 环境的模型引导（0.16.9 官方 runtime）
+### 最小 headless 环境的模型引导（0.16.9/0.17.0 官方 runtime）
 
 在有完整桌面配置的机器上，模型选择由 `~/.zcode` 下的配置文件兜底，桥的 env 注入是否生效不可分辨；但在**最小环境**（空 HOME、仅入口旁有内置 provider 文件）实测中，官方 runtime **完全不读取** `ZCODE_MODEL` / `ZCODE_BASE_URL` / `ANTHROPIC_API_KEY`，`--prompt` 直接失败退出。服务器/容器部署需要按本节准备：
 
