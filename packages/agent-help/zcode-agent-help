@@ -32,6 +32,11 @@ ZCODE_BIN = os.environ.get("ZCODE_BIN", "zcode")
 
 # 模型 ID 的 canonical 格式: config 里 models 的 key 原样 (如 GLM-5.3), 不加 provider 前缀。
 # 实测 "zai/GLM-5.2" 也兼容, 但与 shared/credentials.py 权威实现不一致, 故统一用原始 id。
+# 注意两条命名空间 (0.17.0 / App 3.16.2 起): headless env 的 ZCODE_MODEL 仍用
+# config key 原样 (GLM-5.3, 大写, 实测可用); app-server 的模型目录
+# (session/create 快照 settings.model.available / setModel / generateText)
+# 已改名小写 zai/glm-5.3 (精确大小写敏感, 大写报「不存在 Model」)。桥的
+# session/new 字符串 model 有 casefold 回退, 两个命名空间的写法都能解析。
 ZCODE_CREDS_PATH = Path.home() / ".zcode" / "v2" / "config.json"
 
 # issue #55: 模型解析面只读诊断用的官方 runtime 模型注册表 (桌面 App 完成
@@ -230,15 +235,17 @@ def print_injected_env(config_path=None, provider_config_path=None):
 # ============================================================
 OVERVIEW = {
     "tool": "zcode",
-    "version_described": "0.16.9",
+    "version_described": "0.17.0",
     # 整体 review P2-6: version_described 是"静态清单基于该版本实测"的意思;
     # 实际安装版本以 environment.zcode_version (动态探测) 为准, 两者可能不一致。
     # App 3.12.3 起 --version 同号构建内容漂移 (workspace/* 7 个与
     # updateRuntimeModelConfig 被删, 见 key_methods 各 ❌ 注记), 故不绑定具体
     # App 版本号 — 描述对象是 CLI 能力面, 可用性以各条目注记为准。
-    # 0.16.9 (App 3.14.0) 复测: 协议面与 3.12.3 的 0.16.5 构建一致 (零代码改动),
-    # 仅 CLI 旗标面有增删 (见 agency/input/permission 各条目 0.16.9 注记)。
-    "tested_against": "0.16.9 (App 3.14.0 复测 2026-09-19; 0.16.5 面 App 3.10.2 / 3.12.3 复测)",
+    # 0.17.0 (App 3.16.2) 复测 (2026-10-20): 三处破坏已在桥内适配 (session/list
+    # 的 includeArchived、模型 ID 改名 zai/glm-5.3、generateText 的 selection
+    # 键), 详见 docs/recheck-3.16.2.md。旗标面唯一确证新增 --toolsearch-mode;
+    # --disallowed-tools 帮助标签现带 camelCase 别名 (--disallowedTools)。
+    "tested_against": "0.17.0 (App 3.16.2 复测 2026-10-20; 0.16.9 面 App 3.14.0 复测 2026-09-19; 0.16.5 面 App 3.10.2 / 3.12.3 复测)",
     "what_it_is": (
         "ZCode 是智谱(Z.AI)的 Agentic Coding CLI, 由 GLM 系列模型驱动。"
         "它能自主完成代码编写/审查/调试/分析等任务, 可调用工具(读写文件、"
@@ -414,7 +421,8 @@ NATIVE_CLI = {
          "arg": "--allowed-tools <list>",
          "since": "0.16.1 (仅文案)"},
         {"category": "agency", "name": "tool-denylist", "supported": True,
-         "description": "工具黑名单: 禁止列出的工具 (逗号/空格分隔; camelCase 别名 --disallowedTools)。"
+         "description": "工具黑名单: 禁止列出的工具 (逗号/空格分隔; camelCase 别名 --disallowedTools,"
+                        "0.17.0 起该别名直接显示在 help 标签)。"
                         "实测确认: 工具集级物理移除, 先于权限层, yolo 也绕不过;"
                         "禁 Bash 时必须连 js / mcp__node_repl__js* 一族同禁, 否则可被 execSync 打穿",
          "arg": "--disallowed-tools <list>",
@@ -471,8 +479,14 @@ NATIVE_CLI = {
          "description": "随 --prompt 启用自动 Memory 提取并在退出前等待 "
                        "(需 Memory 功能已启用)",
          "arg": "--memory-bench", "since": "0.16.9"},
+        # 0.17.0 (App 3.16.2) help 新增的旗标, 2026-10-20 实测在列 (与
+        # App 3.15.3 的同号 0.16.9 构建逐项 diff 后的唯一旗标增量)
+        {"category": "agency", "name": "toolsearch-mode", "supported": True,
+         "description": "ToolSearch 模式: auto|native|local|off (默认 off, 仅本次启动生效)",
+         "arg": "--toolsearch-mode <mode>", "since": "0.17.0"},
     ],
-    # 子命令 (zcode <command>, 实测自 0.16.9 --help 复核; 9 个子命令与 0.16.5 一致, 无新增/删除)
+    # 子命令 (zcode <command>, 实测自 0.17.0 --help 复核; 9 个子命令与 0.16.5 一致, 无新增/删除;
+    # login 自 0.16.9 起 help 标签带 [zai|bigmodel] 参数)
     "subcommands": [
         {"name": "tui", "usage": "zcode tui",
          "description": "打开全屏 TUI (无参数直接运行 zcode 同效)",
@@ -499,7 +513,8 @@ NATIVE_CLI = {
          "description": "打印 CLI 版本"},
     ],
     # slash 命令 (TUI 会话内使用; /side /btw 未见于 0.16.1/0.16.5/0.16.9 --help, 出自 App 3.6.5 changelog;
-    # 0.16.5 help 实测 slash 列表 14 个; 0.16.9 help 实测 15 个 (新增 /dwf), 与本清单除 /side /btw 外一致)
+    # 0.16.5 help 实测 slash 列表 14 个; 0.16.9 help 实测 15 个 (新增 /dwf); 0.17.0 help 实测 15 个不变
+    # (与 App 3.15.3 的同号 0.16.9 构建逐项一致), 与本清单除 /side /btw 外一致)
     "slash_commands": [
         {"command": "/help [command]", "description": "slash 命令帮助"},
         {"command": "/login", "description": "Z.AI OAuth 登录", "since": "0.16.1"},
@@ -578,8 +593,10 @@ APP_SERVER = {
          "note": "查状态用; status: idle/running"},
         {"method": "session/messages", "params": "sessionId",
          "result": "{messages:[{info, parts}]}", "note": "parts 类型: text/tool/reasoning/patch/step-start 等"},
-        {"method": "session/list", "params": "workspace?, includeArchived?, limit?",
-         "result": "{sessions:[{sessionId, workspace, title, status...}]}"},
+        {"method": "session/list", "params": "workspace?, limit?",
+         "result": "{sessions:[{sessionId, workspace, title, status...}]}",
+         "note": "0.17.0 起 includeArchived 键被 strict Zod 拒收 (-32602 "
+                 "Unrecognized key, archived 概念疑似已移除) — 桥已不再发送"},
         {"method": "session/resume", "params": "sessionId, workspace?",
          "result": "完整快照 Om", "note": "不回放历史"},
         {"method": "session/setMode", "params": "sessionId, mode", "result": "ok"},
@@ -607,9 +624,12 @@ APP_SERVER = {
         {"method": "session/goal", "params": "sessionId, goal?", "note": "0.14.8+: 读/设 session 目标 (新)"},
         {"method": "session/compact", "params": "sessionId", "note": "0.14.8+: 压缩对话上下文 (新)"},
         {"method": "session/setModel",
-         "params": "sessionId, model{providerId, modelId, options?:{reasoningLevel}}",
+         "params": "sessionId, model{providerId, modelId, options:{reasoningLevel}}",
          "note": "0.14.8+: 切换模型 (新); 0.16 起 schema 要 model 对象 — 旧 modelId 字符串形态必报 "
-                 "-32602 (0.16.9 实测), 缺 reasoningLevel 时部分模型 turn 阶段报 ModelProtocolError"},
+                 "-32602 (0.16.9 实测); 0.17.0 起模型身份改名 (builtin:zai-coding-plan/GLM-5.3 → "
+                 "zai/glm-5.3, 小写, 精确大小写敏感) 且 zai 系模型 options.reasoningLevel 强制必填 "
+                 "(缺它报 \"Reasoning level is required for <provider>/<model>\", 可取 catalog "
+                 "reasoning.defaultLevel)"},
         {"method": "session/cancelBackgroundTask", "params": "sessionId, taskId",
          "note": "0.14.8+: 取消后台 Bash 任务 (新)"},
         # ----- 0.15.0 (App 3.2.0) 新增 session 级方法 -----
@@ -624,14 +644,19 @@ APP_SERVER = {
         {"method": "session/setMode", "params": "sessionId, mode",
          "note": "0.15.0+ 暴露: 切换会话权限模式 (mode: plan|build|edit|yolo|auto); "
                  "⚠ auto 为保留值未实现 — 切 auto 后该会话所有工具调用被 "
-                 "mode.auto.unimplemented 拒绝, 勿当'智能自动批准'用"},
+                 "mode.auto.unimplemented 拒绝, 勿当'智能自动批准'用; "
+                 "0.17.0 help 的 --mode 文案另列 guarded (与 auto 同样未实测, 勿盲用)"},
         # ----- 0.15.0 (App 3.2.0) 新增 workspace/* 方法 (按工作区定位, 非 session) -----
         {"method": "workspace/readState", "params": "workspace:{workspacePath,workspaceKey}, runtimeModel?",
          "note": "0.15.0+: 读工作区状态 (settings/modelCatalog/slashCommands); "
                  "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (2026-09-17 实测返 -32601, 未搬家到 session/)"},
-        {"method": "workspace/generateText", "params": "workspace, modelRef, prompt, querySource, maxOutputTokens?, temperature?",
+        {"method": "workspace/generateText", "params": "workspace, selection{providerId, modelId, options:{reasoningLevel}}, prompt, querySource, maxOutputTokens",
          "note": "0.15.0+: 一次性文本生成 (不建会话, 无 messages/tools); "
-                 "App 3.12.3 的 0.16.5 构建实测仍存活 (workspace/* 8 删 7 中唯一幸存)"},
+                 "App 3.12.3 的 0.16.5 构建实测仍存活 (workspace/* 8 删 7 中唯一幸存); "
+                 "selection 构建起 (早于 0.17.0, App 3.15.3 的同号 0.16.9 已如此): 参数键 "
+                 "modelRef → selection、maxOutputTokens 必填 (省略报 \"outside the model "
+                 "option range\", 实测 1024 ≤ 值 ≤ catalog maxOutputTokens 可用)、temperature "
+                 "已删 (Unrecognized key); 桥先发 selection、键级拒收时一次性回退 modelRef"},
         {"method": "workspace/setDefaultModel", "params": "workspace, model, runtimeModel?, expectedWorkspaceRevision?",
          "note": "0.15.0+: 设工作区默认模型 (持久化, 乐观锁); "
                  "❌ 已于 App 3.12.3 的 0.16.5 构建移除 (实测返 -32601)"},

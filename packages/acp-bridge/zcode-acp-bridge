@@ -56,11 +56,29 @@ CLI 0.16.1 适配 (依据 docs/upgrade-0.16.1-spec.md, 全部经实测复核):
   - state.updated 的 patch 合并为状态投影 (供事件流停滞检查);
     v4/telemetry/event 忽略; session.titleUpdated 转 stderr 日志。
 
+CLI 0.17.0 (App 3.16.2) 适配 (依据 docs/recheck-3.16.2.md, 全部经实测复核):
+  - session/list 不再发 includeArchived (0.17.0 strict Zod 拒未知键 -32602,
+    桥原无条件 false 使 list 整体失败; 0.16.9 实测 {} 与 {includeArchived:
+    false} 等价, 去键 era 无关)。核心链路 (create/subscribe/send/事件流/
+    stop/list/resume) 与删除面均零改动兼容。
+  - 模型身份改名 builtin:zai-coding-plan/GLM-5.3 → zai/glm-5.3 (小写, 精确
+    大小写敏感): session/new 字符串 model 在 catalog 精确未命中后按 casefold
+    回退, 用 catalog 规范 ID 构建 selection — 旧习惯 "GLM-5.3" 自动适配,
+    0.16 大写 catalog 行为不变 (精确先命中)。zai 系模型 reasoningLevel 强制
+    必填 (缺它 turn/generateText 报 "Reasoning level is required"), 字符串
+    形态的 defaultLevel 补全设计天然满足。
+  - workspace/generateText 参数键 modelRef → selection (该改名早于 0.17.0:
+    App 3.15.3 的同号 0.16.9 构建已只收 selection; maxOutputTokens 自改名起
+    必填, temperature 已删): 桥先发 selection, -32602 键级拒收特征时一次性
+    回退 modelRef (老构建), 见 _on_workspace_generate_text。
+
 能力范围:
   ✅ initialize 握手
   ✅ session/new → session/create (可选 model: "GLM-5.3" 字符串按 create 快照
-     catalog 解析并补默认 reasoningLevel, 或完整 ModelSelection 对象; 经
-     session/setModel 应用, 会话创建即锁定模型 — 0.16.9 实测)
+     catalog 解析并补默认 reasoningLevel (0.17.0 起精确未命中再按 casefold
+     折叠匹配, 用 catalog 规范 ID — 旧大写习惯自动适配 zai/glm-5.3 小写改名),
+     或完整 ModelSelection 对象; 经 session/setModel 应用, 会话创建即锁定
+     模型 — 0.16.9 实测)
   ✅ session/prompt → 事件驱动真流式 (0.14.8+) / 轮询伪流式 (旧协议降级)
   ✅ 流式文本 (model.streaming → agent_message_chunk 逐段)
   ✅ 工具调用展示 (tool.updated → tool_call/tool_call_update 实时)
@@ -76,7 +94,8 @@ CLI 0.16.1 适配 (依据 docs/upgrade-0.16.1-spec.md, 全部经实测复核):
   ✅ workspace/* 方法 (0.15.0+): readState/generateText/setDefault{Model,Mode,ThoughtLevel}/
      upsertModelProvider/removeModelProvider/updateProviderRegistry
      (App 3.12.3 的 0.16.5 构建删 7/8, 仅 generateText 存活, 见
-      docs/recheck-3.12.3.md)
+      docs/recheck-3.12.3.md; generateText 的 modelRef→selection 键映射与
+      maxOutputTokens/temperature 语义变化见 _on_workspace_generate_text)
   ✅ prompt/* 方法 (App 3.3.0+): enhance (同步) / enhance/start+result+cancel (异步 job)
      (于 0.16 移除)
 
@@ -1528,6 +1547,13 @@ class ACPBridge:
         匹配 (多 provider 同名取第一个; 需要指定 provider 的调用方应直接传
         对象), catalog 条目带 reasoning.defaultLevel 时补
         options.reasoningLevel (0.16.9 实测部分模型缺它会 ModelProtocolError)。
+        0.17.0 (App 3.16.2) 适配: 精确匹配失败后再按 casefold 做一轮大小写
+        不敏感匹配, 命中则用 catalog 的规范 ID 构建 selection (绝不用调用方
+        原始串) —— 0.17.0 把模型身份从 builtin:zai-coding-plan/GLM-5.3 改为
+        zai/glm-5.3 (小写, 精确大小写敏感), 旧习惯 "GLM-5.3" 借此自动解析到
+        "glm-5.3"; 0.16 系后端 (大写 ID) 精确匹配先命中, 折叠轮不触发, 行为
+        不变。不做 providerId 前缀映射魔法 (builtin:zai-coding-plan→zai 无法
+        从 catalog 泛化推导): 对象形态传旧 providerId 继续由后端报错透传。
         无法解析时返回错误字符串, 「catalog 不可用」与「未命中」分开报 (调用
         方转 -32602 并附上已创建的 sessionId)。
         """
@@ -1546,12 +1572,9 @@ class ACPBridge:
         # AttributeError 把 -32602 变成 -32603 内部错)
         if not isinstance(available, list):
             return "本会话模型目录不可用 (create 快照缺少 settings.model.available)"
-        for entry in available:
-            if not isinstance(entry, dict):
-                continue
+
+        def _build_selection(entry):
             ref = entry.get("ref")
-            if not isinstance(ref, dict) or ref.get("modelId") != wanted:
-                continue
             selection = {"providerId": ref.get("providerId"),
                          "modelId": ref.get("modelId")}
             reasoning = entry.get("reasoning")
@@ -1560,13 +1583,48 @@ class ACPBridge:
             if default_level:
                 selection["options"] = {"reasoningLevel": default_level}
             return selection
+
+        # 第一轮: 精确匹配 (大小写敏感; 与旧行为逐字一致)
+        for entry in available:
+            if not isinstance(entry, dict):
+                continue
+            ref = entry.get("ref")
+            if not isinstance(ref, dict) or ref.get("modelId") != wanted:
+                continue
+            return _build_selection(entry)
+        # 第二轮: casefold 折叠匹配 (仅精确未命中时触发)。多 provider 折叠
+        # 同名同精确轮规则取第一个 — 两个仅大小写不同的规范 ID 共存时命中者
+        # 依赖 catalog 顺序, 与既有「同名取第一个」口径一致。
+        folded = wanted.casefold()
+        for entry in available:
+            if not isinstance(entry, dict):
+                continue
+            ref = entry.get("ref")
+            if not isinstance(ref, dict):
+                continue
+            model_id = ref.get("modelId")
+            if not isinstance(model_id, str):
+                continue
+            if model_id.casefold() != folded:
+                continue
+            return _build_selection(entry)
         return f"modelId '{wanted}' 不在本会话的模型目录中"
 
     def _on_session_list(self, msg_id, params):
-        """ACP session/list → zcode session/list, 转成 ACP SessionInfo[]"""
+        """ACP session/list → zcode session/list, 转成 ACP SessionInfo[]
+
+        0.17.0 (App 3.16.2) 适配: 不再向后端发 includeArchived —— strict Zod
+        对未知键 -32602 "Unrecognized key" (桥此前的无条件 `includeArchived:
+        false` 在 0.17.0 上使 session/list 整体失败, 真机复现)。0.16.9 后端
+        实测 (2026-10-20, 社区包装器 vendor 0.16.9): `{}` 与
+        `{includeArchived: false}` 返回逐项等价 (数量与 result 形状), 故直接
+        去键是 era 无关方案, 0.16 默认行为不变。取舍: ACP 客户端传入的
+        includeArchived 不再透传 (0.17.0 无法透传; archived 会话概念疑似已
+        从 0.17.0 移除), 传 true 也按默认行为处理。
+        """
         self.ensure_backend()
         cwd = params.get("cwd")
-        zc_params = {"includeArchived": params.get("includeArchived", False)}
+        zc_params = {}
         if cwd:
             zc_params["workspace"] = {"workspacePath": cwd, "workspaceKey": cwd}
         limit = params.get("limit")
@@ -1977,13 +2035,51 @@ class ACPBridge:
         log("workspace/readState → ok")
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
+    @staticmethod
+    def _generate_text_needs_legacy_model_ref(err):
+        """判定 generateText 的 -32602 是否为「后端不认识 selection 键」的旧构建特征。
+
+        selection 键的引入早于 0.17.0 (实测 App 3.12.3 的 0.16.5 构建仍收
+        modelRef, App 3.15.3 的同号 0.16.9 构建已只收 selection), 桥无法预知
+        对端构建, 只能先发 selection、按错误特征识别旧构建后重试 modelRef。
+        特征: -32602 且文本提到 modelRef, 或 selection + unrecognized (键级
+        拒收形态)。selection 内容非法时后端报 "expected object" 型 -32602、
+        无 unrecognized, 不触发重试 (避免把内容错误改写成第二次更离谱的
+        "Unrecognized key: modelRef")。
+        """
+        if err.get("code") != -32602:
+            return False
+        low = str(err.get("message") or "").lower()
+        return "modelref" in low or ("selection" in low and "unrecognized" in low)
+
     def _on_workspace_generate_text(self, msg_id, params):
         """workspace/generateText → 同名: 一次性文本生成 (不创建会话)。
 
         params: {workspace, modelRef:{providerId,modelId,variant?}, prompt, querySource,
                  maxOutputTokens?, temperature?}
-        返回: {text, modelRef}
+        返回: 后端原样 (selection 构建实测 result 键为 {text, selection,
+        finishReason, usage}; 老 modelRef 构建为 {text, modelRef})
         注意: 涉及模型调用, timeout 设 60s。
+
+        0.17.0 (App 3.16.2) 适配 — 参数键 modelRef 已更名 selection (strict
+        Zod 对 modelRef 报 Unrecognized key), 桥先按 selection 形态发送:
+          - options 原样透传。0.17.0 对 zai 系模型强制要求
+            options.reasoningLevel, 缺它报 -32603 "Reasoning level is
+            required for <provider>/<model>" (setModel 同规则); 需要 catalog
+            默认值的调用方走 session/new 的字符串 model 解析。
+          - maxOutputTokens: selection 构建起必填 —— 省略时后端报 -32603
+            "maxOutputTokens is outside the model option range" (服务端不再
+            提供可用默认; 0.16.9 的 selection 构建实测同样如此, 非 0.17.0
+            新增)。实测能通组合: 1024 ≤ 值 ≤ catalog maxOutputTokens
+            (zai/glm-5.3 与 zai/glm-5.3-flash 均 128000), 省略或超上限都报
+            range 错。桥不替调用方发明默认值 (那会悄悄改变输出截断语义),
+            省略时让错误透传并附加指引。
+          - temperature: selection 构建已删该键 (Unrecognized key), 照旧
+            透传让错误指名道姓, 不静默丢弃。
+        era 回退: 后端 -32602 且特征是「不认识 selection 键」(老构建只收
+        modelRef) 时, 用 modelRef 形态一次性重试 (全量原始参数); 重试仍失败
+        则透传第二次错误。不做双发 (selection+modelRef 并列): strict Zod 拒
+        未知键, 必 -32602。
         """
         self.ensure_backend()
         ws, err = self._resolve_workspace(msg_id, params)
@@ -1995,20 +2091,46 @@ class ACPBridge:
             return self._error(msg_id, -32602, "generateText 需要 modelRef")
         if not prompt:
             return self._error(msg_id, -32602, "generateText 需要 prompt")
-        zc_params = {
-            "workspace": ws,
-            "modelRef": model_ref,
-            "prompt": prompt,
-            "querySource": params.get("querySource", "bridge"),
-        }
-        if params.get("maxOutputTokens") is not None:
-            zc_params["maxOutputTokens"] = params["maxOutputTokens"]
-        if params.get("temperature") is not None:
-            zc_params["temperature"] = params["temperature"]
+        query_source = params.get("querySource", "bridge")
+        max_output_tokens = params.get("maxOutputTokens")
+        temperature = params.get("temperature")
+
+        def _params(model_key):
+            # selection / modelRef 两形态同构, 仅模型键名不同
+            zc = {
+                "workspace": ws,
+                model_key: model_ref,
+                "prompt": prompt,
+                "querySource": query_source,
+            }
+            if max_output_tokens is not None:
+                zc["maxOutputTokens"] = max_output_tokens
+            if temperature is not None:
+                zc["temperature"] = temperature
+            return zc
+
         zc_id = self._next_id()
-        resp, _ = self.backend.request(zc_id, "workspace/generateText", zc_params, timeout=60)
+        resp, _ = self.backend.request(
+            zc_id, "workspace/generateText", _params("selection"), timeout=60)
+        if "error" in resp and self._generate_text_needs_legacy_model_ref(resp["error"]):
+            # 旧构建 (只收 modelRef) 的一次性重试; 结果无论成败都按原样透传
+            zc_id = self._next_id()
+            resp, _ = self.backend.request(
+                zc_id, "workspace/generateText", _params("modelRef"), timeout=60)
         if "error" in resp:
-            return self._passthrough_error(msg_id, "workspace/generateText", resp)
+            perr = self._passthrough_error(msg_id, "workspace/generateText", resp)
+            # selection 构建的两类 -32603 后端文案不含修法, 附加一句指引
+            # (只追加、不改写后端原文; 其他错误原样透传)
+            emsg = str(resp["error"].get("message") or "")
+            if "maxOutputTokens" in emsg and "range" in emsg:
+                perr["error"]["message"] += (
+                    " (selection 构建起 maxOutputTokens 必填: 显式传 ≤ 目标模型"
+                    " catalog maxOutputTokens 的值, 如 4096)")
+            elif "Reasoning level is required" in emsg:
+                perr["error"]["message"] += (
+                    " (selection 构建下 zai 系模型需要 options.reasoningLevel,"
+                    " 可取 catalog reasoning.defaultLevel)")
+            return perr
         result = resp.get("result", {})
         log(f"workspace/generateText → ok (text {len(result.get('text', ''))} chars)")
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}

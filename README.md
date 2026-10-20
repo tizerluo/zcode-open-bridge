@@ -169,7 +169,7 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | `session/setModel` | 切换会话模型 | 0.14.8 | `{sessionId, model}` — model 是 ModelSelection 对象 `{providerId, modelId, options?: {reasoningLevel}}`（0.16 后端 schema 要对象；旧 `modelId` 字符串形态从未通过 0.16 schema，已移除）。缺 `reasoningLevel` 时部分模型 turn 阶段报 `ModelProtocolError: Reasoning level is required` |
 | `session/setMode` | 切换会话权限模式 | 0.14.8 | `{sessionId, mode}` |
 
-> **session/new 可选 `model` 参数**：`{cwd, mode?, model?}` —— model 可传 catalog 里的 modelId 字符串（如 `"GLM-5.3"`，按 create 快照解析成完整 ModelSelection；catalog 条目带 `reasoning.defaultLevel` 时补默认 reasoningLevel）或完整对象（`{providerId, modelId, options?}`，两者须为非空字符串；`model: null` 或省略等同未提供）。create 成功后桥内部经 `session/setModel` 应用，失败则 session/new 整体报错（文案带已创建的 sessionId，且该会话不登记、不可经 session/prompt 使用）。会话创建即锁定模型，不依赖 App 侧「上次使用」默认（headless 场景刚需）。不透传给 create 本身：0.16.9 实测 create 的初始 model 形参丢 options。
+> **session/new 可选 `model` 参数**：`{cwd, mode?, model?}` —— model 可传 catalog 里的 modelId 字符串（如 `"GLM-5.3"`，按 create 快照解析成完整 ModelSelection；catalog 条目带 `reasoning.defaultLevel` 时补默认 reasoningLevel；0.17.0 起精确未命中再按 casefold 折叠匹配并取 catalog 规范 ID——旧大写习惯 `"GLM-5.3"` 在 0.17.0 小写 catalog 上自动解析到 `glm-5.3`，0.16 大写 catalog 精确先命中、行为不变）或完整对象（`{providerId, modelId, options?}`，两者须为非空字符串，原样透传不做 ID 改写；`model: null` 或省略等同未提供）。create 成功后桥内部经 `session/setModel` 应用，失败则 session/new 整体报错（文案带已创建的 sessionId，且该会话不登记、不可经 session/prompt 使用）。会话创建即锁定模型，不依赖 App 侧「上次使用」默认（headless 场景刚需）。不透传给 create 本身：0.16.9 实测 create 的初始 model 形参丢 options。
 
 > **session/new 可选 `toolAllowlist` / `toolDenylist` 参数**：字符串数组，在会话创建时按名过滤工具（**工具集注册级物理过滤**：先于权限层、与 mode 无关，hook/权限确认都覆盖不了）。键缺省 → 不写入 create 参数（引擎默认全量工具，与旧行为一致）；键存在 → 每个元素须为 strip 后非空的字符串，非法（非数组、元素非字符串、空串，**含显式 `null`**）本地 `-32602` 且不触碰后端——fail-closed，安全参数不静默忽略。条目 strip 后透传，字面 `[]` 原样透传（空 allowlist = 全部禁用，空 denylist = 无限制）。allow+deny 同传时引擎取**交集且 deny 优先**。用于只读监督：0.16 stdio 下 `mode=plan` 只是 advisory（0.16.1 实测工具照常自动执行，快照 diff 只是事后发现），名单是唯一的会话级前置只读手段；建议同时 deny Node REPL 族（`js` / `js_reset` / `js_add_node_module_dir` / `mcp__node_repl__js*`），否则可经 `execSync` 打穿 `Bash` 黑名单（先例见上文 `zcode_review` 只读原理）。
 
@@ -182,7 +182,7 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | 扩展方法 | 作用 | params |
 |----------|------|--------|
 | `workspace/readState` | 读工作区状态（settings/modelCatalog/slashCommands） | `{workspace, runtimeModel?}` |
-| `workspace/generateText` | 一次性文本生成（不建会话） | `{workspace, modelRef, prompt, querySource, maxOutputTokens?, temperature?}` |
+| `workspace/generateText` | 一次性文本生成（不建会话） | `{workspace, modelRef, prompt, querySource, maxOutputTokens?, temperature?}`（桥把 modelRef 映射为后端的 `selection` 键发送——selection 构建起 `maxOutputTokens` 必填、`options.reasoningLevel` 必填（zai 系）、`temperature` 已删；见下行注） |
 | `workspace/setDefaultModel` | 设工作区默认模型（持久化） | `{workspace, model, runtimeModel?, expectedWorkspaceRevision?}` |
 | `workspace/setDefaultMode` | 设工作区默认权限模式（持久化） | `{workspace, mode, expectedWorkspaceRevision?}` |
 | `workspace/setDefaultThoughtLevel` | 设工作区默认思考强度（持久化） | `{workspace, thoughtLevel, expectedWorkspaceRevision?}` |
@@ -190,7 +190,9 @@ ACP bridge 额外暴露了 ZCode 新版协议方法，供编辑器/脚本调用�
 | `workspace/removeModelProvider` | 移除模型供应商 | `{workspace, providerId, expectedWorkspaceRevision?}` |
 | `workspace/updateProviderRegistry` | 批量更新供应商注册表 | `{workspace, registry, includeWorkspaceState?}` |
 
-> ❌ **App 3.12.3 的 0.16.5 构建已删**：除 `workspace/generateText`（存活）外，上表 7 个 workspace/* 方法均已从 app-server 删除（2026-09-17 实测后端 -32601，且未搬家到 session/ 命名空间）；`updateInteractionPreferences` 同批删除。0.16.9（App 3.14.0）复测同面（2026-09-19）。上表语义适用于 0.15.0 – App 3.10.2 的 0.16.5 构建。桥透传调用会收到「当前 ZCode 版本已移除该能力」降级文案（见下方降级行为）。
+> ❌ **App 3.12.3 的 0.16.5 构建已删**：除 `workspace/generateText`（存活）外，上表 7 个 workspace/* 方法均已从 app-server 删除（2026-09-17 实测后端 -32601，且未搬家到 session/ 命名空间）；`updateInteractionPreferences` 同批删除。0.16.9（App 3.14.0）复测同面（2026-09-19）；0.17.0（App 3.16.2）复测同面（2026-10-20）。上表语义适用于 0.15.0 – App 3.10.2 的 0.16.5 构建。桥透传调用会收到「当前 ZCode 版本已移除该能力」降级文案（见下方降级行为）。
+>
+> ⚠️ **`workspace/generateText` 的 selection 语义（早于 0.17.0 引入，0.17.0 延续）**：后端参数键已由 `modelRef` 改名 `selection`，且（实测 App 3.15.3 的同号 0.16.9 构建与 0.17.0 一致）`maxOutputTokens` **必填**（省略报 `maxOutputTokens is outside the model option range`；实测 1024 ≤ 值 ≤ catalog maxOutputTokens 可用）、zai 系模型 `selection.options.reasoningLevel` **必填**（取 catalog `reasoning.defaultLevel`）、`temperature` **已删**。调用方接口保持 `modelRef` 不变（桥负责映射），老构建（≤0.16.5 只收 modelRef）由桥按后端错误特征一次性回退。省略必填项时错误透传并附修法指引；桥不替调用方发明默认值。
 
 **prompt 级**（提示词增强，App 3.3.0 引入；❌ **0.16 已全部移除**，无替代）：
 
@@ -230,6 +232,7 @@ PR 自动审查闸门守护进程（第 4 组件，experimental）：常驻轮�
 **canonical model id = `~/.zcode/v2/config.json` 里 `models` 的 key 原样**（如 `GLM-5.3`），**不加 provider 前缀**。`shared/credentials.py`、MCP server、ACP bridge、agent-help 四处统一用原始 id。实测（0.16.1 时代）`zai/GLM-5.2` 前缀形式也兼容，但非 canonical，本项目不使用。
 
 模型面现状（App 3.12.3 的 0.16.5 构建实测，2026-09-17；0.16.9/App 3.14.0 于 2026-09-19 在完整桌面配置机器上复测一致；最小 headless 环境的模型引导见下方新节）：当前 enabled provider（`builtin:zai-coding-plan`）的 models 为 `GLM-5.3` / `GLM-5.3-Flash`（`GLM-5-Turbo` 已由服务端移除；3.10.2 时代为三者）。
+**0.17.0（App 3.16.2）更新（2026-10-20）**：headless env / config 的模型 key 口径不变（仍 `GLM-5.3` 大写，实测可用）；但 **app-server 的模型目录（create 快照 `settings.model.available` / setModel / generateText）已改名小写 `zai/glm-5.3`**（providerId `zai`，精确大小写敏感），且 **`glm-5-turbo` 回归** catalog（200k 上下文 / maxOutputTokens 64,000 / reasoningLevel enabled）。zai 系模型显式选模型强制 `options.reasoningLevel`。桥的 session/new 字符串 model 两侧写法都能解析（精确命中优先，未命中按 casefold 折叠并取 catalog 规范 ID）。
 
 ### 凭证注入：显式环境变量优先
 
@@ -257,7 +260,8 @@ ZCODE_BASE_URL=https://api.z.ai/api/anthropic ./packages/mcp-server/zcode-mcp-se
 
 在有完整桌面配置的机器上，模型选择由 `~/.zcode` 下的配置文件兜底，桥的 env 注入是否生效不可分辨；但在**最小环境**（空 HOME、仅入口旁有内置 provider 文件）实测中，官方 runtime **完全不读取** `ZCODE_MODEL` / `ZCODE_BASE_URL` / `ANTHROPIC_API_KEY`，`--prompt` 直接失败退出。服务器/容器部署需要按本节准备：
 
-**前置一步：内置 provider 配置文件**。官方 runtime 按**调用入口路径（不解析符号链接）**探测 `<入口目录>/provider/zcode-builtin.json`。部署时需把官方发行物中的该文件（连同 `provider/` 目录）放到调用入口旁，否则 `--prompt` 报 `无法定位 CLI ZCode Built-in Provider Config`。
+**前置一步：内置 provider 配置文件**。官方 runtime 按**调用入口路径**探测 `<入口目录>/provider/zcode-builtin.json`。部署时需把官方发行物中的该文件（连同 `provider/` 目录）放到调用入口旁，否则 `--prompt` 报 `无法定位 CLI ZCode Built-in Provider Config`。
+> ⚠️ **0.17.0（App 3.16.2）机制变化（2026-10-20 实测）**：runtime 把入口解析到**真实路径**，「不解析符号链接」的老结论不再成立——符号链接入口 + 邻置 `provider/` 的组合失效（报错原文里的候选路径即真实路径）。两条实测可行路径：① 入口用**真实文件**（复制而非链接 `zcode.cjs`）+ 邻置 `provider/`（原配方，入口换真实文件即可）；② 桌面 App 同款显式指路 env：`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=<zcode-builtin.json 绝对路径>` + `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=<provider_config.json 绝对路径>`（入口可以是符号链接）。另外复测「最小环境」务必用**仅 HOME/PATH 的干净 env**——桌面 App 会话里的 `ZCODE_*` 注入变量会把失败 case 污染成假阳性。
 
 **模型选择两条可行路径**：
 1. **宿主机先完成一次模型选择**（推荐）：桌面 App 登录并选择模型会生成 `~/.zcode/v2/provider_config.json` 注册表（含加密凭证），把整个 `~/.zcode` 配置带到服务器即可；也可以在该文件的 `config.defaultModelSelection` 写 `{"providerId": ..., "modelId": ...}` 指定默认模型。
@@ -333,6 +337,7 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 
 | ZCode CLI 版本 | 支持情况 | ACP bridge 流式 | 扩展方法 |
 |:--------------:|:--------:|:---------------:|:--------:|
+| **0.17.0**（App 3.16.2） | ✅ 完整（三处面破坏已由桥适配：session/list 去 `includeArchived`、模型 ID 改名 `zai/glm-5.3` 小写 + 字符串 model 大小写折叠回退、generateText `modelRef`→`selection` 键映射，见[^bootstrap]与 [docs/recheck-3.16.2.md](docs/recheck-3.16.2.md)） | **真流式**（事件驱动） | ✅ session/*（workspace/* 仍删 7/8 仅 generateText 存活；CLI 旗标面唯一确证新增 `--toolsearch-mode`，`--disallowed-tools` 标签带 camelCase 别名，见 agent-help） |
 | **0.16.9**（App 3.14.0） | ✅ 完整（核心面与 3.12.3 的 0.16.5 构建一致；最小 headless 环境的模型引导需配置文件，见[^bootstrap]） | **真流式**（事件驱动） | ✅ session/*（workspace/* 仍删 7/8 仅 generateText 存活；CLI 旗标面增删：`--permission-mode`/`--allow-main-worktree-yolo` 已移除，新增 `--cwd`/`--target-replace` 等，见 agent-help） |
 | **0.16.5**（App 3.12.3，同版本号构建漂移） | ✅ 完整（核心面） | **真流式**（事件驱动） | ✅ session/*（workspace/* 删 7/8 仅 generateText 存活；updateRuntimeModelConfig/updateInteractionPreferences 已删，透传优雅降级） |
 | **0.16.5**（App 3.10.2） | ✅ 完整 | **真流式**（事件驱动） | ✅ session/* + workspace/*（与 0.16.1 同面；`automation/*` 未实现不受其删除影响） |
@@ -345,9 +350,9 @@ ACP bridge 侧另有一个 env（不在上两表，仅 ACP 用）：`ZCODE_ACP_D
 | **0.14.5 ~ 0.14.7** | ✅ 兼容 | 伪流式（自动降级轮询） | ❌（旧版协议未实现） |
 | **< 0.14.5** | ⚠️ 未测 | — | — |
 
-> 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改——真正断点是反向调用必须应答、事件模型调整、删除 steer/rewind/enhance（信封去 `jsonrpc`/方法 rename/`deliveryKind` 必填同为协议事实，但桥对内本就用这套调用面），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)（含勘误）。0.16.5 已于 2026-09-01 全链路复测（协议面兼容、桥无需代码改动），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。App 3.12.3 的内嵌 CLI `--version` 仍为 0.16.5 但**构建内容漂移**（同号删了 workspace/* 7/8 等，`--version` 不再是唯一兼容性判据），已于 2026-09-17 复测，详见 [docs/recheck-3.12.3.md](docs/recheck-3.12.3.md)。0.16.9（App 3.14.0）已于 2026-09-19 复测：协议面与 3.12.3 的 0.16.5 构建完全一致、桥零改动；变化仅在 CLI 旗标面（`--allowed-tools`/`--max-turns` 连帮助文案一并消失，`--permission-mode`/`--allow-main-worktree-yolo` 移除，新增 `--cwd`/`--target-replace`/`--browser-use` 等），详见 [docs/recheck-3.14.0.md](docs/recheck-3.14.0.md)。
+> 注：CLI 版本号相同不代表协议面相同——`prompt/enhance` 是 App 3.3.0 引入的协议方法（CLI 同为 0.15.0，仅 App 3.3.0+ 的 app-server 支持），又于 0.16 整体移除，仅 0.15.0 + App ≥ 3.3.0 的组合可用。0.16.1（App 3.6.5）协议面大改——真正断点是反向调用必须应答、事件模型调整、删除 steer/rewind/enhance（信封去 `jsonrpc`/方法 rename/`deliveryKind` 必填同为协议事实，但桥对内本就用这套调用面），详见 [docs/upgrade-0.16.1-spec.md](docs/upgrade-0.16.1-spec.md)（含勘误）。0.16.5 已于 2026-09-01 全链路复测（协议面兼容、桥无需代码改动），详见 [docs/recheck-0.16.5.md](docs/recheck-0.16.5.md)。App 3.12.3 的内嵌 CLI `--version` 仍为 0.16.5 但**构建内容漂移**（同号删了 workspace/* 7/8 等，`--version` 不再是唯一兼容性判据），已于 2026-09-17 复测，详见 [docs/recheck-3.12.3.md](docs/recheck-3.12.3.md)。0.16.9（App 3.14.0）已于 2026-09-19 复测：协议面与 3.12.3 的 0.16.5 构建完全一致、桥零改动；变化仅在 CLI 旗标面（`--allowed-tools`/`--max-turns` 连帮助文案一并消失，`--permission-mode`/`--allow-main-worktree-yolo` 移除，新增 `--cwd`/`--target-replace`/`--browser-use` 等），详见 [docs/recheck-3.14.0.md](docs/recheck-3.14.0.md)。0.17.0（App 3.16.2）已于 2026-10-20 复测：核心链路零改动兼容，但有三处面破坏（`session/list` 拒收 `includeArchived`、模型 ID 改名 `zai/glm-5.3` 小写、`workspace/generateText` 参数键 `modelRef`→`selection`），桥已适配，详见 [docs/recheck-3.16.2.md](docs/recheck-3.16.2.md)。
 >
-> ⚠️ **`session/setModel` 对象形态的适用范围**：仅在 0.16.x 验证（0.16.9 实测可用）；≤0.15 后端未验证该形态（历史 `{modelId}` 字符串形态在 0.16 schema 下必拒，故桥已切换为对象形态——这是破坏性变更，旧版调用方需注意）。
+> ⚠️ **`session/setModel` 对象形态的适用范围**：仅在 0.16.x 验证（0.16.9 实测可用）；≤0.15 后端未验证该形态（历史 `{modelId}` 字符串形态在 0.16 schema 下必拒，故桥已切换为对象形态——这是破坏性变更，旧版调用方需注意）。**0.17.0（App 3.16.2）起两处收紧**：模型身份改名——旧 `builtin:zai-coding-plan/GLM-5.3` → 新 **`zai/glm-5.3`**（小写、精确大小写敏感，大写报「不存在 Model」）；zai 系模型 **`options.reasoningLevel` 强制必填**（缺它报 `Reasoning level is required for zai/glm-5.3`，可取 create 快照 catalog 的 `reasoning.defaultLevel`）。桥的 `session/new` 字符串 model 有大小写折叠回退（用 catalog 规范 ID），旧习惯 `"GLM-5.3"` 在 0.17.0 上自动解析；对象形态不做任何 ID 改写，传旧 providerId 由后端报错透传。
 
 [^bootstrap]: 最小 headless 环境不能依赖 env 注入完成模型引导（0.16.9 官方 runtime 实测 env 不被读取），需按「最小 headless 环境的模型引导」准备 `provider/zcode-builtin.json` 与 `~/.zcode/v2/provider_config.json`；否则 mcp-server 返回结构化 `bootstrap` 键、review-gate 按终态告警。
 
