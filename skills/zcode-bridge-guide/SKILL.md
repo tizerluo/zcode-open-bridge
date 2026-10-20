@@ -1,14 +1,14 @@
 ---
 name: zcode-bridge-guide
 version: 1.3.0
-description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.16.9（App 3.14.0）。
+description: 驱动 ZCode（智谱 GLM 系列 coding agent）的通用说明书。覆盖三种接入模式（CLI --prompt / ACP bridge / MCP tools）、凭证配置、真流式/伪流式双模式、扩展协议方法（session 级 + workspace 级）、思考强度控制、任务书模板、已知坑。需要把 ZCode 当子代理编排、跑编码/审查任务、或集成进编辑器时用。兼容 ZCode CLI 0.14.5 ~ 0.17.0（App 3.16.2）。
 user-invocable: true
 ---
 
 # 驱动 ZCode（三模式通用说明书）
 
 > 本 skill 是 [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) 项目的配套说明书。
-> 兼容 ZCode CLI **0.14.5 ~ 0.16.9**（实测含 App 3.2.1~3.14.0）。新版功能（事件驱动真流式、fork/goal/compact、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`；`session/steer`、`session/rewind*`、`prompt/enhance*` 已于 0.16 移除，调用返回 `-32601`。⚠️ App 3.12.3 的 0.16.5 构建（版本号未变、内容漂移）进一步删除了 workspace/* 面 7/8 方法与 `session/updateRuntimeModelConfig`（0.16.9/App 3.14.0 复测同面，桥零改动；CLI 旗标面有增删，详见下文方法表注记与版本表）。
+> 兼容 ZCode CLI **0.14.5 ~ 0.17.0**（实测含 App 3.2.1~3.16.2）。新版功能（事件驱动真流式、fork/goal/compact、workspace/*、setThoughtLevel 思考强度控制）在旧版上自动降级或返回 `-32603`；`session/steer`、`session/rewind*`、`prompt/enhance*` 已于 0.16 移除，调用返回 `-32601`。⚠️ App 3.12.3 的 0.16.5 构建（版本号未变、内容漂移）进一步删除了 workspace/* 面 7/8 方法与 `session/updateRuntimeModelConfig`（0.16.9/App 3.14.0 复测同面，桥零改动；CLI 旗标面有增删，详见下文方法表注记与版本表）。⚠️ 0.17.0（App 3.16.2）三处面变化（桥已适配）：`session/list` 拒收 `includeArchived` 键；模型目录 ID 改名小写 `zai/glm-5.3`（字符串 model 传旧 `"GLM-5.3"` 由桥 casefold 解析）；`workspace/generateText` 参数键 `modelRef`→`selection`（调用方接口不变，桥负责映射），详见 docs/recheck-3.16.2.md。
 
 ## 前置条件
 
@@ -259,7 +259,7 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 | `session/compact` | 压缩对话上下文 | 0.14.8 | `{sessionId}` |
 | `session/steer` ❌ | turn 进行中追加指令（**0.16 已移除**，语义并入 `session/send`） | 0.14.8 | `{sessionId, content}` |
 | `session/setThoughtLevel` | ⭐ 设置思考强度 | 0.15.0 | `{sessionId, thoughtLevel}` |
-| `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, model}` / `{sessionId, mode}`（model 是 ModelSelection 对象 `{providerId, modelId, options?: {reasoningLevel}}`；0.16 后端 schema 要对象，旧 `modelId` 字符串必 -32602，且对象形态仅在 0.16.x 验证、≤0.15 未验证。另 `session/new` 支持可选 `model`（字符串按 catalog 解析，条目带 `reasoning.defaultLevel` 时补；或完整对象；`model: null`/省略等同未提供），创建会话即锁定模型；另支持 `toolAllowlist`/`toolDenylist` 工具名单，见下方注） |
+| `session/setModel` / `setMode` | 切换模型 / 权限模式 | 0.14.8 | `{sessionId, model}` / `{sessionId, mode}`（model 是 ModelSelection 对象 `{providerId, modelId, options?: {reasoningLevel}}`；0.16 后端 schema 要对象，旧 `modelId` 字符串必 -32602，且对象形态仅在 0.16.x 验证、≤0.15 未验证；0.17.0 起 ID 改名小写 `zai/glm-5.3`（精确大小写敏感）且 zai 系 `options.reasoningLevel` 强制必填。另 `session/new` 支持可选 `model`（字符串按 catalog 解析，条目带 `reasoning.defaultLevel` 时补，0.17.0 起大小写折叠回退、旧 `"GLM-5.3"` 自动解析；或完整对象；`model: null`/省略等同未提供），创建会话即锁定模型；另支持 `toolAllowlist`/`toolDenylist` 工具名单，见下方注） |
 | `session/cancelBackgroundTask` | 取消后台 Bash 任务 | 0.14.8 | `{sessionId, taskId}` |
 | `session/rewindCascade` ❌ | 级联回退（同 rewind schema，**0.16 已移除**） | 0.15.0 | `{sessionId, target?, scope?, expectedRevision?}` |
 | `session/updateRuntimeModelConfig` ❌ | 运行时覆盖模型配置 | 0.15.0 | `{sessionId, runtimeModel, applyModelSelection?}`（0.16 起 `runtimeModel.revision` 必填） |
@@ -275,7 +275,7 @@ ACP bridge 暴露的 ZCode 新版协议方法，按定位维度分组。**sessio
 | 方法 | 作用 | params |
 |------|------|--------|
 | `workspace/readState` | 读工作区状态（模型目录/设置）❌ 3.12.3 已删 | `{workspace, runtimeModel?}` |
-| `workspace/generateText` | 一次性文本生成（不建会话）—— 3.12.3 唯一幸存 | `{workspace, modelRef, prompt, querySource, ...}` |
+| `workspace/generateText` | 一次性文本生成（不建会话）—— 3.12.3 唯一幸存 | `{workspace, modelRef, prompt, querySource, ...}`（0.17.0 适配：桥把 modelRef 映射为后端 `selection` 键；selection 构建起 maxOutputTokens 必填、zai 系需 options.reasoningLevel、temperature 已删——省略必填项时后端错误透传并附指引） |
 | `workspace/setDefaultModel` / `setDefaultMode` / `setDefaultThoughtLevel` | 设工作区默认值（持久化）❌ 3.12.3 已删 | `{workspace, model\|mode\|thoughtLevel, expectedWorkspaceRevision?}` |
 | `workspace/upsertModelProvider` / `removeModelProvider` / `updateProviderRegistry` | 管理模型供应商（含 apiKey，敏感）❌ 3.12.3 已删 | `{workspace, provider\|providerId\|registry, ...}` |
 
@@ -429,6 +429,7 @@ npm test     # 全量，看实际数字
 
 | ZCode CLI 版本 | 支持情况 | 差异 |
 |:--------------:|:--------:|------|
+| **0.17.0** (App 3.16.2) | ✅ 完整 | 核心链路零改动兼容；三处面破坏由桥适配（2026-10-20 复测）：`session/list` 拒收 `includeArchived`（桥已去键）、模型目录 ID 改名小写 `zai/glm-5.3` + `glm-5-turbo` 回归 catalog（zai 系强制 reasoningLevel；字符串 model 桥做 casefold 解析）、`workspace/generateText` 参数键 `modelRef`→`selection`（桥映射 + 老构建一次性回退）。CLI 旗标面唯一确证新增 `--toolsearch-mode`，`--disallowed-tools` 标签带 camelCase 别名（见 docs/recheck-3.16.2.md） |
 | **0.16.9** (App 3.14.0) | ✅ 完整 | 协议面与 3.12.3 的 0.16.5 构建一致（桥零改动，2026-09-19 复测）；变化仅在 CLI 旗标面：`--permission-mode`/`--allow-main-worktree-yolo` 已移除，`--allowed-tools`/`--max-turns` 连帮助文案一并消失，新增 `--cwd`/`--target-replace`/`--browser-use` 等（见 docs/recheck-3.14.0.md） |
 | **0.16.5** (App 3.12.3，同号构建漂移) | ✅ 完整（核心面） | session/* 核心面不变；workspace/* 删 7/8 仅 `generateText` 幸存，`session/updateRuntimeModelConfig`、`updateInteractionPreferences` 已删——桥统一翻译为 `-32601`「已移除该能力」（见 docs/recheck-3.12.3.md） |
 | **0.16.5** (App 3.10.2) | ✅ 完整 | 与 0.16.1 同面 + `automation/*` 全族删除（桥未使用，无影响） |

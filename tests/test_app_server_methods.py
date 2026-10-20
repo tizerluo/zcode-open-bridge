@@ -609,6 +609,124 @@ class TestAppServerMethods(unittest.TestCase):
         self.assertNotIn("sess_badsettings", bridge.session_map,
                          "model 未生效的会话不得登记")
 
+    # ---------- C4o+: 大小写折叠回退 (0.17.0 模型 ID 改名 GLM-5.3 → glm-5.3) ----------
+    # 0.17.0 (App 3.16.2) 的 catalog 形态: providerId "zai" + 小写 modelId;
+    # sessionId 在 result.session.sessionId (0.17 实测嵌套形态, mock 按真)
+    _CATALOG_017 = {
+        "session": {"sessionId": "sess_m17"},
+        "settings": {"model": {"available": [
+            {"ref": {"providerId": "zai", "modelId": "glm-5.3"},
+             "label": "GLM-5.3", "providerLabel": "Z.ai Coding Plan",
+             "reasoning": {"levels": [{"value": "low", "label": "low"},
+                                      {"value": "high", "label": "high"},
+                                      {"value": "max", "label": "max"}],
+                           "defaultLevel": "max"}},
+            {"ref": {"providerId": "zai", "modelId": "glm-5.3-flash"},
+             "label": "GLM-5.3-Flash", "providerLabel": "Z.ai Coding Plan"},
+        ]}},
+    }
+
+    def test_c4o_new_model_casefold_hits_catalog_canonical(self):
+        """C4o: 0.17.0 小写 catalog + 旧习惯 "GLM-5.3" → casefold 折叠命中,
+        selection 用 catalog 规范 ID (zai/glm-5.3), 绝不透传调用方原始串;
+        defaultLevel 照补 (0.17.0 对 zai 系强制 reasoningLevel)"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG_017)}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "GLM-5.3"})
+        self._assert_ok(resp)
+        set_calls = [c for c in fake.calls if c["method"] == "session/setModel"]
+        self.assertEqual(set_calls[0]["params"]["model"],
+                         {"providerId": "zai", "modelId": "glm-5.3",
+                          "options": {"reasoningLevel": "max"}},
+                         "折叠命中必须用 catalog 规范 ID + 补 defaultLevel")
+
+    def test_c4p_new_model_exact_hit_no_fold(self):
+        """C4p: 精确命中不触发折叠轮 (小写请求在小写 catalog 上精确命中)"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG_017)}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "glm-5.3"})
+        self._assert_ok(resp)
+        set_calls = [c for c in fake.calls if c["method"] == "session/setModel"]
+        self.assertEqual(set_calls[0]["params"]["model"]["modelId"], "glm-5.3")
+
+    def test_c4q_new_model_casefold_miss_original_error(self):
+        """C4q: 折叠也无命中 → 报原「不在本会话的模型目录中」错误 (文案带
+        调用方原始串), 不发 setModel、不登记"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG_017)}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "NOPE"})
+        self._assert_error_code(resp, -32602)
+        self.assertIn("NOPE", resp["error"]["message"])
+        self.assertEqual([c for c in fake.calls
+                          if c["method"] == "session/setModel"], [])
+        self.assertNotIn("sess_m17", bridge.session_map)
+
+    def test_c4r_new_model_exact_takes_precedence_over_fold(self):
+        """C4r: 精确命中优先 — catalog 同时有仅大小写不同的两个规范 ID 时,
+        精确轮命中对应条目, 折叠轮不参与 (不串 ID)"""
+        mixed = {"sessionId": "sess_mixed", "settings": {"model": {"available": [
+            {"ref": {"providerId": "zai", "modelId": "glm-5.3"},
+             "label": "glm-5.3", "providerLabel": "zai"},
+            {"ref": {"providerId": "legacy", "modelId": "GLM-5.3"},
+             "label": "GLM-5.3", "providerLabel": "legacy"},
+        ]}}}
+        for wanted, expect_provider in (("GLM-5.3", "legacy"),
+                                        ("glm-5.3", "zai")):
+            with self.subTest(wanted=wanted):
+                bridge, fake = self._new_bridge({
+                    "session/create": {"response": {"result": dict(mixed)}},
+                })
+                resp = self._call(bridge, "session/new",
+                                  {"cwd": "/p", "model": wanted})
+                self._assert_ok(resp, msg=f"model={wanted}")
+                set_calls = [c for c in fake.calls
+                             if c["method"] == "session/setModel"]
+                self.assertEqual(set_calls[0]["params"]["model"]["providerId"],
+                                 expect_provider,
+                                 "精确命中必须取完全同名的条目")
+
+    def test_c4s_new_model_fold_works_on_upper_catalog_too(self):
+        """C4s: 0.16 风格大写 catalog + 小写请求 → 折叠命中大写规范 ID
+        (era 双向便利; 大写请求在大写 catalog 上精确命中、折叠不触发,
+        由既有 C4 覆盖)"""
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": dict(self._CATALOG)}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "glm-5.3"})
+        self._assert_ok(resp)
+        set_calls = [c for c in fake.calls if c["method"] == "session/setModel"]
+        self.assertEqual(set_calls[0]["params"]["model"],
+                         {"providerId": "bigmodel-api", "modelId": "GLM-5.3",
+                          "options": {"reasoningLevel": "max"}})
+
+    def test_c4t_new_model_fold_ambiguous_reports_error(self):
+        """C4t (R1 P2-3): 折叠命中多个条目 (跨 provider 仅大小写不同的同名 ID)
+        → 显式报错不猜 (静默绑定任意 provider 会打到错误供应商), 文案列出
+        命中对并建议对象形态指定 providerId; 不发 setModel、不登记"""
+        ambiguous = {"sessionId": "sess_amb", "settings": {"model": {"available": [
+            {"ref": {"providerId": "legacy", "modelId": "Glm-5.3"},
+             "label": "Glm-5.3", "providerLabel": "legacy"},
+            {"ref": {"providerId": "zai", "modelId": "glm-5.3"},
+             "label": "glm-5.3", "providerLabel": "zai"},
+        ]}}}
+        bridge, fake = self._new_bridge({
+            "session/create": {"response": {"result": ambiguous}},
+        })
+        resp = self._call(bridge, "session/new", {"cwd": "/p", "model": "GLM-5.3"})
+        self._assert_error_code(resp, -32602)
+        msg = resp["error"]["message"]
+        self.assertIn("多个条目", msg, f"应报折叠歧义: {msg}")
+        self.assertIn("legacy/Glm-5.3", msg, "应列出全部命中对")
+        self.assertIn("zai/glm-5.3", msg)
+        self.assertIn("providerId", msg, "应建议对象形态指定 providerId")
+        self.assertIn("sess_amb", msg, "文案带已创建 sessionId 供收编")
+        self.assertEqual([c for c in fake.calls
+                          if c["method"] == "session/setModel"], [])
+        self.assertNotIn("sess_amb", bridge.session_map)
+
     # ---------- C5: session/new 工具名单透传 (只读监督的会话级前置手段) ----------
     def test_c5_new_toollists_normalized_into_create(self):
         """C5: 合法 toolAllowlist/toolDenylist → 归一 (逐条 strip) 后并入
@@ -710,6 +828,85 @@ class TestAppServerMethods(unittest.TestCase):
         set_calls = [c for c in fake.calls if c["method"] == "session/setModel"]
         self.assertEqual(len(set_calls), 1, "model 与名单并存时 setModel 照常走")
         self.assertIn("sess_m", bridge.session_map)
+
+    # ---------- L: session/list (0.17.0 适配: 不发 includeArchived) ----------
+    # 0.17.0 strict Zod 对 includeArchived 报 -32602 Unrecognized key, 桥原无条件
+    # false 使 list 整体失败; 0.16.9 实测 {} 与 {includeArchived: false} 等价
+    # (2026-10-20, 社区包装器 vendor 0.16.9), 故去键是 era 无关方案。
+    # 条目键集按 0.17.0 实测: [createdAt, mode, sessionId, sessionKind, status,
+    # title, titleSource, traceId, updatedAt, workspace] — 无 cwd 键。
+    _LIST_RESULT = {"result": {"sessions": [
+        {"sessionId": "sess_a",
+         "workspace": {"workspacePath": "/w/a", "workspaceKey": "/w/a"},
+         "title": "fix: bug", "updatedAt": 1754460000000, "status": "idle",
+         "sessionKind": "cli", "mode": "build", "traceId": "t1",
+         "createdAt": 1754459000000, "titleSource": "ai"},
+        {"sessionId": "sess_b",
+         "workspace": {"workspacePath": "/w/b", "workspaceKey": "/w/b"},
+         "title": None, "updatedAt": None},
+    ]}}
+
+    def test_l1_list_no_include_archived_key(self):
+        """L1: 空参数 → 后端收到 {} (无 includeArchived 键); result 映射不变
+        (sessionId/workspace→cwd/title/updatedAt)"""
+        bridge, fake = self._new_bridge({
+            "session/list": {"response": dict(self._LIST_RESULT)},
+        })
+        resp = self._call(bridge, "session/list", {})
+        self._assert_ok(resp)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0]["method"], "session/list")
+        self.assertEqual(fake.calls[0]["params"], {},
+                         "0.17.0 拒 includeArchived 键, 空参数必须发 {}")
+        sessions = resp["result"]["sessions"]
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sessions[0], {
+            "sessionId": "sess_a", "cwd": "/w/a",
+            "title": "fix: bug", "updatedAt": "2025-08-06T06:00:00+00:00",
+        }, "SessionInfo 映射 (workspace.workspacePath → cwd, 毫秒→ISO) 不得变")
+        self.assertEqual(sessions[1],
+                         {"sessionId": "sess_b", "cwd": "/w/b",
+                          "title": None, "updatedAt": None},
+                         "title/updatedAt 缺失按 None 透出 (旧行为)")
+
+    def test_l2_list_workspace_limit_passthrough(self):
+        """L2: cwd/limit 照常构造透传 (workspace object + limit), 不夹带其他键"""
+        bridge, fake = self._new_bridge({
+            "session/list": {"response": {"result": {"sessions": []}}},
+        })
+        self._call(bridge, "session/list", {"cwd": "/w/x", "limit": 5})
+        self.assertEqual(fake.calls[0]["params"], {
+            "workspace": {"workspacePath": "/w/x", "workspaceKey": "/w/x"},
+            "limit": 5,
+        })
+
+    def test_l3_list_client_include_archived_not_forwarded(self):
+        """L3: 客户端传 includeArchived → 不透传 (0.17.0 无法透传; archived
+        概念疑似已从 0.17.0 移除, 传 true 也按默认行为处理), 且打一行日志
+        说明丢弃原因 (R1 P2-2: 显式传入的调用方值得一句 stderr, 不做回退)"""
+        bridge, fake = self._new_bridge({
+            "session/list": {"response": {"result": {"sessions": []}}},
+        })
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            resp = self._call(bridge, "session/list", {"includeArchived": True})
+        self._assert_ok(resp)
+        self.assertNotIn("includeArchived", fake.calls[0]["params"])
+        err_out = captured.getvalue()
+        self.assertIn("includeArchived", err_out, "应打丢弃日志")
+        self.assertIn("True", err_out, "日志应含传入的值")
+        self.assertIn("0.17", err_out, "日志应说明 0.17 已移除该概念")
+
+    def test_l4_list_backend_error_passthrough(self):
+        """L4: 后端错误 → -32603 "zcode list failed: <原文>" (核心路径不套
+        「已移除」文案, 与既有边界一致)"""
+        bridge, _ = self._new_bridge({
+            "session/list": {"response": {"error": {
+                "code": -32602, "message": 'Unrecognized key: "includeArchived"'}}},
+        })
+        resp = self._call(bridge, "session/list", {})
+        self._assert_error_code(resp, -32603)
+        self.assertIn("zcode list failed", resp["error"]["message"])
 
     # ---------- EV: 事件/轮询模式选择 · 事件分支 ----------
     def test_ev1_event_branch_subscribe_deliverykind(self):
@@ -1360,7 +1557,8 @@ class TestAppServerMethods(unittest.TestCase):
         self.assertEqual(fake.calls[0]["params"]["runtimeModel"], rm)
 
     def test_m7_generate_text_passthrough(self):
-        """M7a: generateText 透传 modelRef/prompt/querySource/maxOutputTokens/temperature"""
+        """M7a: generateText 首发 selection 形态 (0.17.0 适配: modelRef 键改名),
+        透传 prompt/querySource/maxOutputTokens/temperature"""
         bridge, fake = self._new_bridge()
         resp = self._call(bridge, "workspace/generateText", {
             "workspacePath": "/p",
@@ -1369,13 +1567,17 @@ class TestAppServerMethods(unittest.TestCase):
             "maxOutputTokens": 512, "temperature": 0.5,
         })
         self._assert_ok(resp)
+        self.assertEqual(len(fake.calls), 1, "selection 形态直发, 无重试")
         p = fake.calls[0]["params"]
         self.assertEqual(fake.calls[0]["method"], "workspace/generateText")
-        self.assertEqual(p["modelRef"], {"providerId": "zai", "modelId": "glm-5.2"})
+        self.assertNotIn("modelRef", p, "0.17.0 strict Zod 拒 modelRef 键, 不得再发")
+        self.assertEqual(p["selection"], {"providerId": "zai", "modelId": "glm-5.2"},
+                         "客户端 modelRef 的值应放到 selection 键下")
         self.assertEqual(p["prompt"], "say hi")
         self.assertEqual(p["querySource"], "editor")
         self.assertEqual(p["maxOutputTokens"], 512)
-        self.assertEqual(p["temperature"], 0.5)
+        self.assertEqual(p["temperature"], 0.5,
+                         "temperature 原样透传 (后端拒收时错误指名道姓, 不静默丢弃)")
 
     def test_m7_generate_text_timeout_60(self):
         """M7b: generateText timeout=60 (涉及模型调用)"""
@@ -1385,6 +1587,8 @@ class TestAppServerMethods(unittest.TestCase):
             "modelRef": {"providerId": "zai", "modelId": "glm-5.2"}, "prompt": "x",
         })
         self.assertEqual(fake.calls[0]["timeout"], 60)
+        self.assertEqual(fake.calls[0]["params"]["selection"],
+                         {"providerId": "zai", "modelId": "glm-5.2"})
 
     def test_m7_generate_text_default_query_source(self):
         """M7c: generateText 缺 querySource → 默认 "bridge" """
@@ -1409,6 +1613,158 @@ class TestAppServerMethods(unittest.TestCase):
                           {"workspacePath": "/p",
                            "modelRef": {"providerId": "zai", "modelId": "glm-5.2"}})
         self._assert_error_code(resp, -32602)
+
+    # ----- M7f+: generateText era 回退与错误指引 (0.17.0 适配) -----
+    # 老构建 (推断只收 modelRef, ≤App 3.12.3 的 0.16.5; 见 recheck §③) 对
+    # selection 形态的键级拒收
+    # 形态 (参照同族 strict Zod 实测: Unrecognized key "selection")
+    _LEGACY_REJECT = {"error": {"code": -32602, "message":
+                      'Invalid params — (root): Unrecognized key: "selection"'}}
+    _OK_RESULT = {"result": {"text": "收到", "selection": {"providerId": "zai",
+                          "modelId": "glm-5.3"}, "finishReason": "stop",
+                          "usage": {"outputTokens": 45}}}
+
+    def test_m7f_generate_text_legacy_fallback_model_ref(self):
+        """M7f: 后端键级拒收 selection (-32602 Unrecognized key) → 一次性用
+        modelRef 形态重试 (全量原始参数), 重试成功即成功"""
+        bridge, fake = self._new_bridge({
+            "workspace/generateText": {"response": [dict(self._LEGACY_REJECT),
+                                                    dict(self._OK_RESULT)]},
+        })
+        resp = self._call(bridge, "workspace/generateText", {
+            "workspacePath": "/p",
+            "modelRef": {"providerId": "zai", "modelId": "GLM-5.3"},
+            "prompt": "say hi", "querySource": "editor",
+            "maxOutputTokens": 512, "temperature": 0.5,
+        })
+        self._assert_ok(resp, "老构建 modelRef 重试应成功")
+        self.assertEqual(len(fake.calls), 2, "应恰为 selection + modelRef 两次")
+        self.assertEqual(fake.calls[1]["params"]["modelRef"],
+                         {"providerId": "zai", "modelId": "GLM-5.3"})
+        self.assertNotIn("selection", fake.calls[1]["params"])
+        self.assertEqual(fake.calls[1]["params"]["temperature"], 0.5,
+                         "重试带全量原始参数 (老构建 temperature 未删)")
+        self.assertEqual(fake.calls[1]["params"]["maxOutputTokens"], 512)
+
+    def test_m7f_generate_text_legacy_fallback_both_fail(self):
+        """M7f2: 重试仍失败 → 透传第二次错误 (modelRef 形态的后端裁定)"""
+        second = {"error": {"code": -32602,
+                            "message": 'Invalid params — (root): Unrecognized key: "modelRef"'}}
+        bridge, fake = self._new_bridge({
+            "workspace/generateText": {"response": [dict(self._LEGACY_REJECT),
+                                                    dict(second)]},
+        })
+        resp = self._call(bridge, "workspace/generateText", {
+            "workspacePath": "/p",
+            "modelRef": {"providerId": "zai", "modelId": "m"}, "prompt": "x"})
+        self._assert_error_code(resp, -32603,
+                                msg="重试仍失败经 _passthrough_error 包装 -32603")
+        self.assertIn("modelRef", resp["error"]["message"],
+                      "应透传重试 (第二次) 的错误原文")
+
+    def test_m7g_generate_text_no_fallback_on_content_error(self):
+        """M7g: -32602 但特征是 selection 内容非法 (expected object 型, 无
+        unrecognized) → 不重试 (避免改写成第二次更离谱的错误), 透传原错误"""
+        content_err = {"error": {"code": -32602, "message":
+                       "Invalid params — selection: Invalid input: expected object, "
+                       "received string"}}
+        bridge, fake = self._new_bridge({
+            "workspace/generateText": {"response": [dict(content_err)]},
+        })
+        resp = self._call(bridge, "workspace/generateText", {
+            "workspacePath": "/p",
+            "modelRef": {"providerId": "zai", "modelId": "m"}, "prompt": "x"})
+        self._assert_error_code(resp, -32603, msg="经 _passthrough_error 包装")
+        self.assertEqual(len(fake.calls), 1, "内容错误不触发 modelRef 重试")
+        self.assertIn("expected object", resp["error"]["message"])
+
+    def test_m7h_generate_text_max_tokens_error_enriched(self):
+        """M7h: 省略 maxOutputTokens → 后端 -32603 range 错透传 + 附加指引
+        (不改写后端原文; 不重试 — -32603 非键级拒收)"""
+        range_err = {"error": {"code": -32603,
+                               "message": "maxOutputTokens is outside the model option range"}}
+        bridge, fake = self._new_bridge({
+            "workspace/generateText": {"response": [dict(range_err)]},
+        })
+        resp = self._call(bridge, "workspace/generateText", {
+            "workspacePath": "/p",
+            "modelRef": {"providerId": "zai", "modelId": "glm-5.3"}, "prompt": "x"})
+        self._assert_error_code(resp, -32603)
+        self.assertEqual(len(fake.calls), 1)
+        msg = resp["error"]["message"]
+        self.assertIn("zcode generateText failed", msg, "保留透传形态")
+        self.assertIn("maxOutputTokens is outside the model option range", msg,
+                      "后端原文不改写")
+        self.assertIn("必填", msg, "附加当前构建必填指引")
+
+    def test_m7i_generate_text_reasoning_level_error_enriched(self):
+        """M7i: 缺 options.reasoningLevel → -32603 透传 + 附加指引"""
+        lvl_err = {"error": {"code": -32603,
+                             "message": "Reasoning level is required for zai/glm-5.3"}}
+        bridge, fake = self._new_bridge({
+            "workspace/generateText": {"response": [dict(lvl_err)]},
+        })
+        resp = self._call(bridge, "workspace/generateText", {
+            "workspacePath": "/p",
+            "modelRef": {"providerId": "zai", "modelId": "glm-5.3"},
+            "prompt": "x", "maxOutputTokens": 1024})
+        self._assert_error_code(resp, -32603)
+        msg = resp["error"]["message"]
+        self.assertIn("Reasoning level is required for zai/glm-5.3", msg)
+        self.assertIn("reasoningLevel", msg)
+
+    def test_m7j_generate_text_temperature_rejected_passthrough(self):
+        """M7j: temperature 在 selection 构建已删 → 后端 -32602 Unrecognized key
+        temperature (文本无 selection) → 不重试, 错误指名道姓透传"""
+        temp_err = {"error": {"code": -32602, "message":
+                    'Invalid params — (root): Unrecognized key: "temperature"'}}
+        bridge, fake = self._new_bridge({
+            "workspace/generateText": {"response": [dict(temp_err)]},
+        })
+        resp = self._call(bridge, "workspace/generateText", {
+            "workspacePath": "/p",
+            "modelRef": {"providerId": "zai", "modelId": "glm-5.3"},
+            "prompt": "x", "temperature": 0.5})
+        self._assert_error_code(resp, -32603, msg="经 _passthrough_error 包装")
+        self.assertEqual(len(fake.calls), 1, "temperature 拒收不触发 modelRef 重试")
+        self.assertIn("temperature", resp["error"]["message"])
+
+    def test_m7k_needs_legacy_model_ref_key_level_matching(self):
+        """M7k (R1 P2-1): 重试判定只认「Unrecognized key 后紧跟的键名恰为
+        selection/modelRef」的键级拒收 — 嵌套键 (selection.variant) 与其他键
+        (temperature) 被拒不得触发; modelRef required/missing 分支保留;
+        非 -32602 一律 False (helper 直接单测, 不经 handler)"""
+        needs = self.Bridge._generate_text_needs_legacy_model_ref
+        cases = [
+            # (error, 期望, 说明)
+            ({"code": -32602,
+              "message": 'Invalid params — (root): Unrecognized key: "selection"'},
+             True, "键级拒收 selection"),
+            ({"code": -32602,
+              "message": 'Invalid params — (root): Unrecognized keys: "selection", "temperature"'},
+             True, "复数键列首为 selection"),
+            ({"code": -32602, "message": "Invalid params — modelRef: Required"},
+             True, "老构建必填缺失文案 (required 分支)"),
+            ({"code": -32602, "message": "Invalid params — modelRef is missing"},
+             True, "老构建必填缺失文案 (missing 分支)"),
+            ({"code": -32602,
+              "message": 'Invalid params — (root): Unrecognized key: "temperature"'},
+             False, "temperature 被拒不是 modelRef 回退信号"),
+            ({"code": -32602,
+              "message": 'Invalid params — selection: Unrecognized key: "variant"'},
+             False, "嵌套键拒收 (键名 variant) 不是 modelRef 回退信号"),
+            ({"code": -32602,
+              "message": "Invalid params — selection: Invalid input: expected object, received string"},
+             False, "selection 内容非法 (expected object 型) 不重试"),
+            ({"code": -32603,
+              "message": 'Invalid params — (root): Unrecognized key: "selection"'},
+             False, "非 -32602 一律不重试"),
+            ({"code": -32602, "message": "Internal selection error somewhere"},
+             False, "自由文本提到 selection 但非键级拒收, 不触发"),
+        ]
+        for err, expected, why in cases:
+            with self.subTest(why=why, message=err["message"][:50]):
+                self.assertEqual(needs(err), expected)
 
     # ---------- M8: workspace/setDefault* 三件套 ----------
     def test_m8_set_default_model(self):
